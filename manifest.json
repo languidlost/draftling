@@ -1124,6 +1124,34 @@
           ]
         }
       ]
+    },
+    {
+      "id": "microjournal_rev5",
+      "name": "MicroJournal Rev 5",
+      "description": "ESP32-S3 N16R8, ILI9341, USB host",
+      "chipFamily": "ESP32-S3",
+      "releases": [
+        {
+          "tag": "v1.0.17",
+          "flashMode": "dio",
+          "flashFreq": "80m",
+          "flashSize": "16MB",
+          "parts": [
+            {
+              "path": "firmware/v1.0.17/draftling-microjournal_rev5-bootloader.bin",
+              "offset": "0x0"
+            },
+            {
+              "path": "firmware/v1.0.17/draftling-microjournal_rev5-partition-table.bin",
+              "offset": "0x8000"
+            },
+            {
+              "path": "firmware/v1.0.17/draftling-microjournal_rev5.bin",
+              "offset": "0x10000"
+            }
+          ]
+        }
+      ]
     }
   ]
 }
