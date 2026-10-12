@@ -1,0 +1,2228 @@
+# Copilot Instructions
+
+All firmware sources and build files live under `firmware/` (see
+"Repository Layout" below for the full tree). Every path in this
+document -- `main/...`, `components/...`, `CMakeLists.txt`,
+`CMakePresets.json`, `sdkconfig.defaults*`, `partitions*.csv`,
+`build/<board>` -- is relative to `firmware/` unless stated otherwise.
+The repository root also has `docs/`, `images/`, `3D_Prints/`, and the
+top-level `README.md` / `HARDWARE.md` / `BUILDING.md` / this file.
+
+## Code Style
+
+- Do not use non-ASCII characters anywhere in the repository -- in code,
+  comments, string literals, commit messages, or documentation (including
+  Markdown files under `docs/` and this `AGENTS.md`). All files must be
+  ASCII-only. Use ASCII equivalents instead: `u` (or `micro`) for `mu`,
+  `->` for an arrow, `--` for an em-dash, `>=` / `<=` for the inequality
+  glyphs, `ohm` for the ohm symbol, `deg` for the degree sign, `sec.` for
+  the section sign, etc. The only exception is the auto-generated LVGL
+  font sources under `components/fonts/` (e.g. `greybeard_*.c`), whose
+  comments reference the Unicode glyphs they encode.
+- All board-specific configuration -- pin numbers, panel dimensions,
+  wakeup GPIOs, brand strings, etc. -- belongs in `main/Kconfig.projbuild`
+  and the per-board header files under `main/boards/`. C and C++ files
+  outside `main/` must NOT reference specific board models (no
+  `#if defined(CONFIG_DRAFTLING_MODEL_*)`, no hard-coded board names).
+  Use the derived feature flags (`CONFIG_DRAFTLING_DISPLAY_EPD`,
+  `CONFIG_DRAFTLING_DISPLAY_RLCD`, `CONFIG_DRAFTLING_DISPLAY_HAS_BACKLIGHT`,
+  `CONFIG_DRAFTLING_HAS_BATTERY`, `CONFIG_DRAFTLING_SD_SDMMC`,
+  `CONFIG_DRAFTLING_WAKEUP_GPIO`, etc.) exposed by `main/Kconfig.projbuild`
+  instead. To add a new model, introduce a new `DRAFTLING_MODEL_*` choice
+  option, set the matching derived flags / `default` lines for the existing
+  feature symbols, create a new per-board header file under `main/boards/`
+  defining the board's `BOARD_NAME`, pin numbers and `WAKEUP_GPIO_NUM`, add
+  the corresponding `#elif` include directive in `main/app_config.h`, and
+  update `main/main.cpp`'s display / SD init switch as needed -- no other
+  C / C++ file should require changes.
+
+## Changelog
+
+- Every change that adds a user-facing feature, changes user-visible
+  behaviour, or fixes a user-visible bug must add an entry to
+  `CHANGELOG.md` (repository root) under `## [Unreleased]`, in the
+  same commit / PR as the change itself. Use the existing
+  `### Added` / `### Changed` / `### Fixed` subsections and the
+  existing style: a bold one-line summary followed by a short
+  explanation written for users, not developers. Purely internal
+  changes (refactors, build tooling, documentation of the development
+  process) need no entry.
+- When publishing a release (see "Publishing a Release" below), rename
+  `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD` and start a new empty
+  `## [Unreleased]` section above it.
+
+## Project Overview
+
+Draftling is a distraction-free Markdown text editor for ESP32-S3-based
+development boards with reflective LCD displays. It is built with the
+ESP-IDF framework (v6.0.2+) and uses LVGL v9 for the graphical
+interface.
+
+The user connects a Bluetooth keyboard and edits Markdown files stored on
+a MicroSD card. The reflective LCD needs no backlight and works well in
+daylight. On request the device connects to WiFi and synchronizes files
+with a remote Git repository using a built-in Git client that speaks the
+standard smart HTTP protocol (a local commit history is kept on the SD
+card).
+
+### Supported Hardware
+
+| Board | Display |
+|-------|---------|
+| Waveshare ESP32-S3-RLCD-4.2 | 4.2-inch reflective LCD, 400x300 |
+| M5Stack PaperS3 | 4.7-inch e-paper (ED047TC1), 540x960 |
+| Waveshare ESP32-S3-LCD-3.16 | 3.16-inch ST7701 RGB color LCD, 320x820 portrait rendered landscape at 820x320, no touch |
+| Freenove FNK0104A | 2.8-inch ILI9341 color LCD, 320x240, no touch |
+| Freenove FNK0104B | 2.8-inch ILI9341 color LCD, 320x240, FT6336U touch |
+| Freenove FNK0104N | 3.5-inch ST77922 QSPI color LCD, 480x320, ST77922 built-in touch |
+| Freenove FNK0104S | 4.0-inch ST7796 color LCD, 480x320, FT6336U touch |
+| MicroJournal Rev 5 | ILI9341 color LCD, 320x240, shared-SPI MicroSD, USB host |
+| Viewe UEDX24320028E-WB-A + UEED035HV-RX40-L001 | 3.5-inch ST7365 transflective color LCD (separately sold display on the board's connector), 480x320, CHSC6540-compatible touch |
+| Xteink X4 Pro | 4.26-inch e-paper (SSD1677/UC8179/UC8279, auto-detected), 800x480, GT911 touch |
+| Xteink X4 Classic (X4 v2) | 4.26-inch e-paper (SSD1677/UC8179/UC8279, auto-detected), 800x480, no touch, no front-light |
+| Elecrow CrowPanel ESP32-S3 5.79" E-Paper HMI | 5.79-inch e-paper (SSD1683 x2), 792x272, no touch |
+| Waveshare ESP32-S3-ePaper-3.97 | 3.97-inch e-paper (SSD1677-compatible), 800x480, no touch |
+| Seeed Studio reTerminal E1001 | 7.5-inch e-paper (UC8179), 800x480, no touch |
+| Seeed reTerminal Sticky | 3.97-inch e-paper (SSD1677/SSD2677, auto-detected), 800x480, GT911 touch |
+| M5Stack PaperMono / PaperMono-Lite | 3.97-inch e-paper (SSD1677), 800x480, FT6336G touch |
+
+The Seeed Studio reTerminal E1001 uses a Good Display GDEY075T7 7.5-inch
+monochrome e-paper panel driven by an UltraChip UC8179 controller over
+SPI. It uses OTP waveforms with hardware windowing (PARTIAL_IN 0x91,
+PARTIAL_WINDOW 0x90, PARTIAL_OUT 0x92) for fast partial updates (~450 ms)
+and TSSET 0x5A for periodic full refreshes (~1.2 s). The Waveshare E-Paper
+Driver HAT remains unsupported. The Xteink X4 Pro's UC8179 / UC8279 panel
+variants use their own reverse-engineered OEM waveforms and are also
+supported.
+
+The Freenove FNK0104N (3.5-inch ST77922 QSPI color LCD) was dropped
+once (commit 7412216) because its screen stayed black, and was later
+re-added. The cause was an ESP-IDF bug, not the panel protocol:
+`spicommon_bus_initialize_io()` tests `flags & SPICOMMON_BUSFLAG_OCTAL`,
+which is also true for `SPICOMMON_BUSFLAG_QUAD` (OCTAL = QUAD |
+IO4_IO7). On a bus whose pins are the SPI2 IOMUX pins (GPIO9-14 on the
+ESP32-S3, as on this board) it then calls `bus_iomux_pins_set_oct()`
+and moves the clock and data pins to the octal IOMUX function, so no
+signal reaches the device. Never pass `SPICOMMON_BUSFLAG_QUAD` (or
+`_OCTAL`) to `spi_bus_initialize()` on SPI2 IOMUX pins: quad
+transfers work without it, the flag only adds pin checks. See
+`components/display/display_st77922.cpp`.
+
+## Repository Layout
+
+Paths below are relative to `firmware/` (see the note at the top of
+this document).
+
+```
+CMakeLists.txt              Top-level CMake project file
+CMakePresets.json           Per-board build presets (idf.py --preset <board>)
+partitions.csv              Custom partition table (16 MB flash, single
+                            "factory" app) -- used by every board except
+                            the four below
+partitions_8mb.csv          8 MB-flash variant (Elecrow CrowPanel 5.79")
+partitions_xteink_x4_pro.csv Dual-OTA layout (otadata + ota_0/ota_1) so
+                            the Xteink X4 Pro can be re-flashed with the
+                            stock or Crosspoint firmware afterwards
+partitions_xteink_x4_classic.csv  Same dual-OTA layout for the Xteink
+                            X4 Classic (X4 v2)
+partitions_seeed_reterminal_sticky.csv  Same dual-OTA layout for the
+                            Seeed reTerminal Sticky (32 MB flash)
+sdkconfig.defaults          Common Kconfig defaults for all targets
+sdkconfig.defaults.esp32s3  ESP32-S3-specific defaults (PSRAM, BLE, WiFi)
+sdkconfig.defaults.<board>  Per-board target + hardware-model defaults, one
+                            per CMakePresets.json preset (e.g.
+                            sdkconfig.defaults.waveshare_rlcd42)
+main/                       Application entry point and hardware config
+  main.cpp                  app_main(): initializes all subsystems
+  app_config.h              Display macros; includes the active board header
+  boards/                   Per-board pin definitions (one .h file per board)
+  Kconfig.projbuild         Menuconfig: hardware model, display size, rotation
+  idf_component.yml         IDF component manifest (depends on lvgl ^9.2)
+  CMakeLists.txt            Registers main as an IDF component
+components/                 Reusable IDF components
+  battery/                  Battery voltage monitor (ADC)
+  ble_keyboard/             BLE HID keyboard host (Bluedroid)
+  display/                  RLCD SPI display driver and LVGL port
+  editor/                   Gap-buffer text editor, Markdown / Fountain
+                            parsers, Markdown / Fountain / plain-text
+                            format hooks, LVGL UI
+  fonts/                    Custom LVGL bitmap fonts (Greybeard family)
+  git_sync/                 Native Git client (smart HTTP) + local history
+  io_expander/              CH422G (Waveshare Touch-LCD-7) and M5IOE1
+                            (M5Stack PaperMono) I2C IO-expander drivers
+  kb_layout/                Keyboard layout translation (US/UA/DE/FR)
+  power/                    TCA9554-latched battery rail + PWR-button driver
+  sd_card/                  SD card (SDMMC 1-bit) file operations
+  standby/                  Deep-sleep / standby inactivity timer
+  tab5_kbd/                 M5Stack Tab5 attachable keyboard (I2C + INT)
+  wifi_manager/             WiFi STA connection manager
+  usb_kbd/                  USB HID keyboard host (boot protocol)
+```
+
+## Component Details
+
+### main/
+
+The application entry point. `app_main()` in `main.cpp` initializes every
+subsystem in order: NVS flash, display hardware, LVGL, battery monitor,
+editor UI, SD card, BLE keyboard, WiFi manager, Git sync, and standby
+timer. It also registers an auto-save callback (`pre_sleep_autosave()`,
+run from every board's pre-sleep hook) that persists every open document
+before entering deep sleep. A user-initiated sleep that chose "Sleep
+without saving" first calls `editor_discard_all_changes()`, so by the
+time this callback runs there is nothing left to save; an automatic
+(inactivity-timeout) sleep never discards.
+
+`app_config.h` defines display-dimension and scale macros from Kconfig
+symbols and then delegates all board-specific pin constants to a thin
+per-board header included from `main/boards/`. Each file in `main/boards/`
+(e.g. `waveshare_rlcd42.h`, `m5stack_papers3.h`) defines exactly one board:
+`BOARD_NAME`, SPI pins (MOSI, SCK, DC, CS, RST, TE), SD card pins
+(CLK, CMD, D0 for SDMMC, or MOSI/MISO/SCK/CS for SPI), I2C pins, the
+battery ADC pin, and the deep-sleep wakeup GPIO. The M5Stack PaperS3
+header omits panel data-bus / control-line pins because the `vroland/epdiy`
+driver configures them internally from the in-tree PaperS3 board definition
+(`components/display/epd_board_papers3.c`).
+
+### components/battery/
+
+Two backends:
+
+* **ADC + resistive divider** (`battery_init(gpio, en, divider)`):
+  reads the cell voltage through a configurable ADC pin and applies
+  exponential moving average smoothing over 8 samples. Voltage maps
+  to percentage as >=4.10 V = 100 %, >=3.95 V = 75 %, >=3.80 V = 50 %,
+  >=3.60 V = 25 %, below 3.60 V = 0 %. The M5Stack PaperS3 reads its
+  cell through ADC1 on GPIO3 with a 1:2 divider, matching the
+  M5Unified Power_Class configuration for that board. When
+  `BATT_ADC_PIN < 0`, `battery_init()` is a no-op.
+* **TI BQ27220 fuel gauge** over I2C (`battery_init_bq27220(bus)`):
+  used on the LilyGO T5 E-Paper S3 Pro / Pro Lite, where the cell is
+  routed through a BQ25896 charger + BQ27220YZFR coulomb counter at
+  0x55 on the I2C bus shared with epdiy (TPS65185 / PCA9535) and
+  GT911. main.cpp creates the bus and passes its handle in. Voltage
+  comes from the Voltage register (0x08, mV), and percentage is
+  derived from that voltage via the same LiPo discharge LUT used by
+  the ADC backend -- the gauge's StateOfCharge register (0x2C) is
+  ignored because the factory ships it with default Data Memory and
+  its Impedance-Track SoC stays pinned around 50 % even after
+  several full discharge/charge cycles. On the T5 the BQ25896 charger
+  supplies the charge state; without it, charge state comes from the
+  sign of AverageCurrent (0x14, > 10 mA = charging). Note 0x06 is
+  Temperature, not a flags register (BatteryStatus is 0x0A); reading
+  it as "Flags" once made the charging glyph follow the temperature's
+  lowest bit. Also used on the Seeed
+  reTerminal Sticky, but on its own dedicated I2C bus (main.cpp
+  creates a second bus for it) rather than a bus shared with epdiy or
+  touch -- see `main/boards/seeed_reterminal_sticky.h`. There is no
+  I2C charger on that bus (the reTerminal Sticky's BQ25616 charger is
+  enabled purely through a GPIO, `CHARGE_EN_PIN`), so charge state
+  comes from AverageCurrent. The Sticky's gauge ships with Data
+  Memory programmed for its pack (DesignCapacity = FullChargeCapacity
+  = 7500), so `CONFIG_DRAFTLING_BATTERY_BQ27220_GAUGE_SOC` makes
+  `battery_read_percent()` report its StateOfCharge (0x2C) there.
+* **TI INA226 power monitor** over I2C
+  (`battery_init_ina226(bus, addr, cells)`): used on the M5Stack
+  Tab5. Bus voltage (register 0x02) is divided by the cell count
+  to derive per-cell mV. Charge state comes from the signed
+  shunt-voltage register (0x01): positive shunt voltage means
+  current is flowing into the pack (the Tab5 wires the shunt so
+  the IP2326 charger pushes positive current into the cell). See
+  `docs/tab5-esp-hosted.md` for the CHG_EN enable path.
+* **CellWise CW2017 fuel gauge** over I2C
+  (`battery_init_cw2017(bus)`): used on the Xteink X4 Pro and X4
+  Classic, at 0x63 on the I2C bus (shared with GT911 touch on the X4
+  Pro). Unlike BQ27220, the CW2017's
+  SOC register (0x04) reports a direct integer percentage -- no
+  voltage-to-percent LUT needed -- but only once a matching 80-byte
+  "BATINFO" battery profile is resident; `battery_init_cw2017()`
+  verifies (or uploads, on first boot) that profile before returning.
+  Register map, reset sequence and the profile bytes were recovered
+  from the X4 Pro OEM firmware by the FreeInk SDK
+  (github.com/Free-Ink/freeink-sdk). There is no charger IC on this
+  board's I2C bus and the CW2017 has no current register, so
+  `battery_read_charging()` always returns -1 (unknown) for this
+  backend.
+* **X-Powers AXP2101 PMIC** over I2C (`battery_init_axp2101(bus)`):
+  used on the Waveshare ESP32-S3-ePaper-3.97, at 0x34. Unlike the
+  CW2017, this chip has a real integrated charger, so
+  `battery_read_charging()` reads STATUS2 (register 0x01, bits
+  [7:5]: 0=standby, 1=charging, 2=discharging) instead of always
+  returning -1. Voltage comes from the ADC result at registers
+  0x34/0x35 (13-bit, 1 mV/LSB, direct millivolts); percentage comes
+  from register 0xA4 as a direct integer 0-100, like the CW2017's SOC
+  register but without needing a profile upload -- just three enable
+  bits set once at init (battery detection 0x68 bit 0, battery-
+  voltage ADC 0x30 bit 0, fuel gauge 0xA2 bit 0). This same chip also
+  switches the e-paper panel's own analog supply rail through its
+  ALDO3 LDO output; a separate entry point,
+  `battery_axp2101_enable_display_rail(bus)`, brings up just that
+  rail (3300 mV) and is called by the display backend
+  (`display_ws_epd397.cpp`) via `display_set_shared_i2c_bus()` --
+  before `display_init()` sends anything over SPI and before
+  `battery_init_axp2101()` runs later in the normal boot sequence.
+  Both entry points share one cached I2C device handle so the chip is
+  only ever added to the bus once, regardless of call order.
+* **M5Stack M5PM1 power-management chip** over I2C
+  (`battery_init_m5pm1(bus)`): used on the M5Stack PaperMono, at
+  0x6E. The chip keeps its registers across ESP32 resets and may sit
+  in I2C idle sleep, so init first wakes it with an address probe,
+  then disables its I2C idle sleep (register 0x09) and watchdog
+  (0x0A) and sets the rail/charging bits in PWR_CFG (0x06) -- the same
+  writes as M5GFX's board_M5PaperMono bring-up. main.cpp therefore
+  calls it early, before `display_init()`, and the normal battery-init
+  call later is a no-op. Voltage comes from VBAT (0x22/0x23, 12-bit
+  mV); there is no fuel gauge, so the percentage uses the LiPo LUT.
+  `battery_read_charging()` reports 1 while PWR_SRC (0x04) says USB
+  (5VIN) powers the board. The chip's GPIO3 doubles as PWM0, which
+  drives the PaperMono front-light:
+  `battery_m5pm1_set_frontlight(percent)`, called by that board's
+  display backend from `display_set_backlight()`.
+
+When no backend has been initialized, `battery_read_percent()`
+returns -1 and the editor UI hides the battery indicator.
+The INA226 backend also returns -1 when the per-cell BUS voltage
+drops below ~2.8 V, which is interpreted as "no battery attached"
+(otherwise the floating cell rail would be misread as ~14-18 % via
+the Li-ion discharge curve).
+Similarly `battery_read_charging()` returns -1 on backends that
+cannot detect charge state (the GPIO-ADC backend), so the UI auto-
+hides the `+` charging glyph on those boards.
+
+Public API: `battery_init()`, `battery_init_bq27220()`,
+`battery_init_ina226()`, `battery_init_cw2017()`,
+`battery_init_axp2101()`, `battery_axp2101_enable_display_rail()`,
+`battery_init_m5pm1()`, `battery_m5pm1_set_frontlight()`,
+`battery_read_mv()`, `battery_read_percent()`, `battery_read_charging()`.
+
+### components/ble_keyboard/
+
+BLE HID keyboard host built on ESP-IDF Bluedroid. Handles device scanning,
+pairing with passkey authentication, connection/disconnection callbacks,
+and keyboard event dispatching. Each key event carries the HID keycode,
+ASCII character, modifier flags, and pressed/released state.
+
+Public API: `ble_keyboard_init()`, `ble_keyboard_start_scan()`,
+`ble_keyboard_is_connected()`, `ble_keyboard_set_callback()`,
+`ble_keyboard_forget_all()`, `ble_keyboard_get_device_addr()`, and
+several other callback registration
+functions.
+
+(Re)connection is scan-driven: the host scans continuously and connects
+to the first advertiser that is either bonded (by Draftling's own NVS
+list or by Bluedroid's bond list, any advertisement type -- directed
+advertising carries no HID data) or a new HID keyboard. There are no
+blocking direct connects to individual bonded addresses: each one costs
+`CONFIG_BLE_ESTABLISH_LINK_CONNECTION_TIMEOUT` (30 s) when that keyboard
+is off. `esp_hidh_dev_open()` blocks through connect, service discovery
+and pairing (including the user typing the passkey), so its watchdog
+measures time without progress: `open_watchdog_progress()` re-arms it on
+every security milestone, and a late but successful open is kept.
+
+`ble_keyboard_forget_all()` erases every stored keyboard bond (both from
+the Bluedroid stack and from NVS), disconnects any currently-connected
+keyboard, resets the reconnection state machine, and immediately starts a
+fresh scan. After the call the device behaves as if it has never paired
+with any keyboard. It can be triggered in three ways: a 2-second hold of
+the wakeup / boot button (all boards that define `WAKEUP_GPIO_NUM`), a
+2-second hold of the side key on the LilyGO T5 E-Paper S3 Pro H752
+(GPIO48), or the "Forget KB" touch button on the BLE-prompt screen
+(boards with `CONFIG_DRAFTLING_TOUCHSCREEN`).
+
+### components/display/
+
+Per-board display backends behind a single C API:
+
+- **display_rlcd.cpp** -- Waveshare ESP32-S3-RLCD-4.2 reflective LCD
+  over SPI.
+- **display_epdiy.cpp** -- E-paper backend for the M5Stack PaperS3
+  ED047TC1 panel and the LilyGO T5 E-Paper S3 Pro / Pro Lite
+  ED047TC2 panel, both driven by the `vroland/epdiy` managed
+  component. epdiy keeps a 4-bpp grayscale framebuffer (one
+  nibble per panel pixel, ~253 KB at 960x540) in PSRAM; the LVGL
+  port pushes RGB565 pixels straight into it through the optional
+  `display_push_rgb565()` fast path, one LVGL pixel per panel pixel
+  (1:1; the former 2x framebuffer upscale has been removed -- these
+  high-density boards render the larger Hack font instead, see
+  `CONFIG_DRAFTLING_DISPLAY_HIDPI`). The backend
+  accumulates a dirty bounding box across pushes and, on
+  `display_flush()`, powers on the EPD rail and runs an
+  `epd_hl_update_area()` partial refresh over the bbox using the
+  single-pulse `EPD_MODE_FAST` waveform (one visible flash,
+  ~80-150 ms); every `CONFIG_DRAFTLING_EPD_FULL_REFRESH_INTERVAL`
+  partials (or whenever the dirty area covers most of the screen,
+  or after `display_clear()` / `display_full_refresh()`) the next
+  refresh is promoted to a full-screen `MODE_GC16` flashing
+  update to clear ghosting. The LilyGO T5 path selects epdiy's
+  built-in `epd_board_v7`; the PaperS3 path selects the in-tree
+  `epd_board_papers3` defined in `epd_board_papers3.c`, which
+  drives EPD_EN (GPIO 45) and BST_EN (GPIO 46) directly (no
+  TPS65185 / PCA9555 expander) and uses the LCD peripheral for
+  STH/CKH/STV/CKV/XLE/D0-D7. Grayscale UI is still TODO.
+- **lvgl_port.cpp** -- creates the LVGL display object, sets up a
+  flush callback that first tries `display_push_rgb565()` (used by
+  the epdiy and AXS15231B backends) and otherwise converts LVGL's
+  RGB565 output to the backend's 1-bpp pixel format via
+  `display_set_pixel()`, and runs the LVGL tick/task timer. Thread
+  safety is provided by a mutex exposed as `lvgl_port_lock()` /
+  `lvgl_port_unlock()`. `flush_cb` software-rotates each tile
+  (`rotate_tile_rgb565()` + `map_area_to_physical()`) for a 90/180/270
+  rotation -- the backends only ever see physical panel coordinates.
+  Its rotation sense is the mirror of LVGL's own
+  `lv_display_rotate_area/point()`, so `lv_display_set_rotation()` is
+  fed the mirrored quarter turn via `lvgl_rotation_for_port_deg()` --
+  see the "Display orientation" section for why that keeps touch input
+  aligned.
+- **display_rgb.cpp** -- parallel RGB565 backend for the ESP32-S3 LCD
+  RGB peripheral (`esp_lcd_new_rgb_panel`), selected by
+  `CONFIG_DRAFTLING_DISPLAY_RGB`. Shared by the Sunton ESP32-8048S070C
+  / ESP32-8048S043C (direct-GPIO backlight via LEDC PWM, no LCD reset
+  line) and the Waveshare ESP32-S3-Touch-LCD-7
+  (`CONFIG_DRAFTLING_HAS_CH422G`: backlight and LCD reset instead
+  routed through a CH422G I2C IO-expander -- see
+  `components/io_expander/`) and the Waveshare ESP32-S3-LCD-3.16
+  (`CONFIG_DRAFTLING_RGB_PANEL_ST7701`: an ST7701 controller that is
+  first configured over a bit-banged 3-wire SPI bus -- CS=GPIO0 (BOOT),
+  SCK=GPIO2, SDA=GPIO1, which are the SDMMC CMD / CLK lines -- inside
+  `display_init()`, after which the pins are released; direct-GPIO
+  reset, active-low LEDC backlight that is latched off for deep
+  sleep). Each board selects its own pin/timing
+  branch and data-line order at build time; keeps its own RGB565
+  framebuffer in PSRAM with the same dirty-bbox
+  `display_push_rgb565()` / `display_flush()` pattern as the epdiy
+  backend.
+- **display_ili9341.cpp** -- shared SPI backend for the Freenove
+  FNK0104A/B (ILI9341) and FNK0104S (ST7796) color LCDs, selected by
+  `CONFIG_DRAFTLING_DISPLAY_ILI9341` / `CONFIG_DRAFTLING_DISPLAY_ST7796`
+  respectively. Both panels are wired identically (MOSI/SCK/CS/DC,
+  no hardware RST, GPIO45 active-high backlight) so one file holds
+  both controllers' init command sequences and a shared
+  `display_flush()` path that byte-swaps the whole dirty rectangle
+  into a PSRAM scratch buffer and sends it with a single
+  `esp_lcd_panel_io_tx_color()` call -- refilling the scratch buffer
+  row-by-row across multiple queued `tx_color()` calls previously
+  raced with the async DMA hardware, corrupting the lower portion of
+  the screen once the transaction queue filled up.
+- **display_st77922.cpp** -- QSPI backend for the Freenove FNK0104N's
+  3.5" 320x480 ST77922 panel, gated on `CONFIG_DRAFTLING_DISPLAY_ST77922`.
+  A port of Freenove's own Arduino driver onto the raw `spi_master`
+  API: register writes are opcode 0x02 + 24-bit address on one lane,
+  pixel writes opcode 0x32 + RAMWR / RAMWRC with 4-lane RGB565 data
+  (COLMOD 0x01), sent in 8K-pixel chunks from internal DMA memory at
+  40 MHz. SWRESET then the vendor init table (the panel's RESET pin is
+  tied to CHIP_PU, which a software reset does not toggle). Works in
+  the native portrait frame; the LVGL port's 90-degree base rotation
+  turns it landscape. Flush windows are widened to 4-column
+  boundaries. Logs RDDPM after init as a health check (0x9C = on,
+  0xFF = no reply). See the ESP-IDF QUAD-flag bug noted under
+  "Supported Hardware".
+- **display_xteink_epd.cpp** -- from-scratch SPI e-paper backend for
+  the Xteink X4 Pro and X4 Classic, gated on
+  `CONFIG_DRAFTLING_DISPLAY_XTEINK_EPD`. The two boards share the
+  controller code and differ only in the DC/RST/BUSY pin set and
+  whether the front-light code compiles in -- both switched at build
+  time on `CONFIG_DRAFTLING_MODEL_XTEINK_X4_CLASSIC` /
+  `CONFIG_DRAFTLING_DISPLAY_HAS_BACKLIGHT`.
+  Unlike the other e-paper backends this board carries one of three
+  possible panel controllers depending on manufacturing run (SSD1677,
+  or one of two UltraChip parts, UC8179 / UC8279); `display_init()`
+  bit-bangs a small VER/FLG identification probe over the panel pins
+  before the SPI peripheral claims them, then drives whichever
+  controller is present through its own register sequence (SSD1677:
+  dual-RAM 0x24/0x26 differential refresh; UC8179 / UC8279: KW-mode
+  DTM1/DTM2 differential refresh via PARTIAL_IN/PARTIAL_OUT). A 1bpp
+  PSRAM framebuffer + dirty-rect tracking and the full-vs-partial
+  promotion policy (`CONFIG_DRAFTLING_EPD_FULL_REFRESH_INTERVAL`)
+  mirror `display_h752.cpp`. Only the black/white differential path
+  is implemented; grayscale / anti-aliasing is out of scope. Register
+  sequences, timing and the controller probe are ported from the
+  FreeInk SDK (github.com/Free-Ink/freeink-sdk, MIT licensed), which
+  reverse-engineered the OEM firmware. Drives a dual-channel (cool/
+  warm) front-light LEDC PWM, both channels always driven identically.
+- **display_ssd1683.cpp** -- from-scratch dual-controller SPI
+  e-paper backend for the Elecrow CrowPanel ESP32-S3 5.79" E-Paper
+  HMI Display, gated on `CONFIG_DRAFTLING_DISPLAY_SSD1683`. The
+  792x272 panel is built from two SSD1683 driver chips, one per half
+  (a "slave" driving columns 0-399 and a "master" driving columns
+  392-791, differentiated purely by command set on a shared SPI
+  bus, every slave command being the master's command `+0x80`); every
+  refresh rewrites each chip's *entire* RAM window (not just the
+  dirty rectangle -- narrower windowing was found unreliable on real
+  hardware) from a 1-bpp PSRAM framebuffer. The master/slave
+  RAM-window addressing math (including the master's inverted
+  X-address counting and the seam-alignment special case) originates
+  from the community ESPHome driver at
+  github.com/samperk1/esphome-crowpanel-579. A single Master
+  Activation trigger on this panel can leave an incomplete pixel
+  transition regardless of waveform or RAM content; `display_flush()`
+  runs both the full and partial refresh paths twice, back-to-back, to
+  reliably complete it (matching what pressing Ctrl+R always did) --
+  see HARDWARE.md's CrowPanel section and PR #47 for the full
+  investigation.
+- **display_ws_epd397.cpp** -- from-scratch SPI e-paper backend for
+  the Waveshare ESP32-S3-ePaper-3.97, gated on
+  `CONFIG_DRAFTLING_DISPLAY_WS_EPD397`. Unlike the Xteink X4 Pro, this
+  board carries a single panel controller, so there is no boot-time
+  controller-detection probe -- the register sequence is the same
+  SSD1677-family dual-RAM 0x24/0x26 differential refresh already
+  implemented by `display_xteink_epd.cpp`'s `ssd1677_*` functions,
+  reimplemented here for this board's own pins (not shared code, but
+  the same protocol). No front-light. Its
+  `display_set_shared_i2c_bus()` is NOT a no-op (unlike the Xteink
+  backend's): this board's e-paper panel is powered through an
+  on-board AXP2101 PMIC's ALDO3 LDO output, so `display_init()` cannot
+  talk to the panel over SPI until ALDO3 is enabled over I2C first --
+  see `components/battery/battery.cpp`'s
+  `battery_axp2101_enable_display_rail()`, called from this hook.
+- **display_seeed_e1001.cpp** -- from-scratch SPI e-paper backend for
+  the Seeed Studio reTerminal E1001, gated on
+  `CONFIG_DRAFTLING_DISPLAY_SEEED_E1001`. Drives the 7.5-inch 800x480
+  monochrome panel directly over SPI (SPI2_HOST, shared with the on-board
+  MicroSD slot) using the UltraChip UC8179 controller and OTP waveforms.
+  Supports full refresh (~1.2 s, TSSET 0x5A) and fast partial windowed
+  updates (~450 ms, TSSET 0x6E, PARTIAL_IN/WINDOW/OUT). No backlight.
+- **display_reterminal_sticky.cpp** -- from-scratch SPI e-paper
+  backend for the Seeed reTerminal Sticky, gated on
+  `CONFIG_DRAFTLING_DISPLAY_RETERMINAL_STICKY`. Sticky units carry
+  either an SSD1677 or an SSD2677 controller; `display_init()` tells
+  them apart by BUSY polarity after reset (the SSD1677 holds BUSY
+  high while busy, the SSD2677 low), as Seeed_GFX2's
+  `Driver_Sticky_Auto` does. The SSD1677 path (dual-RAM differential
+  refresh) is tested on physical hardware and uses the same
+  sequences as `display_ws_epd397.cpp` (see "SSD1677 refresh method"
+  below). Its earlier sticky-micronotes sequences (full CTRL2 0xF7,
+  fast 0xFF, plus a re-driven band around each change) left
+  noticeably more ghosting. The first attempt with the ws_epd397
+  sequence seemed not to change the glass, but the panel was blank
+  then anyway because of the unpowered SD card (see below). The
+  SSD2677 path (2bpp DTM1 data, waveform latch, no RAM windows) is ported from Seeed_GFX2's
+  `Driver_SSD2677.cpp` and is untested. The SPI bus is shared with the
+  on-board MicroSD card (separate `CS`, same `SCLK`/`MOSI`/`MISO`):
+  main.cpp powers the card (`SD_EN_PIN`) and drives its CS high before
+  `display_init()`, because an unpowered card on the bus kept the panel
+  from ever showing an image. The panel's SDO is not readable over
+  `MISO`. No PMIC: the panel's power-enable pin is a plain GPIO.
+  The SSD1677 refresh is started without waiting for BUSY (it runs
+  from the LVGL flush callback, and blocking there for the ~0.4 s
+  waveform stopped touch polling, so the second tap of a double-tap
+  was lost); `sticky_wait_idle()` waits before the next panel command
+  and then re-syncs both RAM planes from `s_shown`, the driver's copy
+  of the frame on the glass.
+- **display_m5_papermono.cpp** -- from-scratch SPI e-paper backend
+  for the M5Stack PaperMono / PaperMono-Lite, gated on
+  `CONFIG_DRAFTLING_DISPLAY_M5_PAPERMONO`. Same single-SSD1677
+  differential-refresh protocol and RAM addressing as
+  `display_ws_epd397.cpp` (M5GFX's Panel_SSD1677 addresses this panel
+  the same way), with M5GFX's booster soft-start / border values. The
+  panel has no reset GPIO: its supply and RST are M5IOE1 expander
+  outputs that main.cpp drives before `display_init()`, so
+  `display_set_shared_i2c_bus()` is a no-op here. The front-light is
+  the M5PM1's PWM0 (`battery_m5pm1_set_frontlight()`).
+- **display_margins.cpp** / **display_orientation.cpp** /
+  **display_flip.cpp** -- the three runtime, NVS-persisted,
+  frozen-at-boot display settings that feed `SCR_W`/`SCR_H` and the
+  LVGL rotation angle. See the "Screen margins", "Display
+  orientation" and "Display upside down" sections further down.
+
+**SSD1677 refresh method.** Every SSD1677 e-paper backend must use
+the method of
+`display_ws_epd397.cpp`, which gives the cleanest image with the least
+ghosting on these 3.97" / 4.26" 800x480 panels (confirmed on the
+Waveshare ePaper-3.97 and the Seeed reTerminal Sticky):
+
+- Init: booster soft-start `0xAE 0xC7 0xC3 0xC0 0x80`, border `0x80`,
+  BW and RED RAM auto-filled white (0x46 / 0x47 `0xF7`).
+- Fast refresh: write the new frame to RAM_BW (0x24) and leave RAM_RED
+  (0x26) holding the previous frame, then CTRL1 (0x21) `0x00`, border
+  (0x3C) `0xC0`, CTRL2 (0x22) `0xFC`, MASTER_ACTIVATION (0x20).
+- Full refresh: the same `0xFC` sequence, but RAM_RED is loaded with
+  the bitwise inverse of the new frame so every pixel counts as
+  changed and is re-driven. Do not use the Mode 1 `0xF7` / Mode 2
+  `0xC7` / `0xFF` flood sequences or CTRL1 `0x40`.
+- After each refresh, write the shown frame to both RAM_BW and
+  RAM_RED so the next fast refresh diffs against a clean baseline.
+- Before DEEP_SLEEP (0x10 `0x03`), power analog and clock off with
+  border `0x80`, CTRL2 `0x03` and an activation, since `0xFC` leaves
+  them on.
+
+Board-specific needs (SPI clock, pins, power rails, a non-blocking
+refresh as on the Sticky) may differ; the register sequence should not.
+
+The component's `idf_component.yml` declares the `vroland/epdiy`
+dependency required by both e-paper backends; the source files
+themselves are gated by `CONFIG_DRAFTLING_DISPLAY_EPDIY` so
+non-e-paper builds do not link epdiy into the final image.
+
+Public API: `display_init()`, `display_clear()`, `display_set_pixel()`,
+`display_flush()`, `display_full_refresh()`, `display_push_rgb565()`,
+`display_set_partial_clip()`, `display_set_backlight()`,
+`display_controller_name()`, `display_get_buffer()`,
+`display_get_buffer_size()`, `lvgl_port_init()`,
+`lvgl_port_lock()`, `lvgl_port_unlock()`.
+
+### components/editor/
+
+The largest component. Contains:
+
+- **editor.cpp** -- gap-buffer text engine with a document size limit
+  sized dynamically at `editor_init()` from the PSRAM that is free
+  when the editor starts (the gap buffer and flat cache are each
+  allocated at that size, so the editor's SPIRAM cost is ~2x the
+  limit; the value is clamped to a minimum of 64 KB and an upper
+  bound returned by `git_sync_max_file_size()` -- so the editor never
+  produces a document larger than what git_sync can push -- and a
+  ~512 KB headroom is reserved inside git_sync_max_file_size() for
+  BLE / WiFi / Git sync / LVGL widget growth). Exposes `editor_get_max_doc_size()` for the UI,
+  which surfaces the value read-only in F1 -> Settings. Provides
+  cursor movement, selection, clipboard, insert/delete, and file I/O.
+- **editor_ui.cpp** -- LVGL-based user interface: title bar with battery
+  and layout indicators, scrollable text area with Markdown rendering,
+  status bar, file browser dialog, and settings menu (F1).
+- **md_parser.cpp** -- single-pass Markdown line parser. Recognizes
+  headings H1-H4, bullet and numbered lists, blockquotes, code fences,
+  horizontal rules, and inline spans: `` `code` `` (any backtick-run
+  length), `*italic*` / `_italic_`, `**bold**` / `__bold__`,
+  `***both***` and `~~strikethrough~~`. A simplified subset of the
+  CommonMark delimiter rules applies (an opener must be followed and a
+  closer preceded by non-whitespace, `_` never matches inside a word,
+  closer run length must equal the opener's, backslash escapes and
+  code spans are skipped), and emphasis spans nest ("**a *b* c**").
+  Each `md_span_t` carries `mark_len`, the length of its marker on
+  each side, so the UI can hide the markers.
+- **fountain_parser.cpp** -- line classifier for the Fountain
+  screenplay format (https://fountain.io/syntax/). A Fountain element
+  depends on its neighbours, so the caller threads an `ftn_state_t`
+  from the first line down and says whether the next line is blank.
+  Results are reported as an `md_line_info_t`: the `MD_LINE_FTN_*`
+  types (scene heading, action, character, dialogue, parenthetical,
+  transition, centered, lyric, synopsis, title page, note, boneyard),
+  plus `MD_LINE_H1..H3` for sections, `MD_LINE_HR` for page breaks and
+  `MD_LINE_EMPTY`; `content` excludes forcing characters (`.`, `!`,
+  `@`, `>`, `~`, `=`), the dual-dialogue `^` and centering `<`. Spans
+  carry `*` / `**` / `***` emphasis, `_underline_` (`md_span_t::
+  underline`), notes (`code`, `mark_len` 0) and boneyard text
+  (`strikethrough`, `mark_len` 0); notes and boneyard may span lines.
+- **editor_format.h** (`private_include/`), **md_editor.cpp**,
+  **fountain_editor.cpp**, **text_editor.cpp** -- per-format editing
+  behaviour. `editor_ui.cpp` holds everything the formats share and
+  asks `editor_format_active()` (picked from the active document's
+  `editor_get_format()`) for line classification with scan state
+  (`parse_line`), marker hiding / line-wide decoration (`mark_line`),
+  per-element label layout (`apply_layout`: Fountain's screenplay
+  indents and alignment), the e-paper typing fast-path check
+  (`line_is_plain`; always false for Fountain) and Enter / Tab hooks
+  (Fountain: a blank line after a scene heading / transition, and
+  Slugline-style Tab completion of character names and scene
+  headings). The plain-text format classifies every line as a
+  paragraph (or empty) with no spans, markers or decorations, so the
+  text displays exactly as typed (tabs still expand to four cells).
+  Keep format-specific code in these files rather than in
+  `editor_ui.cpp`.
+- **draftling_logo.c** -- embedded LVGL image for the splash screen.
+
+**Document format** is a per-document `editor_doc_format_t` in
+`editor_doc_t` (`EDITOR_DOC_MARKDOWN`, `EDITOR_DOC_FOUNTAIN`,
+`EDITOR_DOC_TEXT`; `editor_get_format()` / `editor_set_format()`).
+`editor_path_format()` maps a `.md` / `.fountain` / `.txt` name to its
+format (and is what the file browser filters on);
+`editor_open_file()` sets the format from the path (Markdown for an
+unrecognised extension), `editor_save_file_as()` follows a recognised
+extension and otherwise keeps the current format, and
+`editor_format_ext()` gives the extension `generate_default_name()`
+proposes (`draft_NNN.<ext>`, numbers shared across all three). Because
+every pane renders its own bound document, the two panes of a split
+can show different formats.
+
+**New file.** `Ctrl+N` in the editor and `N` / `Ctrl+N` in either file
+browser raise the format picker overlay (`s_newfmt_panel`,
+`show_newfmt_prompt()` / `handle_newfmt_prompt_key()`): Markdown,
+Fountain screenplay or plain text, chosen with Up/Down + Enter or the
+M / F / T accelerators. A `newdoc_target_t` remembers where it was
+raised (full-screen browser, split-mode in-pane selector, or editor)
+so `newfmt_prompt_activate()` creates the untitled document in the
+right place and then applies the format.
+
+**Rename.** `F2` or `Alt+R` in either file browser opens the save-as name
+overlay in rename mode (`show_rename_prompt()`, `s_save_is_rename`).
+The overlay (like the format picker) is re-parented with
+`lv_obj_set_parent()` onto the active screen each time it is shown,
+since the browser and the editor are different LVGL screens.
+`editor_rename_file()` renames the file and its `.<name>.meta`
+sidecar, refuses to overwrite an existing file (a case-only change is
+allowed), and re-points any open document with the old path at the
+new one (taking the new extension's format). The UI rejects names
+without a document extension, since the file would vanish from the
+browser. Directories cannot be renamed.
+
+**Delete.** `Del` or `Alt+D` in either file browser deletes the
+selected file, but only when `git_sync_file_status()` reports
+`GIT_SYNC_FILE_PUSHED`: the file's current content hashes to the same
+blob as its entry in the last commit known to be on the server
+(`refs/remotes/origin/<branch>` under the `path=` sub-tree). Any other
+status (Git sync not configured, a sync running, file new or modified
+since the last push) only puts the reason in the status bar, so a
+deleted file can always be recovered from the repository history. A
+safe file gets a Delete / Cancel overlay (`s_del_panel`,
+`show_delete_prompt()` / `handle_delete_prompt_key()`, Cancel
+preselected, re-parented onto the active screen like the rename
+overlay); `editor_delete_file()` then removes the file and its
+`.meta` sidecar, refusing while the file is open in a pane. The next
+sync commits the deletion.
+
+**Format SD card.** The F1 row `MENU_IDX_FORMAT_SD` (letter `F`) opens a
+picker rendered into `s_menu_list` like the "SD card via USB" one, with
+the question in the menu header (`s_lbl_menu_hdr`, reset to
+`MENU_HDR_TEXT` on close). Steps (`fmt_step_t`): `FMT_STEP_WIFI` keep /
+erase the WiFi settings (skipped when none are configured; the
+credentials are read here, before the card is wiped), then two
+confirmations with Cancel preselected. `fmt_start()` refuses while SD
+via USB is active, no card is mounted, or a Git sync is running; it
+calls `editor_discard_all_changes()` so no auto-save writes the old
+documents back, shows the busy message pop-up and runs `fmt_task()`:
+`sd_card_format()`, then `wifi_manager_save_to_file()` (keep) or
+`wifi_manager_forget()` (erase), then `esp_restart()` so nothing keeps
+pointing at the deleted files (open documents, Git repository,
+`git.cfg`).
+
+**Hardware information.** The F1 row `MENU_IDX_HWINFO` (letter `I`)
+shows `build_hwinfo_text()` on the help screen (`show_hwinfo()`, which
+shares `show_help_page()` and the key / touch handling with the help
+page): the board name main.cpp passes in through
+`editor_ui_set_board_name(BOARD_NAME)`, the chip (`esp_chip_info()`),
+internal RAM and PSRAM heap totals / free space (`heap_caps_*`), the
+PSRAM size (`esp_psram_get_size()`), the flash size
+(`esp_flash_get_physical_size()`), `display_controller_name()`
+(every display backend implements it; the Xteink and reTerminal Sticky
+backends return the controller detected at boot), the touch controller
+from the `DRAFTLING_TOUCH_*` flags, the panel resolution and text
+area, the SD card from `sd_card_get_handle()` and
+`sd_card_get_fs_space()`, the connected keyboards (with the BLE
+keyboard's address from `ble_keyboard_get_device_addr()`) and the WiFi /
+Bluetooth MAC addresses (`esp_read_mac()`).
+
+**F1 menu letter keys.** `s_menu_hotkeys[]` in `editor_ui.cpp` maps
+a letter (resolved with `kb_layout_shortcut_char()`, no Ctrl / Alt /
+Win) to a menu row and the character index of that letter in the
+row's label; `handle_menu_key()` activates the row (`K` only moves the
+highlight to the keyboard-layout row). There is no bold font, so
+`menu_hotkey_draw_cb()` (`LV_EVENT_DRAW_MAIN_END` on the row label)
+redraws the letter 1 px to the right, following the circular-scroll
+offset of an overflowing `lv_list` label (read from
+`lv_label_private.h`). Keep the index in sync when a label changes.
+
+**Settings** is the first item in the F1 menu (moved to the top so it
+is a single Enter away without navigating past the connectivity
+items). It opens an in-line list with: standby timeout, base font
+size, **Backlight** (NN%, only on boards with
+`CONFIG_DRAFTLING_DISPLAY_HAS_BACKLIGHT` -- the value is persisted
+in NVS under the `editor` namespace and applied at boot via
+`display_set_backlight()`; default 50%), color theme (only on
+`CONFIG_DRAFTLING_DISPLAY_COLOR`), append-only editing, **display
+orientation** (Landscape / Portrait -- see the "Display orientation"
+section below), **display upside down** (On / Off -- see the "Display
+upside down" section below; hidden on boards that already expose the
+live-apply "Rotate 180" toggle, `CONFIG_DRAFTLING_DISPLAY_CAN_ROTATE`),
+four screen margins (Left/Right/Top/Bottom, 0-40 px in
+2 px steps, zero by default -- see the "Screen margins" section above),
+factory reset and back. The orientation, upside-down and margin rows
+are persisted immediately but only take effect after a restart, hence
+the "(restart to apply)" suffix on their labels; leaving Settings with
+any of them changed this visit (`s_restart_needed`) raises the shared
+"Restart now to apply changes" prompt. ("Sleep now" used to sit here; it is now a top-level F1 menu item
+-- see below.) Picking a new color theme does NOT reboot the device:
+`rebuild_screens_for_theme()` deletes every screen / overlay /
+screen-bound timer, re-runs `init_styles()` under the new palette,
+calls `build_screens()` again and restores the screen the user was
+on. The persistent state (open document, NVS-backed font size /
+theme / backlight / standby timeout) survives the rebuild.
+
+Public API: `editor_init()`, `editor_open_file()`, `editor_save_file()`,
+`editor_rename_file()`, `editor_get_format()` / `editor_set_format()`,
+`editor_ui_init()`, `editor_ui_handle_key()`, `editor_find()`,
+`editor_replace_range()`, `md_parse_line()`, and many
+cursor/selection/clipboard helpers.
+
+**WYSIWYG rendering.** Body lines are displayed with their Markdown
+applied, not as raw text. `build_line_view()` in `editor_ui.cpp` turns
+each raw line into the label's display text plus a `line_view_t`:
+heading / blockquote / code-fence markers, the markers around inline
+spans and a `---` rule are hidden, the bullet marker is replaced by a
+drawn dot (filled circle / hollow circle / square by nesting level),
+a hard line break (an unescaped trailing `\`, or the last of two or
+more trailing spaces, on a paragraph / blockquote / list line) is
+replaced by a drawn return arrow (`DECO_BREAK`, also on the cursor
+line, 1:1 like the bullet), and tabs expand to four spaces. The line holding the focused pane's
+cursor is built with `reveal = true`: its markers stay visible so they
+can be edited (live preview), but its styling is still drawn. The
+per-line `lv_label` is kept -- its letter-position / hit-test and
+native text-selection APIs drive the cursor, selection and touch code
+-- and the styling is painted over it by `line_deco_draw_cb()`
+(`LV_EVENT_DRAW_MAIN_END`) from row segments computed by
+`layout_line_decorations()` once per re-render. There are no bold or
+italic font assets: bold redraws each glyph 1 px to the right (2 px on
+fonts with a line height >= 40), italic blanks the glyph cell and
+redraws it as 4-row horizontal bands shifted progressively right above
+the baseline (clipped via the layer's `_clip_area`), strikethrough is a
+bar at x-height, inline code a 1 px box, and headings are also bold.
+Because the display text can differ from the raw line,
+`line_view_t::d2r` maps each display character to its raw byte offset;
+cursor placement, partial selection and `ui_point_to_offset()` go
+through `view_raw_to_disp()` / `view_disp_to_raw()`, never through
+character counts on the raw line. The render cache compares the view's
+styling flags as well as the display text, since hidden markers can
+make two differently-styled lines display the same text. The e-paper
+typing fast path (`capture_typing_pre_state()`) only applies to lines
+with no styling at all (the format's `line_is_plain` hook), because typing a
+closing marker restyles characters left of the cursor.
+
+The editor stores text as **UTF-8** internally. `editor_open_file()`
+inspects the leading bytes of each file for a Unicode BOM and
+transcodes on the fly so that files saved from desktop editors render
+correctly:
+
+| BOM bytes          | Encoding   | Handling                          |
+|--------------------|------------|-----------------------------------|
+| `EF BB BF`         | UTF-8      | BOM stripped, rest stored as-is   |
+| `FF FE`            | UTF-16 LE  | Transcoded to UTF-8 via `transcode_utf16_to_utf8()` |
+| `FE FF`            | UTF-16 BE  | Transcoded to UTF-8 via `transcode_utf16_to_utf8()` |
+| (none)             | UTF-8      | Stored as-is                      |
+
+Without this conversion a UTF-16 file (Windows Notepad still defaults
+to "Unicode" = UTF-16 LE for many scripts) would arrive as alternating
+text bytes and `0x00`/`0x05` filler, and Hebrew / Cyrillic / CJK runs
+would render as random Latin-1 glyphs. The transcoder decodes UTF-16
+surrogate pairs into single supplementary-plane codepoints, replaces
+unpaired surrogates with U+FFFD, and silently drops the CR (U+000D)
+half of Windows CRLF line endings.
+
+**Help.** `F10` in the editor, either file browser, or the F1 menu's
+"Help" item opens a scrollable help screen (`s_scr_help`,
+`show_help()` / `handle_help_key()` / `close_help()`). A
+`help_origin_t` records whether it was opened from the editor, the
+full-screen browser or the split-mode in-pane selector, which picks
+the shortcut list and where Esc / Enter return to. In the editor the
+page also lists the focused document's formatting syntax, taken from
+its `editor_format_t` (`help_title` and the `{ NULL, NULL }`-terminated
+`help` rows), so each format keeps its cheat sheet in its own file.
+Rows are word-wrapped by hand (`help_row()`) with a hanging indent so
+the descriptions stay in their column on narrow panels.
+
+**Double-tap** (touch boards) selects the word under the finger
+(`editor_touch_event_cb()`): a click counts as the second tap when its
+press began within `TOUCH_DOUBLE_TAP_MS` (400 ms) of the previous
+click's release and within `TOUCH_DOUBLE_TAP_PX` of it (12 px, 24 px on
+`CONFIG_DRAFTLING_DISPLAY_HIDPI` boards). Timing from press, not
+release, keeps the finger's dwell time out of the window.
+
+Editor shortcuts include `Ctrl+F` (Find) and `Ctrl+H` (Find +
+Replace). Both open a modal overlay; in Find+Replace mode, `Tab`
+switches between the Find and Replace fields, `Enter` jumps to the
+next match (wrapping at end-of-document), and `Ctrl+Enter` replaces
+the current match and advances to the next.
+
+The keyboard layout is cycled with `Ctrl+L` or, equivalently, with
+`Win+Space` (the GUI modifier plus HID keycode 0x2C); both call
+`kb_layout_next()` from `handle_editor_key()`.
+
+`Ctrl+P` (and the F1 menu's "Sleep now" item) enters deep sleep via
+`standby_enter_sleep()`. When the active document has unsaved changes it
+first raises the exit/sleep overlay (`show_sleep_prompt()`; the same
+LVGL objects as the Esc prompt, with `s_exit_purpose = EXIT_PURPOSE_SLEEP`
+and relabelled rows). "Sleep without saving" calls
+`editor_discard_all_changes()` -- which reloads every modified titled
+document from the SD card and clears every modified untitled one -- so
+the pre-sleep auto-save then has nothing to persist. From the F1 menu
+the item first `close_menu()`s so the overlay is drawn on the editor
+screen it belongs to. `Ctrl+P` also works from the full-screen file
+browser (`handle_browser_key()`); there it just calls
+`standby_enter_sleep()` (no editor screen to prompt on -- the pre-sleep
+auto-save covers any open document).
+
+The editor UI supports a two-pane **split screen** built
+on the multi-document engine. `editor_ui.cpp` wraps the per-pane UI
+state (container, cursor, logo, line-label / selection-rect arrays,
+render caches, bound `editor_doc_t`, and pane geometry x / w / y / h)
+in a `pane_t` struct held in a fixed `s_panes[EDITOR_MAX_PANES]`
+(EDITOR_MAX_PANES = 2) pool, mirroring the `editor_doc_t` aliasing
+pattern in `editor.cpp`: macros alias the historical widget globals
+(`s_cont_edit`, `s_cursor`, ...) to `s_rp->...` where `s_rp` is the
+currently rendered pane. `pane_bind()` / `pane_bind_focus()` point
+`s_rp` and the engine's active document at a pane before drawing or
+handling a key. `editor_ui_refresh()` loops the active panes
+(unfocused first, focused last) calling `refresh_active_pane()` for
+each, then updates the title / battery once. The split layout is
+driven by `split_mode_t` (SPLIT_NONE, SPLIT_HALF, SPLIT_LEFT_2_3,
+SPLIT_LEFT_1_3 -- read "LEFT" as "first pane"); `recalc_pane_geometry()`
+splits along the display's long axis: left/right (vary x / width, full
+height) in landscape, top/bottom (vary y / height, full width) in
+portrait (`display_orientation_is_portrait()`), with `s_pane_divider`
+the 1 px rule between them. Shortcuts: `Ctrl+1` single pane
+(`SPLIT_NONE`), `Ctrl+2` equal split (`SPLIT_HALF`), `Ctrl+3`
+first-pane-2/3 then toggling to 1/3 (`editor_ui_cycle_wide_split()`),
+`Ctrl+Tab` move focus between panes (`editor_ui_focus_other_pane()`). Digit HID keycodes (1 = 0x1E,
+2 = 0x1F, 3 = 0x20) and `KB_KEY_TAB` are matched before the a..z Ctrl
+switch in `handle_editor_key()`. `Ctrl+1/2/3` also work from both file
+browsers: `handle_browser_key()` (full-screen) applies the mode and, if
+that enables a split, switches straight to the editor so the layout is
+visible immediately (`Ctrl+O` in a pane then picks its file);
+`handle_inpane_browser_key()` (the split-mode overlay) closes the
+overlay and re-applies the mode via `editor_ui_apply_split_mode()`,
+which repaints and hands key routing back to `handle_editor_key()` --
+`Ctrl+1` from there is how the user collapses a split entered by
+mistake (a split editor shows this overlay, not the full-screen
+browser, on Esc). While split, the file browser
+(`Ctrl+O`) targets the focused pane via `open_into_pane()`, so each
+panel opens a file for itself (focus a pane, then `Ctrl+O`); opening
+the same path in both panes shares one refcounted buffer (two views of
+one document). Enabling a split acquires a fresh untitled document
+into pane 1; collapsing keeps it open in the background. The split
+mode persists in NVS (`editor` namespace, key `split`) via
+`save_split_to_nvs()` / `load_split_from_nvs()` and is restored at the
+end of `editor_ui_init()` (only the layout is restored, not the open
+documents, matching the existing boot-to-file-browser behavior).
+Auto-save, the standby pre-sleep callback, and `Ctrl+G` git-sync all
+iterate every open document via `editor_doc_foreach()`.
+
+`Esc` in the editor leaves to the file browser. When the document has
+unsaved changes it instead opens a small modal overlay (`s_exit_panel`,
+handled by `handle_exit_prompt_key()`) offering three choices --
+"Save and exit", "Exit without saving" and "Cancel (keep editing)" --
+navigated with `Up`/`Down` and confirmed with `Enter`; `Esc` inside
+the dialog cancels. For an untitled document, "Save and exit" first
+opens the save-as prompt so the user can name the file.
+
+The title bar shows `L %d/%d` (current line / total lines) on every
+build; on non-EPD targets the column counter is appended as well.
+
+The bottom status bar of both the editor and the file browser
+displays a small Wi-Fi icon (`components/editor/wifi_icon.c`) in the
+right corner whenever `wifi_manager_is_connected()` is true. The base
+Greybeard fonts cover U+0020-U+00FF plus a few currency / numero
+glyphs, which excludes the U+1F6DC "wireless" pictograph, so the
+icon is rendered from a small embedded LVGL `LV_COLOR_FORMAT_I1`
+image instead of as a font glyph. Two pre-baked descriptors are
+exposed (black-on-transparent for the default theme and
+white-on-transparent for `CONFIG_DRAFTLING_EPD_BLACK_BACKGROUND`).
+
+A second pair of descriptors (`wifi6_icon_black`/`wifi6_icon_white`)
+stacks a small "6" digit above the same Wi-Fi glyph. `update_wifi_icons()`
+in `editor_ui.cpp` switches to that variant -- and re-centers the icon
+vertically, since it is taller -- whenever `wifi_manager_has_global_ipv6()`
+is true, i.e. the WiFi network is IPv4/IPv6 dual-stack. See
+`components/wifi_manager/` above for how that flag is derived.
+
+### components/fonts/
+
+Custom LVGL bitmap fonts. Standard-density boards use the Greybeard
+typeface; high-density boards (`CONFIG_DRAFTLING_DISPLAY_HIDPI`) use
+the Hack typeface at larger native sizes instead of upscaling the
+framebuffer. See the dedicated section below for the full creation
+process.
+
+### components/git_sync/
+
+A minimal but real **native Git client**. It keeps a genuine commit
+history under `<sdcard>/.git` and exchanges objects with the remote over
+the standard smart HTTP protocol (`gitprotocol-http`): `info/refs`,
+`git-upload-pack` (fetch) and `git-receive-pack` (push), pkt-line
+framing, packfile v2 transfer. No host-specific REST API is used, so any
+standard Git HTTP host works. Configuration (`repo_url`, `branch`,
+`token`, `username`, `path`, `author_name`, `author_email`) is read from
+`/sdcard/git.cfg`. User-facing docs: `docs/git-sync.md`.
+
+Source layout (all in-tree, no managed components):
+
+- `git_sync.cpp` -- config parsing, the sync task, the working-tree
+  file filter (`is_doc()`: `*.md`, `*.fountain` and `*.txt`), and the orchestration
+  (advertise -> clone -> local commit -> fetch -> fast-forward/rebase ->
+  three-way merge -> checkout -> push). Keeps the historical public API.
+- `git_util.c` -- oids, growable `git_buf`, SHA-1 (Mbed TLS / PSA), and
+  zlib inflate/deflate via the ROM miniz (`tinfl_*` / `tdefl_*` from
+  `esp_rom/include/miniz.h`).
+- `git_odb.c` -- repo layout, loose object store, refs, tree/commit
+  parse+build, subtree splicing, merge-base and reachability walks.
+- `git_pack.c` -- packfile v2 reader (incl. OFS_DELTA / REF_DELTA and
+  delta application) and a non-delta packfile writer.
+- `git_net.c` -- pkt-line framing and the `esp_http_client`-based
+  transport (`info/refs`, `git-upload-pack`, `git-receive-pack`), HTTP
+  Basic auth. Every request goes through `http_open()`, which prefers
+  the server's `AAAA` record (`esp_http_client_config_t::addr_type =
+  HTTP_ADDR_TYPE_INET6`) whenever `wifi_manager_has_global_ipv6()` is
+  true, and transparently retries with default (`A`-or-whatever)
+  resolution if that connection attempt fails -- esp-tls's address
+  family hint is a hard filter, not a preference, so there is no
+  automatic fallback lower in the stack.
+- `git_merge.c` -- flat three-way tree merge with an LCS-based diff3 line
+  merge; overlapping edits are written with `<<<<<<< / ======= />>>>>>>`
+  markers and **committed as-is** (never discarded).
+
+Convention: a `const git_oid *` parameter that represents an optional
+commit/tree ("no parent", "no base", "not cloned yet") is passed as a
+literal `NULL`, not a pointer to a zero-filled `git_oid`. Every function
+taking such a parameter must guard with `!oid || git_oid_is_zero(oid)`
+(`git_oid_is_zero()` itself does not null-check its argument). Missing
+that guard in `commit_tree_oid()` crashed a first-ever sync of an empty
+repo with no local files -- `have_head` was false on both sides, so
+`subtree_for_commit(NULL, ...)` was reached in the normal course of
+things, not just on a malformed repo.
+
+Behaviour:
+
+- The working tree is the flat set of `*.md`, `*.fountain` and `*.txt` files
+  in the sync dir. An
+  optional `path=` maps that set onto a sub-tree of the repository (the
+  rest of the repo tree is preserved across commits).
+- First sync clones full history; later syncs send `have` lines so the
+  server returns a minimal pack.
+- Divergent histories are rebased commit-by-commit onto the remote tip.
+  Conflicts are committed with markers; the commit message gets a
+  `[draftling] N conflict(s)` note. The editor UI reloads the open
+  buffer on `GIT_SYNC_SUCCESS`.
+- Push is a fast-forward ref update; a race (remote moved mid-sync) is
+  reported and the user re-syncs. When the remote branch does not
+  exist yet (brand-new / empty repo), the push's "old oid" baseline is
+  the all-zero oid, matching git's smart-HTTP convention for creating
+  a ref; `do_sync()`'s push-trigger condition compares `local_head`
+  against that same baseline (`remote_baseline`), not against
+  `remote_sha` unconditionally -- comparing against `&local_head`
+  itself in the no-branch-yet case, as an earlier version did, is
+  trivially always "equal" and silently skips every push to an empty
+  remote.
+- Wall-clock for commit timestamps comes from a best-effort SNTP query
+  (`esp_netif_sntp` against `2.pool.ntp.org`) attempted exactly once per
+  boot (`ensure_time()`, bounded to a 6 s wait), floored at 2025-01-01
+  if `time(NULL)` still reads earlier than that when a commit is made.
+  This must run unconditionally every boot rather than being skipped
+  whenever `time(NULL)` already looks "plausible" (> 2025-01-01):
+  ESP-IDF's system clock is backed by the RTC timer domain, which
+  keeps ticking through deep sleep (using the internal RC oscillator
+  on boards with no external 32kHz crystal, which drifts), so on wake
+  it already reads a plausible-looking but possibly drifted time --
+  skipping the sync in that case means SNTP would never actually
+  correct it after the device's very first boot.
+
+Scope limits: one branch, no tags/submodules/signing, no shallow clone,
+flat `*.md` / `*.fountain` / `*.txt` working tree only, HTTP Basic auth only (no SSH). LCS merge
+falls back to a whole-file conflict above ~1400 lines per side.
+
+Public API: `git_sync_init()`, `git_sync_start()`,
+`git_sync_get_state()`, `git_sync_is_configured()`,
+`git_sync_get_last_error()`, `git_sync_max_file_size()`,
+`git_sync_file_status()` (local-only check whether a file's current
+content is in the last commit known to be on the server; used by the
+file browser's delete command), `git_sync_draftbox_connect()`.
+
+**Draftbox.** `draftbox.c` is a client for the token-exchange API of
+Draftbox (github.com/clackups/draftbox): `POST
+https://<site>/api/v1/token-exchange` with `{"password":"<8 digits>"}`
+returns `token`, `name`, `access`, `user`, `repository`, `cloneUrl`,
+`branch` and `expiresAt` (404 `invalid_password`, 429
+`rate_limited`). A null `cloneUrl` or `branch` means a global token
+(not bound to one repository); it is rejected with "global token, use a
+repository-specific one". A *missing* `branch` key (a server that
+predates the field) is accepted and just writes no `branch=` line. It carries its own tiny
+flat-object JSON reader -- ESP-IDF v6 no longer bundles cJSON.
+`git_sync_draftbox_connect()` (blocking; the editor calls it from a
+worker task) validates the input, makes the request, and only on
+success rewrites `/sdcard/git.cfg`: `repo_url`, `token`, `username`
+and `branch` come from `cloneUrl`, `token`, `user` and `branch`
+(`username=` / `branch=` are written only when the server sends a
+non-null value -- `branch` is a newer field that older servers omit);
+any old `path` line is dropped; every other line is kept; values with
+control characters are rejected so they cannot inject extra keys; and
+the config is re-parsed in memory. When the repository URL
+changes it also deletes `refs/remotes/origin/<branch>`, which
+described the previous server, so `git_sync_file_status()` does not
+report files as safely pushed to the new one. `git_sync_start()`
+refuses to run while a connect is in progress. The UI is the F1 menu
+row "Connect a Draftbox repository..." (`MENU_IDX_DRAFTBOX`, letter
+`C`): a two-step prompt on the menu screen (`s_dbx_panel`, site name
+then digits-only password). When WiFi is down it first shows
+`DBX_STEP_WIFI` and starts `wifi_connect_async()` (unless an attempt is
+already running); `wifi_state_cb()` calls `dbx_wifi_done()`, which
+advances to the site on CONNECTED and on ERROR (or when
+`wifi_connect_task()` finds no credentials / is busy) closes the prompt
+and explains the failure in the message pop-up. The Draftbox progress
+("Connecting to <site>...") and result are shown in the generic
+message pop-up (`s_msg_panel`, `show_msg_popup()` /
+`close_msg_popup()`): a modal moved onto the active screen, first in
+the key routing chain; while `s_msg_busy` it ignores all keys, and the
+worker task replaces the text with the result (taking the LVGL lock
+without a timeout so the pop-up can never stay stuck), otherwise Enter
+/ Esc (or a tap) closes it.
+The prompt shares the line-editing helper `text_field_key()` with the
+WiFi password prompt.
+
+### components/io_expander/
+
+WCH CH422G I2C IO-expander driver. Compiled in only when
+`CONFIG_DRAFTLING_HAS_CH422G` is set (currently only the Waveshare
+ESP32-S3-Touch-LCD-7); on every other board `ch422g_init()` /
+`ch422g_set_pin()` are no-op stubs, matching the `power` component's
+stub pattern.
+
+The CH422G has no single "register address" the way a TCA9554 or
+PCA9535 does -- each internal register is a distinct 7-bit I2C slave
+address that accepts exactly one data byte. This driver implements
+only the two registers Draftling needs: the system/mode register
+(address 0x24, used once at init to switch all 8 EXIO pins to
+push-pull outputs) and the EXIO0-7 output-level register (address
+0x38). The chip has no read-modify-write, so the output byte is
+shadowed in RAM and re-sent in full on every `ch422g_set_pin()` call.
+
+`main.cpp` calls `ch422g_init()` on the shared I2C bus (also carrying
+the GT911 touch controller on this board) before `display_init()`
+runs, since the RGB display backend
+(`components/display/display_rgb.cpp`) pulses the LCD reset line and
+drives the backlight through CH422G EXIO pins as part of its own
+init. `main.cpp` also uses `ch422g_set_pin()` directly to pulse the
+touch-reset line (with INT held low so the GT911 latches its primary
+I2C address) and to assert the SD card chip-select line once at boot
+(the SD card is the only device on its SPI bus, so the CS line never
+needs to toggle again -- see `sd_card_init_spi()`'s handling of
+`cs = -1` / `GPIO_NUM_NC`). See
+[docs/waveshare-esp32-s3-touch-lcd-7.md](docs/waveshare-esp32-s3-touch-lcd-7.md)
+for the full EXIO pin map.
+
+Public API: `ch422g_init()`, `ch422g_set_pin()`.
+
+The component also carries an M5Stack M5IOE1 driver
+(`io_expander_m5ioe1.cpp`), compiled in only when
+`CONFIG_DRAFTLING_HAS_M5IOE1` is set (currently only the M5Stack
+PaperMono) and stubbed out otherwise. The M5IOE1 (fixed address 0x4F)
+is a register-addressed 14-pin expander: each GPIO setting is a
+16-bit little-endian register pair, one bit per pin (PYG1 = bit 0).
+Only digital outputs are implemented: `m5ioe1_set_pin(pin, level)`
+makes PYG<pin> a push-pull output without pulls and drives it, and
+`m5ioe1_release_pin()` returns it to a high-impedance input.
+`m5ioe1_init()` probes the chip (which wakes it from I2C idle sleep)
+and disables its idle sleep (register 0x23). On the PaperMono,
+main.cpp uses it before `display_init()` to power the e-paper panel,
+the FT6336G touch controller and the MicroSD card and to pulse the
+panel and touch reset lines, and the pre-sleep hook switches those
+supplies off again.
+
+Public API: `m5ioe1_init()`, `m5ioe1_set_pin()`, `m5ioe1_release_pin()`.
+
+### components/kb_layout/
+
+Translates HID keycodes and modifier flags into UTF-8 character strings
+for the active keyboard layout. Supports US-English (QWERTY), Ukrainian
+(Cyrillic), German (QWERTZ), French (AZERTY), and Hebrew (SI 1452, RTL
+via LVGL's bidi engine). Each layout can be independently enabled or
+disabled at build time via Kconfig (see
+`components/kb_layout/Kconfig.projbuild`); all five default to enabled.
+
+Which of the compiled-in layouts `kb_layout_next()` (bound to `Ctrl+L`
+and `Win+Space` in the editor) actually cycles through is a separate,
+user-configurable "active set" -- see `kb_layout_set_active()` /
+`kb_layout_is_active()` / `kb_layout_get_active_mask()` /
+`kb_layout_set_active_mask()`. `components/editor/editor_ui.cpp` owns
+persisting this set to NVS and exposes it as the "Active layouts" row
+in the F1 -> Settings menu; it defaults to US + UA. The title bar only
+shows the `[XX]` layout tag when `kb_layout_active_count() > 1`.
+
+Ctrl-letter shortcuts (`handle_editor_key()` / `handle_browser_key()`
+in `editor_ui.cpp`), `Alt+R`, `Alt+D` and the file browser's unmodified `N`
+(new file) accelerator resolve their letter via `kb_layout_shortcut_char()`, not
+a raw `kb_layout_translate()` call: under a Latin layout (US/DE/FR) it
+follows the national layout, and is not limited to the classic 26-key
+US letter block -- so Ctrl+Z lands on the key printed "Z" on a German
+keyboard, and Ctrl+M on a French (AZERTY) keyboard is the semicolon
+key, since AZERTY moves "m" there. Under a non-Latin layout
+(Ukrainian/Hebrew) it falls back to the US physical key position
+within that classic block, since there is no national Latin letter to
+remap to. Plain document text entry still goes through
+`kb_layout_translate()` directly.
+
+Public API: `kb_layout_translate()`, `kb_layout_shortcut_char()`,
+`kb_layout_set()`, `kb_layout_get()`, `kb_layout_name()`,
+`kb_layout_next()`, `kb_layout_is_rtl()`, `kb_layout_is_active()`,
+`kb_layout_set_active()`, `kb_layout_active_count()`,
+`kb_layout_get_active_mask()`, `kb_layout_set_active_mask()`.
+
+### components/sd_card/
+
+Initializes the MicroSD card over SDMMC 1-bit interface and mounts it as
+a FAT filesystem at `/sdcard`. Provides standard file operations (read,
+write, append, delete, rename, existence check, size query) and directory
+operations (mkdir, list).
+
+`sd_card_format()` re-creates the FAT file system on the mounted card
+(`esp_vfs_fat_sdcard_format_cfg()`, same mount settings) and mounts it
+again; if that re-mount fails the card is released and the handle
+cleared.
+
+Public API: `sd_card_init()`, `sd_card_read_file()`,
+`sd_card_write_file()`, `sd_card_list_dir()`, `sd_card_file_exists()`,
+`sd_card_format()`, `sd_card_get_fs_space()`, and others.
+
+### components/standby/
+
+Monitors user inactivity and enters ESP32 deep sleep after a configurable
+timeout (default 600 seconds / 10 minutes). The timeout is persisted in
+NVS so it survives reboots. `standby_enter_sleep()` is also called
+directly for an on-demand sleep -- `Ctrl+P` or the F1 "Sleep now" item
+in `editor_ui.cpp`. A pre-sleep callback allows the editor to
+auto-save before power-down; a user-initiated "sleep without saving"
+discards the edits in `editor_ui.cpp` before calling
+`standby_enter_sleep()`, so the callback sees a clean document. The wake
+source is an EXT0 trigger on
+the per-board RTC-capable GPIO selected by `CONFIG_DRAFTLING_WAKEUP_GPIO`
+in `main/Kconfig.projbuild` (defaults: GPIO18 on Waveshare RLCD-4.2,
+GPIO0 / BOOT on every other board). The standby code itself is
+board-agnostic and never tests `DRAFTLING_MODEL_*` directly. On the
+M5Stack PaperS3, GPIO0 is used because earlier revisions tried
+GPIO21 (the on-board buzzer pin -- floated low under some
+speaker-driver states and woke the device instantly) and GPIO48
+(the GT911 touch INT) with a light-sleep + `esp_restart()`
+workaround; both woke the device immediately, the latter because
+the e-paper backend initialises only the panel (not the touch
+controller), so the GT911 is left uninitialised and holds INT low.
+
+On targets that have no EXT0 support (the ESP32-P4 / M5Stack Tab5,
+where `SOC_PM_SUPPORT_EXT0_WAKEUP` is undefined), the EXT0 arming
+is compiled out entirely. The Tab5 has no user button or touch INT
+on an LP_IO pin (GPIO 0-15) either, so the only wake path is the
+hardware RESET button: the chip cold-boots and the editor restores
+from autosave on the next run. See `docs/tab5-esp-hosted.md`.
+
+On the LilyGO T5 E-Paper S3 Pro / Pro Lite, the standby pre-sleep
+callback is replaced with `pre_sleep_t5_deinit()` (`main/main.cpp`),
+which chains the standard `pre_sleep_autosave` and then walks every
+peripheral that the ESP-IDF default deep-sleep path would leave
+powered: GT911 (`touchscreen_sleep()`), SX1262 LoRa (`SetSleep`
+opcode over SPI3 on the Pro variant), MicroSD (`sd_card_deinit()`
+releases SPI3), the front-light LED on GPIO 11 (driven LOW + RTC IO
+hold), unused RTC-IO pins (`rtc_gpio_isolate()`), and finally
+`esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_OFF)`.
+Without this hook the board pulled ~30 mA in sleep, draining the
+1500 mAh pack in two days; with the hook the figure drops to the
+tens of uA. Full peripheral table in `docs/lilygo-t5-power.md`.
+
+Before arming EXT0, `standby_enter_sleep()` enables the chip's
+internal RTC pull-up on the wake GPIO and disables any pull-down.
+The supported boards (RLCD-4.2 button on GPIO18 and PaperS3 BOOT on
+GPIO0 / strapping pin) already have external pull-ups, so this is
+harmless: the two pull-ups simply parallel. The internal pull-up is
+always enabled so the behaviour is consistent across boards.
+
+In addition to the inactivity timer, `standby_init()` also arms a
+"no keyboard connected" countdown of `CONFIG_DRAFTLING_NO_KEYBOARD_SLEEP_SEC`
+seconds (default 180, 0 = disabled). When the timer fires it polls
+`ble_keyboard_is_connected()` and only enters deep sleep if no
+Bluetooth keyboard has paired by then. If any pairing activity
+happened (`ble_keyboard_last_pairing_activity_us()`), it instead waits
+until twice that many seconds after the last pairing event, so a user
+retrying a failed passkey entry is not put to sleep mid-attempt. This conserves battery when
+the device is powered on accidentally or no paired keyboard is in
+range. The countdown is only armed on boards with
+`CONFIG_DRAFTLING_HAS_BATTERY` -- the USB-only Guition JC3248W535
+skips it, since there is nothing to conserve and unexpectedly
+blanking the display during bring-up is more disruptive than helpful.
+
+Public API: `standby_init()`, `standby_reset_timer()`,
+`standby_set_timeout()`, `standby_set_pre_sleep_cb()`,
+`standby_enter_sleep()`.
+
+### components/power/
+
+Hardware power-latch + PWR-button driver. Compiled in only on
+boards with `CONFIG_DRAFTLING_HAS_POWER_LATCH` (currently just the
+Waveshare ESP32-S3-Touch-LCD-3.49); on every other board the
+public functions are no-op stubs.
+
+The Touch-LCD-3.49 keeps the battery rail alive through a TCA9554
+I2C IO-expander pin (IO6 by default): the pin must be driven HIGH
+at boot or the rail collapses as soon as the user releases the
+boot-time PWR button press, and driving it LOW cuts the rail and
+fully powers the board off. The dedicated PWR button on GPIO 16
+is monitored by a 50 ms-period `esp_timer`; a hold of
+`POWER_LONG_PRESS_MS` (1500 ms) or longer triggers the pre-off
+callback (typically the editor auto-save) and then `power_off()`.
+A short press is intentionally ignored -- short presses are how
+the user *powers on* the board from a fully-off state.
+
+`standby_enter_sleep()` calls `power_off()` before falling back
+to `esp_deep_sleep_start()`, so on battery the inactivity timer
+cleanly powers the board down (and the LCD goes truly dark
+because its supply is downstream of the latch) while on USB the
+latch has no effect and the chip just deep-sleeps.
+
+The TCA9554 is reached over a dedicated I2C bus (SDA/SCL pins +
+address + latch bit all carried by `power_config_t` so this
+component stays board-agnostic). The bus is opened with the
+ESP-IDF v5.x `i2c_master_*` API; we issue only two register writes
+(Output and Configuration) so this component does not pull in a
+heavy `esp_io_expander_tca9554` dependency.
+
+Public API: `power_init()`, `power_set_long_press_cb()`, `power_off()`.
+
+### components/tab5_kbd/
+
+Driver for the M5Stack Tab5 attachable keyboard, a detachable QWERTY
+keyboard that talks to the ESP32-P4 over a dedicated I2C bus
+(7-bit address 0x6D, see `TAB5_KBD_I2C_ADDR`; SDA/SCL set by
+`CONFIG_DRAFTLING_TAB5_KBD_I2C_SDA_GPIO` /
+`CONFIG_DRAFTLING_TAB5_KBD_I2C_SCL_GPIO`, default GPIO 0 / 1) plus a
+dedicated interrupt line on GPIO 50 (`CONFIG_DRAFTLING_TAB5_KBD_INT_GPIO`).
+Compiled in only when `CONFIG_DRAFTLING_HAS_TAB5_KBD` is set (Tab5
+default); main / editor pull it in via
+`idf_component_optional_requires()`. main.cpp creates the dedicated
+keyboard I2C master bus (auto-selected port via `i2c_port = -1`, since
+the BSP system bus already holds one controller) and hands its handle
+to `tab5_kbd_init()`.
+
+`tab5_kbd_init(bus, int_gpio)` probes the keyboard once by reading its
+version register (0xFE). If the keyboard is not attached the probe
+fails, the I2C device handle is removed, and the component stays
+permanently idle this boot -- no further traffic is issued on its
+dedicated bus. If the probe
+succeeds the keyboard is switched to HID mode (register 0x10 = 1),
+the event queue / interrupt latch are cleared, RGB custom mode is
+selected (register 0x11 = 1), both indicator LEDs are lit green for
+one second and then turned off (a one-shot `esp_timer`), and a
+negative-edge GPIO interrupt on the INT line drives a worker task.
+
+On each interrupt the task reads the interrupt-status register
+(0x01); if the HID-event bit (0x02) is set it drains the queued
+events (count from register 0x02), reading the 2-byte HID report
+(modifier + keycode) from register 0x30 for each, then clears the
+status register to release the INT line. Because the Tab5 HID report
+carries a single keycode slot (keycode 0 means "no key"), each report
+is diffed against the previous one to synthesise the same
+`kb_event_t` press / release stream the BLE and USB keyboards emit;
+the editor key handler is shared verbatim. The Tab5 keyboard coexists
+with USB and BLE rather than replacing them: on the Tab5 the built-in
+keyboard and a USB keyboard both feed the editor, and when neither a
+USB nor BLE keyboard is connected the user can still start a BLE scan
+on demand from the F1 menu ("BLE: Start scan", which re-enables BLE
+if it was left idle at boot).
+
+Only the registers Draftling needs are implemented here; the full
+vendor library (RGB binding modes, string mode, I2C-address
+re-flashing, Arduino backend) from
+`m5stack/M5Tab5-Keyboard-UserDemo` is intentionally not vendored.
+
+Public API: `tab5_kbd_init()`, `tab5_kbd_is_present()`,
+`tab5_kbd_set_callback()`.
+
+### components/wifi_manager/
+
+Manages WiFi in station mode. Reads credentials from NVS or from
+`/sdcard/wifi.cfg`. Provides connect, disconnect, and state query
+functions with an event callback for connection state changes (idle,
+connecting, connected, disconnected, error). Required by `git_sync` for
+network access.
+
+`wifi_manager_connect()` reads `/sdcard/wifi.cfg` on *every* call, not
+only when NVS has nothing cached: if the file's SSID or password no
+longer matches what NVS remembers from a previous connection, the
+stale NVS entry is overwritten with the file's credentials before
+connecting. This is what makes editing `wifi.cfg` on the SD card take
+effect on the next `Ctrl+W` -- without it, once NVS was populated the
+file was never consulted again and the device kept reconnecting to
+whichever SSID it first learned.
+
+Connections are started explicitly: `wifi_manager_connect_to()` calls
+`esp_wifi_connect()` itself rather than relying on
+`WIFI_EVENT_STA_START` (which only fires on a stopped -> started
+transition, so a connect after a scan or after an earlier attempt
+never reached the AP). It first drops any current association, clears
+stale event-group bits, and on failure disables the auto-retry logic
+and stops the driver, so the next attempt (e.g. `Ctrl+W` back to the
+`wifi.cfg` network after a failed F1 -> "WiFi: New connection...")
+starts from a clean state. Connect and `wifi_manager_scan()` are
+serialized by a mutex; a second request while one is running returns
+`ESP_ERR_INVALID_STATE`.
+
+Retries: a dropped / failed association is retried up to `MAX_RETRY`
+times (weak signal, AP not found, beacon timeout, ...), but a
+disconnect reason meaning the credentials were rejected
+(`is_auth_failure()`: AUTH_FAIL, 4-way / handshake timeout, MIC
+failure, 802.1X failure, no AP with compatible security) fails the
+attempt at once. `wifi_manager_last_failure_was_auth()` lets the UI
+report "wrong password" instead of a generic failure.
+
+IPv4/IPv6 dual stack: on `WIFI_EVENT_STA_CONNECTED` the manager calls
+`esp_netif_create_ip6_linklocal()` on the STA netif, which makes lwIP
+send router solicitations; if the AP's network advertises a global
+prefix (SLAAC, RFC 4862 -- requires `CONFIG_LWIP_IPV6_AUTOCONFIG=y`,
+set in `sdkconfig.defaults`) a later `IP_EVENT_GOT_IP6` carries a
+global-scope address and `wifi_manager_has_global_ipv6()` starts
+returning `true`. That flag drives two things: the editor's WiFi
+status icon switches to the "6"-badged variant (see
+`components/editor/wifi_icon.c` below), and `git_sync`'s HTTP layer
+(`git_net.c`) prefers the Git server's `AAAA` record, falling back to
+`A` if the connection attempt fails. The flag (and the cached address
+string from `wifi_manager_get_ipv6()`) resets on disconnect and at the
+start of every new connection attempt.
+
+Public API: `wifi_manager_init()`, `wifi_manager_connect()`,
+`wifi_manager_disconnect()`, `wifi_manager_is_connected()`,
+`wifi_manager_get_ip()`, `wifi_manager_get_ssid()`,
+`wifi_manager_has_global_ipv6()`, `wifi_manager_get_ipv6()`,
+`wifi_manager_get_configured()` (SSID + password Ctrl+W would use),
+`wifi_manager_forget()` (disconnect and erase the `wifi` NVS namespace
+plus the WiFi driver's own saved station config: `esp_wifi_restore()`
+once the driver is up, otherwise the `nvs.net80211` namespace).
+
+## Font Creation Process
+
+The `components/fonts/` directory contains custom LVGL bitmap fonts
+generated from the **Greybeard** typeface, a monospaced bitmap font that
+is a vector port of UW ttyp0 (MIT-licensed, source:
+https://github.com/flowchartsman/greybeard).
+
+### Source Files
+
+Greybeard ships as a set of TTF files, each designed for a single native
+pixel size. Because the outlines trace exact pixel boundaries, rendering
+at the native size with 1-bit-per-pixel (no antialiasing) produces
+pixel-perfect glyphs with no scaling artifacts.
+
+### Generation Tool
+
+The fonts were converted to LVGL C source files using **lv_font_conv**,
+the official LVGL font conversion utility. The exact command line is
+recorded in the header comment of each generated `.c` file. For example,
+the 14 px font was generated with:
+
+```
+lv_font_conv \
+  --font Greybeard-14px.ttf \
+  -r 0x20-0x7F,0xA0-0xFF,0x400-0x4FF,0x20AC,0x20B4,0x2116 \
+  --size 14 \
+  --bpp 1 \
+  --format lvgl \
+  --no-compress \
+  --lv-font-name greybeard_14 \
+  -o greybeard_14.c
+```
+
+### Reproducing the committed fonts
+
+The committed base fonts (`greybeard_NN.c`, `hack_NN.c`) regenerate
+byte-for-byte -- apart from the fix-ups below -- from the command line
+recorded in each file's header comment, using:
+
+- `lv_font_conv` at commit `1f44ab4` of github.com/lvgl/lv_font_conv.
+  The npm release 1.5.2 predates `--lv-fallback` / `--lv-font-name`,
+  and later commits change the output format (`0x00` instead of `0x0`,
+  an extra `__has_include` block, `stride` / `static_bitmap` fields).
+- Greybeard v1.0.0 (`Greybeard-v1.0.0-ttf.zip` from the
+  flowchartsman/greybeard release) and Hack v3.003
+  (`Hack-v3.003-ttf.zip` from the source-foundry/Hack release).
+
+To add a glyph, regenerate with the new code point appended to `-r`,
+apply the fix-ups below, and diff against the committed file: only the
+new glyph's bitmap, its `glyph_dsc` entry and the cmap tables should
+change. This is how U+2026 was added.
+
+### Post-generation Fix-up
+
+`lv_font_conv` emits a boilerplate include block at the top of every
+generated `.c` file:
+
+```c
+#ifdef LV_LVGL_H_INCLUDE_SIMPLE
+#include "lvgl.h"
+#else
+#include "lvgl/lvgl.h"
+#endif
+```
+
+Under ESP-IDF the LVGL component is registered as `lvgl__lvgl` and the
+public header is exposed simply as `lvgl.h`; the `lvgl/lvgl.h` fallback
+path does not exist and breaks the build with
+`fatal error: lvgl/lvgl.h: No such file or directory`. After regenerating
+any font, replace that whole `#ifdef ... #endif` block with a single line:
+
+```c
+#include "lvgl.h"
+```
+
+This matches the include style used elsewhere in the component
+(`components/fonts/greybeard.c`, `components/fonts/include/greybeard.h`).
+
+Newer `lv_font_conv` commits wrap that block in an `#ifdef
+__has_include` guard; replace the whole construct the same way. Some
+committed files also declare the fallback router as `extern lv_font_t
+..._ext;` rather than `extern const lv_font_t ..._ext;` (the router is
+mutable, see `greybeard.c`); keep whichever form the file already has.
+The Hack files additionally get the advance-width snapping described
+under "Hack fonts" below.
+
+### Unicode Ranges
+
+The base `greybeard_NN.c` files cover the always-on core ranges:
+
+| Range | Description |
+|-------|-------------|
+| U+0020 - U+007F | Basic Latin (ASCII printable characters) |
+| U+00A0 - U+00FF | Latin-1 Supplement (accented Latin characters, symbols) |
+| U+20AC | Euro sign |
+| U+2116 | Numero sign |
+| U+2026 | Horizontal ellipsis (the editor title bar ends a shortened file name with it) |
+
+Additional script coverage is split into separate subset font files
+that are compiled into the firmware only when the corresponding
+keyboard layout is enabled in Kconfig. This keeps the firmware small
+for builds that do not need a given script.
+
+| File pattern | Range | Gated on |
+|--------------|-------|----------|
+| `greybeard_cyrillic_NN.c` | U+0400 - U+04FF (Cyrillic) + U+20B4 (Hryvnia) | `CONFIG_KB_LAYOUT_ENABLE_UA` |
+| `greybeard_hebrew_NN.c`   | U+0590 - U+05FF (Hebrew block) | `CONFIG_KB_LAYOUT_ENABLE_HE` |
+
+The base font is generated with `--lv-fallback greybeard_NN_ext` and
+the Hebrew subset with `--lv-fallback greybeard_NN_he_next`. Both
+fallback symbols are tiny runtime-mutable "router" `lv_font_t` structs
+defined in `components/fonts/greybeard.c`; `greybeard_init()` chains
+their `.fallback` pointers at boot so that a missed glyph lookup in
+the base font walks into Hebrew and/or Cyrillic as appropriate.
+Hebrew layouts also require `CONFIG_LV_USE_BIDI=y` so LVGL renders
+RTL strings in the correct visual order.
+
+Every `greybeard_NN.c`/`greybeard_cyrillic_NN.c`/`greybeard_hebrew_NN.c`
+file for NN in {18, 22, 26} is generated with `--autohint-off`; 11/14/16
+are not (see below for why). Without it, freetype's autohinter drops
+entire scanlines out of many glyphs -- diagonal strokes in "V"/"X" get
+a blank row mid-stroke, "O"/"Q" lose a row out of their ring, "2" loses
+the row joining its diagonal to its base, etc. This is a rounding
+artifact in how the hinter grid-fits a given outline at a given pixel
+size, so it does not affect every size or every glyph uniformly; it was
+found by rendering the full glyph set and looking for a fully blank
+scanline sandwiched between non-blank ones (excluding known
+intentionally-gapped glyphs like "!", ":", ";", "?", "i", "j", and
+accented Cyrillic/Hebrew letters, which have a real gap by design).
+`--autohint-off` was verified against 11/14/16px too: it produces
+byte-identical output there (hinting has no effect at those sizes), so
+those three are left as originally generated, without the flag, to
+keep the documented command lines minimal.
+
+### Sizes and Metrics
+
+Eight sizes are provided. `greybeard_11` through `greybeard_22` are
+rendered at their native TTF pixel size. The remaining three have no
+matching native TTF and are derived from a smaller native size
+instead -- `greybeard_26` by scaling the 22 px TTF up by a
+non-integer 1.18x ratio (acceptable since it is only ever used as a
+heading, one step above the largest body size), and `greybeard_30` /
+`greybeard_34` as a clean 2x pixel-double of the native 15 px / 17 px
+TTFs respectively. The 2x-double approach was chosen over scaling
+from 22 px (as was tried initially) because a non-integer scale
+ratio (22 px -> 30 px is 1.36x, -> 34 px is 1.55x) produces visibly
+uneven, distorted diagonal stair-steps on letters like V and X --
+freetype's 1bpp mono rasterizer has no clean pixel mapping at a
+non-integer ratio. An exact 2x double instead maps each source pixel
+to a crisp 2x2 block, matching the technique already used for the
+Hack family's Hebrew subset (see "Hack fonts" below).
+
+| File | Pixel Size | Char Width | Line Height | Notes |
+|------|-----------|------------|-------------|-------|
+| greybeard_11.c | 11 | 6 | 11 | Smallest, used for compact UI elements |
+| greybeard_14.c | 14 | 7 | 13 | Default body text |
+| greybeard_16.c | 16 | 8 | 15 | |
+| greybeard_18.c | 18 | 9 | 17 | Also a base font size choice |
+| greybeard_22.c | 22 | 11 | 21 | Headings; also a base font size choice |
+| greybeard_26.c | 26 | 13 | 25 | Heading (scaled from 22 px TTF) |
+| greybeard_30.c | 30 | 16 | 30 | H1 for the 18 px base size (2x double of 15 px TTF) |
+| greybeard_34.c | 34 | 18 | 34 | H1 for the 22 px base size (2x double of 17 px TTF) |
+
+Slots 30 and 34 exist only to back the H1/H2 headings of the 18 px
+and 22 px base font size choices (`FONT_SIZE_OPTIONS` in
+`components/editor/editor_ui.cpp`) -- 30/34 px are not offered as base
+(body) font sizes themselves, since the monospace cell that large
+would show very little content even on a large panel.
+
+All fonts are declared in `components/fonts/include/greybeard.h` as
+`extern const lv_font_t greybeard_NN` and compiled as an IDF component
+that depends on `lvgl__lvgl`.
+
+### Rendering Settings
+
+- **Bits per pixel (bpp):** 1 (pure black and white, no antialiasing).
+  This matches the reflective LCD which has no grayscale capability.
+- **Compression:** disabled (`--no-compress`) for faster glyph lookup on
+  the microcontroller.
+- **Format:** `lvgl` (native LVGL font structure).
+
+### Hack fonts (high-density boards)
+
+Boards with `CONFIG_DRAFTLING_DISPLAY_HIDPI` set (the ones that used to
+upscale the framebuffer 2x) render the UI 1:1 with the **Hack**
+typeface instead of scaling Greybeard. Hack is a monospaced outline
+font (MIT, https://github.com/source-foundry/Hack). Eight sizes are
+generated with `lv_font_conv`. Seven mirror Greybeard slots of the
+same number (11 through 30), chosen so each text row is approximately
+the height the user saw with Greybeard rendered at the old 2x scale;
+slot 9 is Hack-only, with no Greybeard counterpart: an extra-compact
+body size below Greybeard's smallest (11), for users who want to fit
+more text on a large, dense panel (e.g. the Waveshare Touch-LCD-7's
+7" 800x480 panel). Slot 30 provides an H1 heading larger than slot 26
+for the HIDPI-only 20 px base font size; Greybeard also has its own
+slot 30 (and 34), added later to back headings for the non-HIDPI 18 px
+and 22 px base font sizes -- see "Sizes and Metrics" above. The file
+names mirror the Greybeard slots (`hack_11` ..
+`hack_26`) plus the two extras (`hack_9`, `hack_30`); the number is
+the slot, not the Hack pixel size:
+
+| File | Hack Pixel Size | Cell Width | Line Height | Replaces Greybeard slot |
+|------|-----------------|------------|-------------|-------------------------|
+| hack_9.c  | 16 | 10 | 19 | (none; Hack-only extra-compact body size) |
+| hack_11.c | 19 | 11 | 23 | greybeard_11 (x2) |
+| hack_14.c | 21 | 13 | 26 | greybeard_14 (x2) |
+| hack_16.c | 25 | 15 | 30 | greybeard_16 (x2) |
+| hack_18.c | 28 | 17 | 34 | greybeard_18 (x2) |
+| hack_22.c | 34 | 21 | 41 | greybeard_22 (x2) |
+| hack_26.c | 41 | 25 | 50 | greybeard_26 (x2) |
+| hack_30.c | 47 | 28 | 58 | (Greybeard's slot 30 exists too, but is unrelated -- it is not pixel-doubled into this file, since HIDPI boards never fall back to Greybeard) |
+
+Slot 9's heading fonts (h1/h2/h3) reuse the existing slot 11/14/16
+fonts rather than needing new dedicated assets -- the heading scale
+just shifts down by one slot compared to the body-11 tier (body 9 ->
+h3 11, h2 14, h1 16; see `body_font()` / `h1_font()` / `h2_font()` /
+`h3_font()` in `components/editor/editor_ui.cpp`).
+
+The generated advance widths are fractional (Hack is not a native
+pixel font), so after generation every full-width glyph's `adv_w` is
+snapped to an integer number of 1/16-px units (the cell width above)
+so the editor's monospace cursor grid stays aligned; zero-advance
+combining marks are left untouched.
+
+Script coverage mirrors Greybeard and is gated on the same Kconfig
+layout options:
+
+| File pattern | Range | Source | Gated on |
+|--------------|-------|--------|----------|
+| `hack_NN.c` | Latin, Latin-1, U+20AC, U+2116, U+2026 | Hack-Regular.ttf | `DRAFTLING_DISPLAY_HIDPI` |
+| `hack_cyrillic_NN.c` | U+0400-U+04FF + U+20B4 | Hack-Regular.ttf | `KB_LAYOUT_ENABLE_UA` |
+| `hack_hebrew_NN.c` | U+0590-U+05FF | Greybeard TTFs, pixel-doubled | `KB_LAYOUT_ENABLE_HE` |
+
+Hack has no Hebrew glyphs, so the Hebrew subset is rendered from the
+Greybeard TTFs. For slots 11-30, that's at twice the corresponding
+Greybeard slot's native pixel size (a clean 2x pixel-double that
+matches what the old scaled path produced). Slot 9 has no Greybeard
+source of its own to double (Greybeard's smallest is 11px), so
+`hack_hebrew_9.c` is instead rendered directly from
+`Greybeard-11px.ttf` (the smallest available source) at 18px --
+close to, but not an exact 2x multiple of, the source's native size;
+freetype rasterizes any target size cleanly from the vector outline
+regardless, so this is a minor deviation from the other slots'
+"clean double" convention, not a technical limitation. The base fonts
+are generated with `--lv-fallback hack_NN_ext` and the Hebrew subset
+with `--lv-fallback hack_NN_he_next`; the router structs live in
+`components/fonts/hack.c` and are chained at boot by `hack_init()`,
+exactly like `greybeard_init()`. The same post-generation include
+fix-up applies (replace the `#ifdef LV_LVGL_H_INCLUDE_SIMPLE ... #endif`
+block with `#include "lvgl.h"`). All Hack sources are compiled only
+when `CONFIG_DRAFTLING_DISPLAY_HIDPI` is set, so standard-density
+builds do not pay for them.
+
+The editor (`components/editor/editor_ui.cpp`) selects the family with
+a compile-time `#ifdef CONFIG_DRAFTLING_DISPLAY_HIDPI`: the `FONT_11`
+.. `FONT_26` macros (plus the HIDPI-only `FONT_9`, and `FONT_30`/
+`FONT_34` which are each defined only on one side of the `#ifdef`),
+`char_width_for_font()` and the boot-time init call all switch between
+Greybeard and Hack. Everything else in the editor is family-agnostic
+because it works through those slots. `FONT_9` is HIDPI-only, backing
+the HIDPI-only 9 px base font size, and has no Greybeard equivalent.
+`FONT_30` is defined on both sides but for unrelated fonts: on HIDPI
+boards it is `&hack_30`, backing the H1 heading of the HIDPI-only
+20 px base font size; on non-HIDPI boards it is `&greybeard_30`,
+backing the H1 heading of the non-HIDPI 18 px base font size.
+`FONT_34` is non-HIDPI-only (`&greybeard_34`), backing the H1 heading
+of the non-HIDPI 22 px base font size -- Hack has no matching slot
+since HIDPI's base font sizes top out at 20 px.
+
+## Hardware Definitions in Kconfig.projbuild
+
+There are two Kconfig.projbuild files that expose project-specific
+menuconfig options.
+
+### main/Kconfig.projbuild -- Hardware Configuration
+
+This file defines the **DRAFTLING Configuration** menu with the following
+options:
+
+#### Hardware Model (DRAFTLING_HARDWARE_MODEL)
+
+A `choice` that selects the target board. Both options are
+ESP32-S3-only (`depends on IDF_TARGET_ESP32S3`):
+
+- **DRAFTLING_MODEL_WAVESHARE_RLCD42** -- Waveshare ESP32-S3-RLCD-4.2
+  with a 400x300 reflective LCD and GPIO18 deep-sleep wakeup button.
+  *Requires ESP32-S3.*
+- **DRAFTLING_MODEL_M5STACK_PAPERS3** -- M5Stack PaperS3 with a
+  4.7" 540x960 ED047TC1 e-paper driven by the `vroland/epdiy`
+  library (with the in-tree `epd_board_papers3` board definition),
+  on-board MicroSD on SPI3, BOOT button on GPIO0 used as
+  the EXT0 deep-sleep wake source (the only RTC-capable user-input
+  GPIO on the board). *Requires ESP32-S3.*
+- **DRAFTLING_MODEL_FREENOVE_FNK0104A** -- Freenove FNK0104A: 2.8"
+  ILI9341 color SPI LCD, 320x240, no touch, on-board MicroSD on
+  SDMMC, BOOT button on GPIO0 as the wake source. *Requires ESP32-S3.*
+- **DRAFTLING_MODEL_FREENOVE_FNK0104B** -- same 2.8" ILI9341 panel
+  and SPI wiring as FNK0104A, plus an on-board FT6336U I2C
+  capacitive touch controller. *Requires ESP32-S3.*
+- **DRAFTLING_MODEL_FREENOVE_FNK0104S** -- Freenove FNK0104S: 4.0"
+  ST7796 color SPI LCD, 480x320, with an on-board FT6336U I2C touch
+  controller. *Requires ESP32-S3.*
+- **DRAFTLING_MODEL_FREENOVE_FNK0104N** -- Freenove FNK0104N: 3.5"
+  320x480 ST77922 QSPI color LCD (`display_st77922.cpp`), rendered
+  landscape at 480x320 via a 90-degree base rotation. MicroSD on
+  SDMMC 1-bit (CLK=5, CMD=4, D0=6), battery on GPIO8 (1:2 divider),
+  BOOT (GPIO0) wake. Touch is the ST77922's own touch interface
+  (`DRAFTLING_TOUCH_ST77922`, I2C 0x55 on SDA=38/SCL=39, INT=47,
+  RST=48), reported in the panel's native frame (no swap/mirror). The
+  unused on-board WS2812 LED (GPIO40,
+  `BOARD_WS2812_PIN`) is switched off at boot by `ws2812_off()` in
+  main.cpp. Tested on physical hardware. *Requires ESP32-S3.*
+- **DRAFTLING_MODEL_MICROJOURNAL_REV5** -- MicroJournal Rev 5
+  writerdeck: ESP32-S3 N16R8, ILI9341 color LCD (320x240 landscape),
+  shared-SPI MicroSD reader and native USB host keyboard; Bluetooth is
+  disabled in this build. GPIO0 is reserved for hardware power control,
+  not a wake button. Backlight control is disabled. *Requires ESP32-S3.*
+- **DRAFTLING_MODEL_XTEINK_X4_PRO** -- Xteink X4 Pro: 4.26" 800x480
+  e-paper panel over SPI, one of three controllers (SSD1677, UC8179,
+  UC8279) auto-detected at boot by
+  `components/display/display_xteink_epd.cpp`. GT911 touch and a
+  CW2017 fuel gauge on a shared I2C bus, dual-channel PWM front-light,
+  on-board MicroSD on SDMMC. Left/Right buttons inject Page Up / Page
+  Down; Power is the wake source, and also puts the device to sleep on
+  a short press (there is no hardware power-off latch on this board)
+  or forgets BLE keyboards on a 2 s hold. The short press goes through
+  `editor_ui_request_sleep()`, so unsaved changes get the Ctrl+P
+  Save / Discard / Cancel prompt first (same on the reTerminal
+  Sticky). The enclosure's cover
+  overlaps the panel; the user-adjustable screen margins (see below)
+  compensate. `app_main()` power-cycles the GT911 (via its active-low
+  `TOUCH_POWER_EN_PIN`) very early, *before* the shared I2C bus is
+  created, and calls `gpio_deep_sleep_hold_dis()` first: a warm reboot
+  (`esp_restart()` from the Settings "restart to apply" prompt, a panic,
+  a watchdog) does not reset the I2C peripheral or the GT911, so
+  without the power-cycle the controller comes up wedged on the bus and
+  touch is dead until the next deep-sleep cycle. Tested on physical
+  hardware after an initial blind port; see HARDWARE.md.
+  *Requires ESP32-S3.*
+- **DRAFTLING_MODEL_XTEINK_X4_CLASSIC** -- Xteink X4 Classic (a.k.a.
+  "X4 v2"): the buttons-only, no-front-light sibling of the X4 Pro.
+  Same ESP32-S3, same 800x480 panel and `display_xteink_epd.cpp`
+  controller stack (DC/RST/BUSY on 14/10/18 instead of 18/14/6), same
+  CW2017 gauge and SDMMC slot. `CONFIG_DRAFTLING_TOUCHSCREEN` and
+  `CONFIG_DRAFTLING_DISPLAY_HAS_BACKLIGHT` are both off. Eight buttons
+  (`xteink_x4_classic_btn_init()` in `main.cpp`) drive the editor with
+  no keyboard, the same buttons-only model as the CrowPanel: Power
+  (GPIO3) = F1 / forget-keyboards, side keys = Up/Down, bottom keys =
+  Left/Right/Enter/Esc. The derived symbol `DRAFTLING_MODEL_XTEINK_X4`
+  is set for both this and the X4 Pro and gates the code common to
+  the two. See HARDWARE.md. *Requires ESP32-S3.*
+- **DRAFTLING_MODEL_ELECROW_CROWPANEL_579** -- Elecrow CrowPanel
+  ESP32-S3 5.79" E-Paper HMI Display: 792x272 black/white e-paper
+  panel built from two SSD1683 controllers over plain SPI, driven by
+  `components/display/display_ssd1683.cpp`. On-board MicroSD on its
+  own SPI bus. Menu button (GPIO2) is the deep-sleep wake source and
+  doubles as F1 / forget-keyboards; Back button + a 3-way dial
+  switch (Up/Down/OK) provide full menu navigation without a
+  keyboard. No on-board battery monitor. Extensively tested on
+  physical hardware; see HARDWARE.md. *Requires ESP32-S3.*
+- **DRAFTLING_MODEL_WAVESHARE_EPAPER_397** -- Waveshare
+  ESP32-S3-ePaper-3.97: 3.97" 800x480 black/white e-paper panel driven
+  over plain SPI by `components/display/display_ws_epd397.cpp`, using
+  the same SSD1677-family differential-refresh protocol as the Xteink
+  X4 Pro's SSD1677 path. No touch controller; four discrete
+  active-low buttons (Up/Function/Down plus BOOT) stand in for it.
+  Battery and the e-paper panel's own supply rail are both managed by
+  an on-board AXP2101 PMIC on I2C. On-board MicroSD on SDMMC 1-bit.
+  Tested on physical hardware. *Requires ESP32-S3.*
+- **DRAFTLING_MODEL_SEEED_RETERMINAL_STICKY** -- Seeed reTerminal
+  Sticky: the same 3.97" 800x480 panel class as the Waveshare
+  ESP32-S3-ePaper-3.97 above, driven by
+  `components/display/display_reterminal_sticky.cpp`, but with the
+  on-board MicroSD sharing the panel's SPI bus instead of a dedicated
+  one, a GT911 capacitive touchscreen on its own I2C bus, and a
+  BQ27220 fuel gauge on a second, separate I2C bus. Two page-turn
+  buttons (Up/Down) plus a combined Power/AI button (deep-sleep wake;
+  short press = sleep, asking first about unsaved changes; 2 s hold =
+  forget BLE keyboards) drive the
+  editor without a keyboard. 32 MB flash; dual-OTA partition table
+  (`partitions_seeed_reterminal_sticky.csv`) so the third-party
+  Crosspoint firmware can still be installed later. Tested on
+  physical hardware; pin assignments are triple-sourced from Seeed's
+  own documentation and the FreeInk SDK (MIT licensed), which agree;
+  see `main/boards/seeed_reterminal_sticky.h` and HARDWARE.md. The
+  panel controller is an SSD1677 or an SSD2677, auto-detected (see
+  `display_reterminal_sticky.cpp` above). The USB-C port goes through
+  a WCH CH343 USB-to-UART bridge, not the ESP32-S3's native USB, so
+  "SD card via USB" is not available. On wake, main.cpp calls
+  `gpio_deep_sleep_hold_dis()` before anything else: the digital-pad
+  autohold armed by the pre-sleep hook survives the wake reset and
+  would otherwise keep GPIO47 (panel power) frozen. main.cpp also
+  resets the GT911 itself (INT held LOW across the RST rising edge
+  and for 50 ms after it, then `tcfg.rst = -1`), like on the X4 Pro:
+  with INT floating the chip came up at 0x14 and never reported a
+  touch.
+  *Requires ESP32-S3.*
+- **DRAFTLING_MODEL_M5STACK_PAPERMONO** -- M5Stack PaperMono /
+  PaperMono-Lite (one build for both; the full PaperMono's NFC and
+  LoRa modules are left unused): 3.97" 800x480 SSD1677 e-paper driven
+  by `components/display/display_m5_papermono.cpp`, front-light,
+  FT6336G touch, MicroSD on SDMMC 1-bit, all on peripherals switched
+  by an M5IOE1 IO expander and an M5PM1 power-management chip on the
+  shared I2C bus (SDA=47, SCL=48). main.cpp brings both chips up
+  before `display_init()`: `battery_init_m5pm1()`, then
+  `m5ioe1_init()` + `m5ioe1_set_pin()` to power the panel, touch and
+  SD card and pulse the panel/touch reset lines. Touch reports a
+  480x800 portrait frame (`TOUCH_NATIVE_W/H` 480/800, swap + mirror
+  X). Button A (GPIO2) is the wake source, Page Up on a short press
+  and forget-keyboards on a 2 s hold; Button B (GPIO3) is Page Down on
+  a short press and sleep on a 2 s hold
+  (`CONFIG_DRAFTLING_SLEEP_BUTTON_GPIO`); `papermono_btn_init()` in
+  main.cpp suppresses the Page Up/Down on a long hold. Tested on
+  physical hardware; see HARDWARE.md.
+  *Requires ESP32-S3.*
+- **DRAFTLING_MODEL_WAVESHARE_LCD_316** -- Waveshare ESP32-S3-LCD-3.16:
+  3.16" 320x820 portrait ST7701 color LCD on the 16-bit RGB
+  interface (`display_rgb.cpp`, `CONFIG_DRAFTLING_RGB_PANEL_ST7701`),
+  rendered landscape at 820x320 via a 270-degree base rotation, Hack
+  fonts (HIDPI). MicroSD on SDMMC 1-bit (CLK=1, CMD=2, D0=42; CLK/CMD
+  shared with the panel's init bus), battery through a 1:2 divider on
+  GPIO4, BOOT (GPIO0) as the wake source. No touch. The unused
+  QMI8658 IMU (0x6B) and PCF85063 RTC (0x51) on I2C SDA=15/SCL=7 are
+  quieted once per boot by `ws_lcd316_quiet_i2c_peripherals()` in
+  main.cpp (IMU CTRL1 sensorDisable = Power-Down; RTC Control_2
+  COF = 111 = CLKOUT off), right after `display_init()`. Tested on
+  physical hardware. *Requires ESP32-S3.*
+
+The hardware-model selection drives two non-prompted `int` symbols
+consumed in `main/app_config.h` as `DISPLAY_WIDTH` / `DISPLAY_HEIGHT`:
+
+- **DRAFTLING_DISPLAY_WIDTH** -- 400 (RLCD), 960 (PaperS3), 320
+  (FNK0104A/B, FNK0104N, Waveshare LCD-3.16), 480 (FNK0104S), 800 (Xteink X4 Pro / X4 Classic,
+  Waveshare ePaper-3.97, Seeed reTerminal Sticky, M5Stack PaperMono),
+  792 (Elecrow CrowPanel 5.79").
+- **DRAFTLING_DISPLAY_HEIGHT** -- 300 (RLCD), 540 (PaperS3), 820
+  (Waveshare LCD-3.16, FNK0104N), 240
+  (FNK0104A/B), 320 (FNK0104S), 480 (Xteink X4 Pro / X4 Classic,
+  Waveshare ePaper-3.97, Seeed reTerminal Sticky, M5Stack PaperMono),
+  272 (Elecrow CrowPanel 5.79").
+
+### Screen margins (user-adjustable, not a Kconfig setting)
+
+Pixels of physical panel hidden under an opaque bezel/enclosure cover
+on each edge -- e.g. a recessed cutout whose cover overlaps the
+glass -- are a **runtime, NVS-persisted** setting, not a per-board
+Kconfig default: `components/display/display_margins.h` /
+`display_margins.cpp` expose `display_margin_left/right/top/bottom()`
+(a frozen, session-lifetime value loaded by `display_margins_init()`,
+which `main.cpp` calls immediately after `nvs_flash_init()` -- before
+`display_init()` / `draftling_lvgl_port_init()` -- so every consumer
+sees it from the first frame) and `display_margins_set()` /
+`display_margins_get_pending()` (write/read the raw NVS value for the
+*next* boot; the editor's F1 -> Settings menu uses these to let the
+user cycle each margin 0-40 px in 2 px steps). Zero on every board on
+a fresh install.
+
+`main/app_config.h` subtracts the frozen margins from
+`DISPLAY_WIDTH/HEIGHT` to get `DISPLAY_LOGICAL_WIDTH/HEIGHT` -- the
+area LVGL and the editor (`SCR_W`/`SCR_H` in `editor_ui.cpp`) actually
+render into -- and a display backend that needs to compensate (only
+`display_xteink_epd.cpp` does today) offsets every write into its
+physical framebuffer by the left/top margin so on-screen content
+never lands under the cover.
+
+Changing a margin only takes effect after a restart: `display_margin_
+*()`'s frozen value (not whatever was most recently saved) is what
+every consumer reads for the life of the session, because the LVGL
+display resolution is fixed once `draftling_lvgl_port_init()` runs --
+re-deriving it live would mean tearing down and rebuilding the entire
+LVGL display and widget tree. If `display_margin_*()` returned the
+live NVS value instead, `SCR_W`/`SCR_H` would start disagreeing with
+LVGL's actual (unchanged) canvas size the moment a setting was saved,
+well before the restart meant to apply it -- this is why
+`display_margins_set()` deliberately does not touch the in-memory
+values `display_margin_*()` return.
+
+Both symbols are non-prompted (no menuconfig entry); to support a
+new board with a different resolution, add a model `config` block
+inside the `DRAFTLING_HARDWARE_MODEL` choice and extend the
+per-model `default` lines on these symbols.
+
+### Display orientation (user-adjustable, not a Kconfig setting)
+
+Landscape (default) or portrait, a **runtime, NVS-persisted** setting
+modelled exactly on the screen margins above:
+`components/display/display_orientation.{h,cpp}` expose
+`display_orientation_is_portrait()` (frozen, session-lifetime, loaded
+by `display_orientation_init()` which `main.cpp` calls right after
+`display_margins_init()`), plus `display_orientation_set_portrait()` /
+`display_orientation_get_pending_portrait()` for the F1 -> Settings
+"Display orientation" row. NVS namespace `disporient`, key `portrait`
+(u8). Landscape on a fresh install.
+
+Portrait adds a quarter turn to the board's build-time base rotation:
+`app_config.h`'s `DISPLAY_ROTATE_EFFECTIVE` is `DISPLAY_ROTATE +
+CONFIG_DRAFTLING_DISPLAY_PORTRAIT_EXTRA_ROTATE` (mod 360) in portrait,
+and that is what `main.cpp` passes to `draftling_lvgl_port_init()`.
+`DRAFTLING_DISPLAY_PORTRAIT_EXTRA_ROTATE` is a non-prompted derived
+`int` (Kconfig.projbuild) defaulting to **90**; the **Xteink X4 Pro**
+and **X4 Classic** set it to **270** because that board family's
+enclosure reads better with portrait turned the opposite way. LVGL
+then swaps its own reported
+resolution, and `flush_cb` software-rotates each tile back to physical
+panel coordinates -- the display backends stay rotation-agnostic.
+`DISPLAY_LOGICAL_WIDTH/HEIGHT` and the touchscreen `logical_width/height`
+stay in the pre-rotation (panel-native) frame; the touchscreen
+component's `user_rotate_deg` stays 0 and LVGL rotates each incoming
+indev point itself (`lv_display_rotate_point()` in
+`indev_pointer_proc()`).
+
+The subtlety: `flush_cb` in `lvgl_port.cpp` software-rotates pixels
+with a rotation sense OPPOSITE to LVGL's own
+`lv_display_rotate_area()` / `lv_display_rotate_point()`. So
+`lv_display_set_rotation()` is fed the **mirrored** quarter turn --
+`lvgl_rotation_for_port_deg()` maps 90<->270 (0 and 180 unchanged).
+That keeps the reported-resolution swap the same (90 and 270 both swap)
+while making `lv_display_rotate_point()`'s physical->logical map the
+exact inverse of `flush_cb`'s logical->physical pixel map, so a tap
+lands under the finger in every orientation. (Before this, a 90/270
+base-rotation or portrait mode put touch input a quarter turn off.)
+
+In `editor_ui.cpp`, `scr_axes_swapped()` folds the build base and the
+portrait flag into one XOR that decides whether `SCR_W`/`SCR_H` use the
+panel width or height. `recalc_pane_geometry()` / `layout_panes()`
+split top/bottom instead of left/right when portrait (the split always
+follows the display's long axis). Frozen for the session for the same
+reason as the margins -- the LVGL canvas and widget tree are built once
+at boot -- so a change only applies after a restart, offered by
+`request_close_settings()` (shared with the margin-change prompt via
+`s_restart_needed` / the "Restart now to apply changes" list).
+
+### Display upside down (user-adjustable, not a Kconfig setting)
+
+Off (default) or on, a second **runtime, NVS-persisted** setting,
+modelled exactly on the "Display orientation" setting above:
+`components/display/display_flip.{h,cpp}` expose
+`display_flip_is_upside_down()` (frozen, session-lifetime, loaded by
+`display_flip_init()`, which `main.cpp` calls right after
+`display_orientation_init()`), plus `display_flip_set_upside_down()` /
+`display_flip_get_pending_upside_down()` for the F1 -> Settings
+"Display upside down" row. NVS namespace `dispflip`, key `updown`
+(u8). Off on a fresh install.
+
+When on, it adds a further 180 degrees on top of whatever
+`DISPLAY_ROTATE` and the portrait extra-rotate already produce:
+`app_config.h`'s `DISPLAY_ROTATE_EFFECTIVE` folds in
+`display_flip_is_upside_down() ? 180 : 0` after the portrait
+conditional, mod 360. A plain 180 turn never swaps width and height,
+so it composes with the portrait quarter turn in either order and does
+not affect `scr_axes_swapped()`; it reuses the exact same
+`DISPLAY_ROTATE_EFFECTIVE` -> `draftling_lvgl_port_init()` pipeline as
+the base rotation and portrait extra-rotate, so the software tile
+rotation (`flush_cb` in `lvgl_port.cpp`) and touch-point rotation stay
+correct for free. Frozen for the session for the same reason as the
+margins and orientation -- the LVGL rotation angle is fixed at
+`draftling_lvgl_port_init()` time -- so a change only applies after a
+restart, offered by `request_close_settings()` alongside the margin
+and orientation prompts.
+
+This setting is hidden from F1 -> Settings on boards where
+`CONFIG_DRAFTLING_DISPLAY_CAN_ROTATE` is set (currently the
+parallel-RGB boards -- see "Display Rotation" below): those boards
+already expose a "Rotate 180" toggle that does the same 180-degree
+turn, applied immediately via `draftling_lvgl_port_set_flip180()`
+with no restart needed (a 180 flip never changes the reported
+resolution, so the LVGL widget tree does not need rebuilding).
+Offering both at once on the same board would be two redundant
+controls for the same turn; `editor_ui.cpp`'s
+`SETTINGS_IDX_UPSIDE_DOWN` is `-1` (and the row and its Enter/arrow
+handling compiled out) whenever `CONFIG_DRAFTLING_DISPLAY_CAN_ROTATE`
+is defined.
+
+#### E-paper full-refresh interval (DRAFTLING_EPD_FULL_REFRESH_INTERVAL)
+
+`int` used by e-paper backends only (gated on
+`DRAFTLING_DISPLAY_EPD`). Number of partial refreshes between
+full refreshes; default 30.
+
+#### Derived feature flags (no menuconfig prompt)
+
+The hardware-model choice also drives a set of hidden `bool` /
+`int` symbols that carry the user's board pick to every component
+without anyone needing to test individual `DRAFTLING_MODEL_*` ids
+in C / C++ code:
+
+| Symbol | Purpose | Set by |
+|--------|---------|--------|
+| DRAFTLING_DISPLAY_RLCD            | Selects `display_rlcd.cpp`        | RLCD-4.2 |
+| DRAFTLING_MODEL_XTEINK_X4         | Common to the Xteink X4 Pro and X4 Classic (shared `display_xteink_epd.cpp` backend, CW2017 gauge, SDMMC slot, OTA partition table, GPIO1 peripheral-rail latch, GPIO3 Power/wake) | Xteink X4 Pro, Xteink X4 Classic |
+| DRAFTLING_DISPLAY_EPD             | Gates EPD-only options (BLACK_BACKGROUND, full-refresh interval) and the editor's no-blink cursor / 120 ms flush debounce | PaperS3, LilyGO T5 E-Paper S3 Pro / Pro Lite, Xteink X4 Pro / X4 Classic, Elecrow CrowPanel 5.79", Waveshare ESP32-S3-ePaper-3.97, Seeed reTerminal Sticky, M5Stack PaperMono |
+| DRAFTLING_DISPLAY_EPDIY           | Selects `display_epdiy.cpp` (with `epd_board_v7` for LilyGO T5 or the in-tree `epd_board_papers3` for PaperS3) and pulls in the `vroland/epdiy` managed component | PaperS3, LilyGO T5 E-Paper S3 Pro / Pro Lite |
+| DRAFTLING_EPDIY_BOARD_PAPERS3     | Switches `display_epdiy.cpp` to the PaperS3 board definition (no VCOM, no shared I2C) | PaperS3 |
+| DRAFTLING_DISPLAY_XTEINK_EPD      | Selects `display_xteink_epd.cpp` (plain SPI, auto-detects SSD1677/UC8179/UC8279 at boot) | Xteink X4 Pro, Xteink X4 Classic |
+| DRAFTLING_DISPLAY_SSD1683         | Selects `display_ssd1683.cpp` (dual-controller plain-SPI e-paper backend) | Elecrow CrowPanel 5.79" |
+| DRAFTLING_DISPLAY_WS_EPD397       | Selects `display_ws_epd397.cpp` (plain SPI, single SSD1677-family controller, no boot-time detection) | Waveshare ESP32-S3-ePaper-3.97 |
+| DRAFTLING_DISPLAY_RETERMINAL_STICKY | Selects `display_reterminal_sticky.cpp` (plain SPI, SSD1677 or SSD2677 auto-detected by BUSY polarity, MISO wired since the MicroSD card shares this panel's bus) | Seeed reTerminal Sticky |
+| DRAFTLING_DISPLAY_M5_PAPERMONO    | Selects `display_m5_papermono.cpp` (plain SPI, single SSD1677 controller; panel supply/reset on the M5IOE1, front-light on the M5PM1) | M5Stack PaperMono |
+| DRAFTLING_DISPLAY_AXS15231B       | Selects `display_axs15231b.cpp`   | Touch-LCD-3.49, JC3248W535 |
+| DRAFTLING_DISPLAY_ILI9341         | Selects `display_ili9341.cpp` (shared ILI9341/ST7796 SPI backend) with the ILI9341 init sequence | Freenove FNK0104A / FNK0104B |
+| DRAFTLING_DISPLAY_SPI_TFT_CUSTOM_PINS | Routes a board-provided SPI TFT pin tuple, including MISO and hardware reset, through `display_init()` | MicroJournal Rev 5 |
+| DRAFTLING_HAS_USB_HOST             | Enables the USB HID keyboard host component | M5Stack Tab5, MicroJournal Rev 5 |
+| DRAFTLING_USB_HOST_BSP_MANAGED     | Selects BSP-owned USB PHY, VBUS and host daemon startup | M5Stack Tab5 |
+| DRAFTLING_DISPLAY_ST7796          | Selects `display_ili9341.cpp` with the ST7796 init sequence | Freenove FNK0104S |
+| DRAFTLING_DISPLAY_ST77922         | Selects `display_st77922.cpp` (ST77922 QSPI panel, native portrait, LVGL port rotates) | Freenove FNK0104N |
+| DRAFTLING_DISPLAY_ST7365          | Selects `display_ili9341.cpp` with the Viewe UEED035HV-RX40-L001 pins (incl. RST and the IM0/IM1 interface-mode straps) and Viewe's ST7365 init table | Viewe UEDX24320028E-WB-A + UEED035HV |
+| DRAFTLING_DISPLAY_MIPI_DSI        | Selects `display_mipi_dsi.cpp` (delegates to `espressif/m5stack_tab5` BSP) | M5Stack Tab5 |
+| DRAFTLING_DISPLAY_RGB             | Selects `display_rgb.cpp` (parallel RGB565 via `esp_lcd_new_rgb_panel`) | Sunton 8048S070 / 8048S043, Waveshare Touch-LCD-7, Waveshare LCD-3.16 |
+| DRAFTLING_RGB_PANEL_ST7701        | Switches `display_rgb.cpp` to the ST7701 branch: own pins / timings, direct-GPIO reset, active-low PWM backlight, and the vendor init sequence over a bit-banged 3-wire SPI bus (CS=0/BOOT, SCK=2, SDA=1) that is released afterwards for the BOOT button and the SDMMC slot | Waveshare LCD-3.16 |
+| DRAFTLING_HAS_CH422G              | Enables the `io_expander` component (CH422G I2C IO-expander) and switches `display_rgb.cpp` to the CH422G-based backlight / LCD-reset path instead of a direct GPIO | Waveshare Touch-LCD-7 |
+| DRAFTLING_HAS_M5IOE1              | Compiles in the M5IOE1 IO-expander driver in the `io_expander` component (stubs otherwise) | M5Stack PaperMono |
+| DRAFTLING_DISPLAY_COLOR           | Enables the color-theme picker; PARTIAL render mode in `lvgl_port.cpp` | AXS15231B boards, Tab5, RGB boards, Freenove FNK0104 family |
+| DRAFTLING_DISPLAY_TRANSFLECTIVE   | Selects the separate transflective-panel copy of `COLOR_THEMES` in `editor_ui.cpp` (these panels render colors differently) | Viewe UEDX24320028E-WB-A + UEED035HV |
+| DRAFTLING_DISPLAY_HAS_BACKLIGHT   | Adds the "Backlight: NN%" entry to F1 -> Settings, enables the Ctrl+B cycle shortcut, and calls `display_set_backlight()` at boot from NVS -- unless DRAFTLING_DISPLAY_BACKLIGHT_BINARY is also set (see below) | AXS15231B boards, Tab5, LilyGO T5 E-Paper S3 Pro / Pro Lite, RGB boards, Freenove FNK0104 family, Xteink X4 Pro, M5Stack PaperMono |
+| DRAFTLING_DISPLAY_BACKLIGHT_BINARY | Suppresses the entire backlight Settings entry / Ctrl+B feature (no PWM dimming is physically possible, so a brightness control would be misleading); the backlight is left at the display backend's own default (on) | Waveshare Touch-LCD-7 (any CH422G board) |
+| DRAFTLING_DISPLAY_HIDPI           | Renders the UI 1:1 with the larger Hack font (instead of upscaling the framebuffer); compiles the `hack_*` font sources and selects the Hack family in `editor_ui.cpp` | PaperS3, LilyGO T5 E-Paper S3 Pro / Pro Lite, Tab5, Sunton 8048S070 / 8048S043, Waveshare Touch-LCD-7, Waveshare LCD-3.16, Xteink X4 Pro / X4 Classic, Waveshare ESP32-S3-ePaper-3.97, Seeed reTerminal Sticky, M5Stack PaperMono |
+| DRAFTLING_HAS_BATTERY             | Creates the battery-percentage status-bar label and its poll timer | RLCD-4.2, PaperS3, Touch-LCD-3.49, T5 E-Paper S3 Pro / Pro Lite, Freenove FNK0104 family, Waveshare LCD-3.16, Xteink X4 Pro / X4 Classic, Waveshare ESP32-S3-ePaper-3.97, Seeed reTerminal Sticky, M5Stack PaperMono |
+| DRAFTLING_BATTERY_BQ27220         | Selects the BQ27220 fuel-gauge backend (`battery_init_bq27220(bus)`) instead of the GPIO ADC backend. On the Seeed reTerminal Sticky the bus passed in is a second, dedicated one main.cpp creates just for the gauge, not `shared_i2c_bus` | T5 E-Paper S3 Pro / Pro Lite, Seeed reTerminal Sticky |
+| DRAFTLING_BATTERY_BQ27220_GAUGE_SOC | BQ27220 percentage comes from the gauge's StateOfCharge (0x2C) instead of the voltage LUT; only for gauges whose Data Memory is programmed for the pack | Seeed reTerminal Sticky |
+| DRAFTLING_BATTERY_CW2017          | Selects the CW2017 fuel-gauge backend (`battery_init_cw2017(shared_i2c_bus)`); no charger IC on the bus, so charging state always reads unknown | Xteink X4 Pro / X4 Classic |
+| DRAFTLING_BATTERY_AXP2101         | Selects the AXP2101 PMIC backend (`battery_init_axp2101(shared_i2c_bus)`); real integrated charger, so charging state is reported directly. Same chip's ALDO3 output also powers the e-paper panel -- see `battery_axp2101_enable_display_rail()`, called from the display backend's `display_set_shared_i2c_bus()` before `display_init()` | Waveshare ESP32-S3-ePaper-3.97 |
+| DRAFTLING_BATTERY_M5PM1           | Selects the M5PM1 backend (`battery_init_m5pm1(shared_i2c_bus)`, called early in boot since the chip gates the board's rails); voltage-only, "charging" = on USB. Its PWM0 drives the front-light (`battery_m5pm1_set_frontlight()`) | M5Stack PaperMono |
+| DRAFTLING_HAS_POWER_LATCH         | Enables the `power` component: TCA9554-latched battery rail + PWR-button long-press = power off; standby cuts the latch before falling back to deep sleep | Touch-LCD-3.49 |
+| DRAFTLING_SD_SDMMC                | Routes SD init through the on-chip SDMMC peripheral (1-bit) instead of generic SPI | RLCD-4.2, Freenove FNK0104 family, Waveshare LCD-3.16, Xteink X4 Pro / X4 Classic, Waveshare ESP32-S3-ePaper-3.97, M5Stack PaperMono |
+| DRAFTLING_WAKEUP_GPIO             | RTC-capable EXT0 wake-up GPIO; consumed by `components/standby/standby.cpp` | per-model defaults |
+| DRAFTLING_TOUCH_ST77922           | Adds the ST77922 TDDI touch poll routine to `components/touchscreen/touchscreen.cpp` (16-bit register addresses, info at 0x0010, point 0 at 0x0014) | Freenove FNK0104N |
+| DRAFTLING_TOUCH_FT6336U           | Adds the FT6336U poll routine to `components/touchscreen/touchscreen.cpp` (8-bit register protocol) | Freenove FNK0104B / FNK0104S, M5Stack PaperMono (FT6336G) |
+
+Components MUST key off these derived symbols; they MUST NOT
+test `DRAFTLING_MODEL_*` directly. Adding a new model means
+adding new `default` lines to each of the symbols above (plus
+the width / height / rotate-default symbols), creating a new per-board
+header file under `main/boards/` with the board's `BOARD_NAME`, pin
+numbers and `WAKEUP_GPIO_NUM`, adding the corresponding `#elif` include
+directive in `main/app_config.h`, and updating the matching display / SD
+init branch in `main/main.cpp`.
+
+#### Display Rotation (DRAFTLING_DISPLAY_ROTATE)
+
+A `choice` that sets the **build-time base** display rotation angle.
+Options are 0, 90, 180, and 270 degrees. The default is 0 (no
+rotation); the natively-portrait Freenove panels default to 90 and the
+Tab5 and the Waveshare LCD-3.16 to 270 so the editor renders landscape. The selected angle is
+exposed as the hidden `int` symbol **DRAFTLING_DISPLAY_ROTATE_ANGLE**,
+consumed in `app_config.h` as `DISPLAY_ROTATE`.
+
+The runtime **"Display orientation"** setting (F1 -> Settings; see the
+"Display orientation" section below) adds
+`DRAFTLING_DISPLAY_PORTRAIT_EXTRA_ROTATE` degrees on top of this for
+portrait -- a second non-prompted derived `int` in this file, default
+90, set to 270 on the Xteink X4 Pro / X4 Classic. `app_config.h`'s
+`DISPLAY_ROTATE_EFFECTIVE` is what `main.cpp` actually passes to
+`draftling_lvgl_port_init()`.
+
+#### High-density font selection (DRAFTLING_DISPLAY_HIDPI)
+
+Non-prompted derived `bool`. When set, the board renders the UI 1:1
+(logical resolution == physical panel resolution) using the larger
+**Hack** font family instead of upscaling a lower-resolution Greybeard
+framebuffer. This is enabled by default on the boards whose panels are
+dense enough that native-size Greybeard text would be too small: the
+M5Stack PaperS3, both LilyGO T5 E-Paper S3 Pro variants, the M5Stack
+Tab5, and the Sunton 8048S070 / 8048S043. See the "Hack fonts" section
+under Font Creation Process for the sizes and script coverage. Because
+the symbol is non-prompted, the per-model default re-applies
+automatically whenever `DRAFTLING_HARDWARE_MODEL` changes -- no need to
+delete `sdkconfig`.
+
+This flag replaced the former `DRAFTLING_DISPLAY_SCALE` integer, which
+rendered LVGL into a lower-resolution logical buffer and then expanded
+each pixel into a SCALE x SCALE block in the display backend. That
+approach produced blocky, upscaled glyphs; rendering the Hack font at
+its native size at full panel resolution is sharper. The display
+backends now always run their 1:1 (SCALE == 1) path.
+
+### components/kb_layout/Kconfig.projbuild -- Keyboard Layouts
+
+This file defines the **DRAFTLING Keyboard Layouts** menu. Each layout
+is an independent `bool` option that can be enabled or disabled:
+
+| Symbol | Layout | Default |
+|--------|--------|---------|
+| KB_LAYOUT_ENABLE_US | US-English (QWERTY) | y (enabled) |
+| KB_LAYOUT_ENABLE_UA | Ukrainian (Cyrillic) | y (enabled) |
+| KB_LAYOUT_ENABLE_DE | German (QWERTZ) | y (enabled) |
+| KB_LAYOUT_ENABLE_FR | French (AZERTY) | y (enabled) |
+| KB_LAYOUT_ENABLE_HE | Hebrew (SI 1452) | y (enabled) |
+
+Disabling unused layouts saves flash space because the translation
+tables for disabled layouts are excluded from the build. The `kb_layout`
+component reads these symbols at compile time to conditionally compile
+only the enabled layout tables. A board-specific `sdkconfig.defaults.*`
+can override individual symbols (see `sdkconfig.defaults.sunton_8048s043`,
+which keeps only US + DE for that author's German keyboard).
+
+Which of the *compiled-in* layouts actually get cycled through at
+runtime is a separate, user-facing "Active layouts" setting (F1 ->
+Settings), independent of this Kconfig menu -- see the `kb_layout`
+component writeup above.
+
+## Building
+
+Requires ESP-IDF v6.0.2 or later.
+
+PSRAM is required on every supported board. The editor gap buffer
+(sized dynamically at startup from the PSRAM that is free when
+`editor_init()` runs -- typically a few hundred KB up to a few MB
+depending on the board), the display
+framebuffers, the LVGL widget heap (`CONFIG_LV_USE_CUSTOM_MALLOC` routes
+through PSRAM), the Git client's object buffers, ~24 KB task stack and
+diff3 LCS matrix, and
+the Bluedroid host environment (`CONFIG_BT_BLE_DYNAMIC_ENV_MEMORY` plus
+`CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST`) all assume `MALLOC_CAP_SPIRAM`
+is available. The top-level `CMakeLists.txt` aborts the configure step
+with a `FATAL_ERROR` if `CONFIG_SPIRAM` is not set. Targets without
+on-chip PSRAM support (e.g. ESP32-S2, bare ESP32-C3 modules without
+PSRAM) are not supported.
+
+`firmware/` ships a `CMakePresets.json` with one preset per supported
+board (`waveshare_rlcd42`, `m5stack_papers3`, `lilygo_t5_epd_s3_pro`,
+`lilygo_t5_epd_s3_pro_h752`, `waveshare_touch_lcd_349`, `m5stack_tab5`,
+`jc3248w535`, `sunton_8048s070`, `sunton_8048s043`,
+`waveshare_touch_lcd_7`, `waveshare_lcd_316`, `freenove_fnk0104a`, `freenove_fnk0104b`,
+`freenove_fnk0104s`, `freenove_fnk0104n`, `microjournal_rev5`, `viewe_uedx24320028_ueed035hv`, `xteink_x4_pro`, `xteink_x4_classic`,
+`elecrow_crowpanel_579`, `waveshare_epaper_397`,
+`seeed_reterminal_e1001`, `seeed_reterminal_sticky`,
+`m5stack_papermono`). Each
+preset points `SDKCONFIG_DEFAULTS` at `sdkconfig.defaults` plus its own
+`sdkconfig.defaults.<board>` file (which sets `CONFIG_IDF_TARGET` and
+the board's `CONFIG_DRAFTLING_MODEL_*` option), and places `binaryDir` /
+`SDKCONFIG` under `build/<board>` so every board's build output stays
+isolated. Run these from inside `firmware/`:
+
+```bash
+cd firmware
+idf.py --preset waveshare_rlcd42 build
+idf.py --preset waveshare_rlcd42 -p /dev/ttyACM0 flash monitor
+```
+
+If you pull new changes that touch `sdkconfig.defaults` or a board's
+`sdkconfig.defaults.<board>` file, delete the preset's generated
+`sdkconfig` so the defaults are re-applied:
+
+```bash
+rm -f build/waveshare_rlcd42/sdkconfig    # from inside firmware/
+idf.py --preset waveshare_rlcd42 build
+```
+
+## Publishing a Release
+
+The project version lives in one place: `set(PROJECT_VER "X.Y.Z")` in
+the top-level `CMakeLists.txt`, set before `project(draftling)`. ESP-IDF
+embeds it in the app image's `esp_app_desc_t`; `components/editor/editor_ui.cpp`
+reads it back at runtime via `esp_app_get_description()->version` and
+shows it in the F1 menu's bottom status row. Bump this string as the
+first step of every release.
+
+A release also publishes prebuilt binaries for the boards covered by
+the web flasher (see below), on the `_flasher` branch only -- never as
+GitHub release assets. Currently: `m5stack_papers3`,
+`xteink_x4_pro`, `xteink_x4_classic`, `waveshare_rlcd42`,
+`waveshare_touch_lcd_349`, `waveshare_lcd_316`, `waveshare_epaper_397`,
+`lilygo_t5_epd_s3_pro`, `freenove_fnk0104a`, `freenove_fnk0104b`,
+`freenove_fnk0104s`, `freenove_fnk0104n`, `elecrow_crowpanel_579`,
+`seeed_reterminal_e1001`, `seeed_reterminal_sticky`, and
+`m5stack_papermono`. Extend the list
+there
+as more boards get a web-flasher entry. A release does not need to
+cover every board with prebuilt binaries -- the flasher's manifest
+tracks a `releases` list per board (see below), so a board can simply
+keep pointing at an older tag until it is next rebuilt. An
+experimental / untested board's manifest entry marks itself with a
+`" -- UNTESTED on physical hardware"` (or similar) suffix on its
+`description` field, matching the convention already used for
+`xteink_x4_classic`; there is no separate schema flag for this.
+
+Note: step 5 below refers to `firmware/` on the *`_flasher`* branch --
+its own binary-staging directory, named the same as (but unrelated to)
+the `firmware/` subdirectory on `main` that holds the actual build
+tree referenced in steps 1-4.
+
+1. Bump `PROJECT_VER` in `firmware/CMakeLists.txt`, move the
+   `CHANGELOG.md` `[Unreleased]` entries under a new `[X.Y.Z]` heading
+   (see "Changelog" above), commit, and push `main` (along with
+   whatever else is going into the release).
+2. For each board with prebuilt binaries, build at the commit that
+   will be tagged and sanity-check the output:
+   ```bash
+   cd firmware
+   idf.py --preset m5stack_papers3 build
+   idf.py --preset xteink_x4_pro build
+   idf.py --preset xteink_x4_classic build
+   idf.py --preset waveshare_epaper_397 build
+   # ...and so on for every board in the release
+   ```
+3. Tag and push:
+   ```bash
+   git tag -a vX.Y.Z -m "Release X.Y.Z"
+   git push origin vX.Y.Z
+   ```
+4. Create the GitHub release with the `[X.Y.Z]` changelog section as
+   its notes. **Do NOT attach firmware binaries (or any other files)
+   to the GitHub release** -- no `gh release upload`, no file
+   arguments to `gh release create`. Prebuilt images are published
+   only through the web flasher (step 5).
+   ```bash
+   gh release create vX.Y.Z --title "Release X.Y.Z" --notes-file notes.md
+   ```
+5. Update the web flasher on the `_flasher` branch (see below). Each
+   board gets three images, named
+   `draftling-<board>[-bootloader|-partition-table].bin` (from
+   `firmware/build/<board>/bootloader/bootloader.bin`,
+   `firmware/build/<board>/partition_table/partition-table.bin`, and
+   `firmware/build/<board>/draftling.bin`).
+   `xteink_x4_pro`, `xteink_x4_classic` and `seeed_reterminal_sticky`
+   each also need a fourth image, `draftling-<board>-otadata.bin`
+   (from `firmware/build/<board>/ota_data_initial.bin`): their
+   partition tables are dual-OTA (`partitions_xteink_x4_pro.csv` /
+   `partitions_xteink_x4_classic.csv` /
+   `partitions_seeed_reterminal_sticky.csv`), so a clean flash must
+   also (re)initialise the `otadata` partition at `0xd000` -- an 8 KB
+   all-`0xFF` blob that makes the bootloader pick `ota_0`. Otherwise a
+   stale `otadata` left by the stock firmware could point the
+   bootloader at the empty `ota_1`. `waveshare_epaper_397` uses the
+   default single-"factory"-app partition table like most other boards,
+   so it needs only the usual three images.
+
+   The `_flasher` branch has its own `README.md` with the full layout
+   and rationale -- it is an orphan branch with no shared history with
+   `main`, published via GitHub Pages, so check it out in a separate
+   `git worktree` rather than switching your main checkout to it:
+   - Add `firmware/vX.Y.Z/` (on `_flasher`) with those images, named
+     as above, for each board included in this release (including
+     `draftling-xteink_x4_pro-otadata.bin`,
+     `draftling-xteink_x4_classic-otadata.bin` and
+     `draftling-seeed_reterminal_sticky-otadata.bin` for those three
+     boards).
+   - In `manifest.json`, each board has its own `releases` array
+     (newest first). For each board this release covers, prepend a new
+     entry with its `tag`, flash mode/freq/size, and `parts[].path`
+     pointing at `firmware/vX.Y.Z/...`. Leave other boards' `releases`
+     untouched -- they keep pointing at whatever tag they last shipped
+     under. `xteink_x4_pro`, `xteink_x4_classic` and
+     `seeed_reterminal_sticky` each have a fourth `parts` entry:
+     `{ "path": "firmware/vX.Y.Z/draftling-<board>-otadata.bin",
+     "offset": "0xd000" }` (their `draftling-<board>.bin` app part
+     still sits at `0x10000`).
+   - Commit and push to `_flasher` -- GitHub Pages redeploys
+     automatically; no separate deploy step.
+   - A `firmware/<tag>/` directory (on `_flasher`) can be deleted once
+     no board's `releases` references it any more (check every board,
+     not just the ones just updated).
+
+Note: the `gh` CLI here is authenticated with a fine-grained PAT that
+can create tags, releases, and release assets, but is *not* authorized
+to manage repository settings (e.g. `gh api repos/.../pages` returns
+403). GitHub Pages for `_flasher` only needed enabling once, in
+Settings -> Pages; it does not need to be touched again for routine
+releases.

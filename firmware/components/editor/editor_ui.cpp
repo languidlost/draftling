@@ -1,0 +1,10835 @@
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <esp_log.h>
+#include <esp_system.h>
+#include <esp_app_desc.h>
+#include <esp_mac.h>
+#include <esp_chip_info.h>
+#include <esp_flash.h>
+#include <esp_heap_caps.h>
+#include <esp_psram.h>
+#include "soc/soc_caps.h"
+#include <sd_protocol_defs.h>
+#include <nvs_flash.h>
+#include <nvs.h>
+#include "sdkconfig.h"
+#include "lvgl.h"
+#include "widgets/label/lv_label_private.h"  /* offset / text_size of scrolling menu labels */
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+
+#include "editor_ui.h"
+#include "editor.h"
+#include "md_parser.h"
+#include "editor_format.h"
+#include "ble_keyboard.h"
+#if defined(CONFIG_DRAFTLING_HAS_USB_HOST)
+#include "usb_kbd.h"
+#endif
+#if defined(CONFIG_DRAFTLING_HAS_TAB5_KBD)
+#include "tab5_kbd.h"
+#endif
+#if defined(CONFIG_DRAFTLING_HAS_USB_MSC)
+#include "usb_msc.h"
+#endif
+#include "kb_layout.h"
+#include "wifi_manager.h"
+#include "git_sync.h"
+#include "sd_card.h"
+#include "lvgl_port.h"
+#include "display.h"
+#include "display_margins.h"
+#include "display_orientation.h"
+#include "display_flip.h"
+#include "standby.h"
+#include "greybeard.h"
+#include "battery.h"
+#include "wifi_icon.h"
+#include "freertos/task.h"
+
+/*
+ * Font aliases.
+ *
+ * Two monospaced bitmap font families are available. Standard-density
+ * boards use Greybeard (Latin + Latin-1 + Cyrillic + Hebrew). The
+ * high-density boards (CONFIG_DRAFTLING_DISPLAY_HIDPI -- the ones that
+ * used to upscale the framebuffer 2x) instead render 1:1 with the
+ * larger Hack family, whose six sizes mirror the Greybeard slots so
+ * the rest of the editor is family-agnostic. The FONT_NN number is
+ * the Greybeard slot; on Hack boards it maps to a larger pixel size
+ * with an approximately matching row height.
+ *
+ * The body font is selected at runtime via the base font size user
+ * setting (11, 14, 16, 18, or 22 px; high-density boards instead offer
+ * 9, 11, 14, 16, or 20 px, since the larger Hack glyphs need fewer
+ * body steps to cover the same visual range). Heading fonts are
+ * scaled relative to the body size, going as high as slot 34 (only
+ * defined on non-HIDPI boards, for the 22 px body size's H1).
+ * Status bars always use FONT_11 regardless of the body font setting.
+ */
+#ifdef CONFIG_DRAFTLING_DISPLAY_HIDPI
+#include "hack.h"
+#define FONT_9  (&hack_9)
+#define FONT_11 (&hack_11)
+#define FONT_14 (&hack_14)
+#define FONT_16 (&hack_16)
+#define FONT_18 (&hack_18)
+#define FONT_22 (&hack_22)
+#define FONT_26 (&hack_26)
+#define FONT_30 (&hack_30)
+#else
+#define FONT_11 (&greybeard_11)
+#define FONT_14 (&greybeard_14)
+#define FONT_16 (&greybeard_16)
+#define FONT_18 (&greybeard_18)
+#define FONT_22 (&greybeard_22)
+#define FONT_26 (&greybeard_26)
+#define FONT_30 (&greybeard_30)
+#define FONT_34 (&greybeard_34)
+#endif
+
+static const char *TAG = "EditorUI";
+
+/* Layout constants -- account for display rotation. The editor and
+ * LVGL canvas render 1:1 at the panel resolution (no framebuffer
+ * upscaling; high-density boards use a larger font instead), minus
+ * the user-adjustable screen margins (display_margin_*(), zero by
+ * default on every board -- see Settings -> Screen margins and
+ * app_config.h's DISPLAY_LOGICAL_WIDTH/HEIGHT).
+ *
+ * The LVGL logical canvas has the panel's width and height swapped
+ * whenever the *effective* rotation is 90 or 270 degrees. That happens
+ * when the board's build-time base rotation
+ * (CONFIG_DRAFTLING_DISPLAY_ROTATE_ANGLE) is 90/270, OR when the user
+ * picked portrait orientation (Settings -> Display orientation, which
+ * adds a quarter turn -- 90 or 270 degrees, per
+ * CONFIG_DRAFTLING_DISPLAY_PORTRAIT_EXTRA_ROTATE), but not both -- an
+ * XOR (both 90 and 270 flip the swap either way, so the exact quarter
+ * turn does not matter here). display_orientation_is_portrait() is
+ * frozen for the session (see display_orientation.h), so SCR_W / SCR_H
+ * stay constant until the next restart, exactly like the margins. */
+#if CONFIG_DRAFTLING_DISPLAY_ROTATE_ANGLE == 90 || CONFIG_DRAFTLING_DISPLAY_ROTATE_ANGLE == 270
+static inline bool scr_axes_swapped(void) { return !display_orientation_is_portrait(); }
+#else
+static inline bool scr_axes_swapped(void) { return display_orientation_is_portrait(); }
+#endif
+#define SCR_W        (scr_axes_swapped() \
+    ? (CONFIG_DRAFTLING_DISPLAY_HEIGHT - display_margin_top()  - display_margin_bottom()) \
+    : (CONFIG_DRAFTLING_DISPLAY_WIDTH  - display_margin_left() - display_margin_right()))
+#define SCR_H        (scr_axes_swapped() \
+    ? (CONFIG_DRAFTLING_DISPLAY_WIDTH  - display_margin_left() - display_margin_right()) \
+    : (CONFIG_DRAFTLING_DISPLAY_HEIGHT - display_margin_top()  - display_margin_bottom()))
+/* Header / status bar heights. These bars always use FONT_11, so on
+ * high-density boards (which render 1:1 with the taller Hack font
+ * instead of the old 2x upscale) they must be twice as tall to fit the
+ * larger glyphs -- this reproduces the physical bar height users saw
+ * when these boards still upscaled a FONT_11 (Greybeard 11 px) bar 2x. */
+#ifdef CONFIG_DRAFTLING_DISPLAY_HIDPI
+#define HEADER_H     32
+#define STATUS_H     32
+#define EDITOR_Y     HEADER_H
+#define EDITOR_H     (SCR_H - HEADER_H - STATUS_H)
+#define LIST_PANEL_H (SCR_H - HEADER_H)  /* height for list panels below header */
+#else
+#define HEADER_H     16
+#define STATUS_H     16
+#define EDITOR_Y     HEADER_H
+#define EDITOR_H     (SCR_H - HEADER_H - STATUS_H)
+#define LIST_PANEL_H (SCR_H - HEADER_H)  /* height for list panels below header */
+#endif
+
+/* ---- Base font size setting ----
+ * The user can pick 11, 14, 16, 18, or 22 px as the editor body font.
+ * Heading fonts are scaled up from the body size. High-density
+ * (HIDPI) boards render with the larger Hack family and expose two
+ * extra steps instead: 20 px, since their panels have the resolution
+ * to show a bigger body font comfortably, and 9 px -- smaller than
+ * the smallest Greybeard-mirrored slot -- for users who want to fit
+ * more text on a large, dense panel. */
+#ifdef CONFIG_DRAFTLING_DISPLAY_HIDPI
+#define FONT_SIZE_COUNT 5
+static const int FONT_SIZE_OPTIONS[FONT_SIZE_COUNT] = { 9, 11, 14, 16, 20 };
+static const char *FONT_SIZE_LABELS[FONT_SIZE_COUNT] = { "9 px", "11 px", "14 px", "16 px", "20 px" };
+#else
+#define FONT_SIZE_COUNT 5
+static const int FONT_SIZE_OPTIONS[FONT_SIZE_COUNT] = { 11, 14, 16, 18, 22 };
+static const char *FONT_SIZE_LABELS[FONT_SIZE_COUNT] = { "11 px", "14 px", "16 px", "18 px", "22 px" };
+#endif
+
+/* NVS namespace/key for font size */
+#define NVS_NS_EDITOR   "editor"
+#define NVS_KEY_FONTSZ  "fontsz"
+#define NVS_KEY_SPLIT   "split"
+
+/* Current body font size in pixels (default 11) */
+static int s_font_size = 11;
+
+/* Derived layout values -- recomputed when font size changes */
+static int s_line_h       = 11;
+static int s_char_w       = 6;
+
+/* Accessor macros that used to be compile-time constants.
+ * VISIBLE_LINES is derived from the *current* pane's content height
+ * (s_rp->h) so it stays correct whether the editor is showing one
+ * full-height pane or two half-height split panes. */
+#define LINE_H        s_line_h
+#define VISIBLE_LINES (s_line_h > 0 ? (s_rp->h / s_line_h) : 1)
+#define CHAR_W        s_char_w
+
+/* How far to jump the viewport when the cursor falls outside it, as a
+ * fraction of VISIBLE_LINES. Snapping the cursor to the very edge row
+ * (the old behavior: scroll = cur_line, or cur_line - VISIBLE_LINES +
+ * 1) means the next line of continued typing or navigation in the
+ * same direction immediately falls outside the viewport again,
+ * re-triggering a scroll -- and its full-screen re-render -- on
+ * every single line. Jumping a majority of the screen height instead
+ * leaves headroom so several more lines fit before another scroll is
+ * needed, trading a slightly larger jump for far fewer redraws
+ * (particularly noticeable on e-paper boards, where every redraw is
+ * a visible, non-instant refresh). Used by every scroll-adjustment
+ * site in this file, including refresh_active_pane()'s word-wrap
+ * correction loop below, so a scroll is never just one line whether
+ * it is triggered by ensure_cursor_visible(), editor_ui_move_visual(),
+ * or a paragraph wrapping into more rows than expected.
+ *
+ * Defined near s_rp below (VISIBLE_LINES expands to an s_rp
+ * dereference), rather than here alongside VISIBLE_LINES itself. */
+#define SCROLL_JUMP_FRACTION 0.6f
+
+/* Forward declaration (defined below) */
+static int char_width_for_font(const lv_font_t *font);
+static int utf8_chars_in_bytes(const char *text, size_t byte_len);
+static size_t utf8_byte_of_char(const char *s, size_t len, int n);
+
+#if defined(CONFIG_DRAFTLING_DISPLAY_COLOR)
+/* Forward declaration: tear down every screen / overlay and rebuild
+ * them under the freshly-selected color theme. Defined alongside
+ * the other init helpers near the bottom of this file. */
+static void rebuild_screens_for_theme(void);
+#endif
+
+/* Return the body font for the current size setting. */
+static const lv_font_t *body_font(void)
+{
+#ifdef CONFIG_DRAFTLING_DISPLAY_HIDPI
+    if (s_font_size == 20) return FONT_18;
+    if (s_font_size == 9)  return FONT_9;
+#else
+    if (s_font_size == 22) return FONT_22;
+    if (s_font_size == 18) return FONT_18;
+#endif
+    if (s_font_size == 16) return FONT_16;
+    if (s_font_size == 14) return FONT_14;
+    return FONT_11;
+}
+
+/* Return heading fonts (h1/h2/h3) scaled relative to the body size.
+ *   body 9  -> h3 11, h2 14, h1 16 (HIDPI only)
+ *   body 11 -> h3 14, h2 16, h1 18
+ *   body 14 -> h3 16, h2 18, h1 22
+ *   body 16 -> h3 18, h2 22, h1 26
+ *   body 18 -> h3 22, h2 26, h1 30 (non-HIDPI only; slot 30 is a clean
+ *              2x pixel-double of Greybeard's native 15 px TTF, since
+ *              Greybeard has no native 30 px size)
+ *   body 20 -> h3 22, h2 26, h1 30 (HIDPI only; slot 30 is Hack-only)
+ *   body 22 -> h3 26, h2 30, h1 34 (non-HIDPI only; slot 34 is a clean
+ *              2x pixel-double of Greybeard's native 17 px TTF)
+ */
+static const lv_font_t *h1_font(void)
+{
+#ifdef CONFIG_DRAFTLING_DISPLAY_HIDPI
+    if (s_font_size == 20) return FONT_30;
+    if (s_font_size == 9)  return FONT_16;
+#else
+    if (s_font_size == 22) return FONT_34;
+    if (s_font_size == 18) return FONT_30;
+#endif
+    if (s_font_size == 16) return FONT_26;
+    if (s_font_size == 14) return FONT_22;
+    return FONT_18;
+}
+
+static const lv_font_t *h2_font(void)
+{
+#ifdef CONFIG_DRAFTLING_DISPLAY_HIDPI
+    if (s_font_size == 20) return FONT_26;
+    if (s_font_size == 9)  return FONT_14;
+#else
+    if (s_font_size == 22) return FONT_30;
+    if (s_font_size == 18) return FONT_26;
+#endif
+    if (s_font_size == 16) return FONT_22;
+    if (s_font_size == 14) return FONT_18;
+    return FONT_16;
+}
+
+static const lv_font_t *h3_font(void)
+{
+#ifdef CONFIG_DRAFTLING_DISPLAY_HIDPI
+    if (s_font_size == 20) return FONT_22;
+    if (s_font_size == 9)  return FONT_11;
+#else
+    if (s_font_size == 22) return FONT_26;
+    if (s_font_size == 18) return FONT_22;
+#endif
+    if (s_font_size == 16) return FONT_18;
+    if (s_font_size == 14) return FONT_16;
+    return FONT_14;
+}
+
+/* ---- Modal overlay geometry ----
+ * The small editor overlays (save prompt, exit prompt, search box)
+ * lay a header line at y=0 and content rows below it. All use
+ * FONT_11 for the header, so the header occupies one FONT_11 line height. Deriving
+ * these offsets from the font (instead of a hard-coded 20 px that was
+ * tuned for the 11 px Greybeard header) keeps the panels tall enough
+ * that their border never clips the content on high-density boards,
+ * where FONT_11 is the much taller Hack 19 px glyph. */
+#define OVERLAY_PAD 6   /* lv_obj_set_style_pad_all() on each overlay */
+
+/* Y offset (inside the padded content area) of the first content row
+ * that sits below the overlay's FONT_11 header line. */
+static int overlay_row_y(void)
+{
+    return lv_font_get_line_height(FONT_11) + 4;
+}
+
+/* Pitch between successive FONT_11 content rows in an overlay. */
+static int overlay_row_pitch(void)
+{
+    return lv_font_get_line_height(FONT_11) + 2;
+}
+
+/* Search overlay row offsets (Find row, Replace row) inside the panel. */
+static int search_find_row_y(void) { return overlay_row_y(); }
+static int search_repl_row_y(void) { return overlay_row_y() + overlay_row_pitch(); }
+
+/* X offset of the search field value labels: just past the "F:" / "R:"
+ * two-character FONT_11 prefix, so the value never overlaps the prefix
+ * even with the wider Hack glyphs on high-density boards. */
+static int search_field_x(void)
+{
+    return 2 * char_width_for_font(FONT_11) + 4;
+}
+
+/* ---- Color theme ----
+ *
+ * The editor renders only two colors: a foreground (text, cursor,
+ * borders, separator lines) and a background (screens, dialog panels).
+ * Inverted highlights (selection rectangles, active list rows) draw
+ * the foreground color as their background and vice-versa.
+ *
+ * On monochrome boards (RLCD, e-paper) the palette is fixed:
+ * black-on-white by default, optionally inverted via
+ * CONFIG_DRAFTLING_EPD_BLACK_BACKGROUND on the e-paper boards.
+ *
+ * On color LCDs (CONFIG_DRAFTLING_DISPLAY_COLOR) the user can pick
+ * one of several preset themes from F1 -> Settings. The selection
+ * is persisted in NVS.
+ */
+#if defined(CONFIG_DRAFTLING_DISPLAY_COLOR)
+
+typedef struct {
+    const char *name;       /* shown in Settings menu */
+    uint32_t    fg_rgb;     /* 0xRRGGBB */
+    uint32_t    bg_rgb;
+} color_theme_t;
+
+#if defined(CONFIG_DRAFTLING_DISPLAY_TRANSFLECTIVE)
+/* Transflective panels (CONFIG_DRAFTLING_DISPLAY_TRANSFLECTIVE)
+ * reproduce colors differently from transmissive LCDs, so they get
+ * their own set of color themes. */
+static const color_theme_t COLOR_THEMES[] = {
+    { "Green on black",       0x00FF00, 0x000000 },
+    { "Yellow on black",      0xFFFF00, 0x000000 },
+    { "Cyan on black",        0x00FFFF, 0x000000 },
+    { "White on black",       0xFFFFFF, 0x000000 },
+    { "Black on white",       0x000000, 0xFFFFFF },
+};
+#else
+static const color_theme_t COLOR_THEMES[] = {
+    /* Color themes that look nice to the eye on most LCD panels.  */
+    { "Light green on black", 0x00FF00, 0x000000 },
+    { "Dark green on black",  0x15631A, 0x000000 },
+    { "Orange on black",      0xCC6600, 0x000000 },
+    { "White on black",       0xFFFFFF, 0x000000 },
+    { "Black on beige",       0x000000, 0xF3EFEA },
+};
+#endif
+
+#define COLOR_THEME_COUNT \
+    ((int)(sizeof(COLOR_THEMES) / sizeof(COLOR_THEMES[0])))
+
+#define NVS_KEY_THEME "theme"
+static int s_theme_idx = 0;
+
+static void load_theme_from_nvs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_EDITOR, NVS_READONLY, &h) == ESP_OK) {
+        uint8_t v = 0;
+        if (nvs_get_u8(h, NVS_KEY_THEME, &v) == ESP_OK && v < COLOR_THEME_COUNT) {
+            s_theme_idx = v;
+        }
+        nvs_close(h);
+    }
+}
+
+static void save_theme_to_nvs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_EDITOR, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, NVS_KEY_THEME, (uint8_t)s_theme_idx);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+static inline lv_color_t theme_fg(void)
+{
+    return lv_color_hex(COLOR_THEMES[s_theme_idx].fg_rgb);
+}
+
+static inline lv_color_t theme_bg(void)
+{
+    return lv_color_hex(COLOR_THEMES[s_theme_idx].bg_rgb);
+}
+
+#else  /* monochrome */
+
+static inline lv_color_t theme_fg(void)
+{
+#if defined(CONFIG_DRAFTLING_EPD_BLACK_BACKGROUND)
+    return lv_color_white();
+#else
+    return lv_color_black();
+#endif
+}
+
+static inline lv_color_t theme_bg(void)
+{
+#if defined(CONFIG_DRAFTLING_EPD_BLACK_BACKGROUND)
+    return lv_color_black();
+#else
+    return lv_color_white();
+#endif
+}
+
+#endif  /* CONFIG_DRAFTLING_DISPLAY_COLOR */
+
+/* ---- Backlight setting ----
+ *
+ * Boards whose display backend exposes a controllable (dimmable)
+ * backlight (CONFIG_DRAFTLING_DISPLAY_HAS_BACKLIGHT, and not
+ * CONFIG_DRAFTLING_DISPLAY_BACKLIGHT_BINARY -- see below) let the user
+ * pick a brightness percentage from F1 -> Settings. The selection is
+ * persisted in NVS and applied at boot (and immediately on change)
+ * via display_set_backlight().
+ *
+ * The available steps are coarse on purpose: a single Enter on the
+ * Settings list cycles through them, so finer granularity would be
+ * tedious to dial in.
+ *
+ * Boards with CONFIG_DRAFTLING_DISPLAY_BACKLIGHT_BINARY (no PWM --
+ * the backlight enable line is a plain on/off switch) skip this
+ * entire feature: the Settings entry and the Ctrl+B shortcut are
+ * both compiled out (every occurrence of
+ * CONFIG_DRAFTLING_DISPLAY_HAS_BACKLIGHT in this file is guarded with
+ * `&& !defined(CONFIG_DRAFTLING_DISPLAY_BACKLIGHT_BINARY)`), rather
+ * than exposing a control that can only toggle the backlight fully
+ * on or off. The backlight itself is left at whatever the display
+ * backend's own default is (on) with no user override. */
+#if defined(CONFIG_DRAFTLING_DISPLAY_HAS_BACKLIGHT) && !defined(CONFIG_DRAFTLING_DISPLAY_BACKLIGHT_BINARY)
+/* The cycle steps. Boards whose lowest steps are unusably dim
+ * either (a) raise CONFIG_DRAFTLING_BACKLIGHT_MIN_PCT to exclude
+ * them at compile time, or (b) set CONFIG_DRAFTLING_BL_DUTY_FLOOR_PCT
+ * so the display backend remaps low percents into a higher PWM
+ * duty range (preferred -- keeps the full UI range). */
+static const int BACKLIGHT_OPTIONS[] = {
+#if CONFIG_DRAFTLING_BACKLIGHT_MIN_PCT <= 0
+    /* Only meaningful on reflective / e-paper panels that stay
+     * readable without any back/front-light; transmissive LCDs
+     * raise CONFIG_DRAFTLING_BACKLIGHT_MIN_PCT above 0 to drop
+     * this step. */
+    0,
+#endif
+#if (CONFIG_DRAFTLING_BACKLIGHT_MIN_PCT <= 5) && \
+    (defined(CONFIG_DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO) || \
+     defined(CONFIG_DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO_H752))
+    /* Extra-dim step for the LilyGO T5 E-Paper S3 Pro / Pro Lite
+     * front-light: 10 % is already usable in a dark room but some
+     * users want an even lower setting for night reading. The
+     * e-paper panel itself stays readable without the front-light,
+     * so 5 % is well above the "barely visible" threshold. */
+    5,
+#endif
+#if CONFIG_DRAFTLING_BACKLIGHT_MIN_PCT <= 10
+    10,
+#endif
+#if CONFIG_DRAFTLING_BACKLIGHT_MIN_PCT <= 25
+    25,
+#endif
+#if CONFIG_DRAFTLING_BACKLIGHT_MIN_PCT <= 50
+    50,
+#endif
+#if CONFIG_DRAFTLING_BACKLIGHT_MIN_PCT <= 75
+    75,
+#endif
+    100
+};
+#define BACKLIGHT_OPTION_COUNT \
+    ((int)(sizeof(BACKLIGHT_OPTIONS) / sizeof(BACKLIGHT_OPTIONS[0])))
+
+#define NVS_KEY_BACKLIGHT "backlight"
+/* Default to 50 % when available, else the lowest still-allowed
+ * step (set per board via CONFIG_DRAFTLING_BACKLIGHT_MIN_PCT). */
+#if CONFIG_DRAFTLING_BACKLIGHT_MIN_PCT <= 50
+static int s_backlight_pct = 50;
+#else
+static int s_backlight_pct = CONFIG_DRAFTLING_BACKLIGHT_MIN_PCT;
+#endif
+
+static void load_backlight_from_nvs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_EDITOR, NVS_READONLY, &h) == ESP_OK) {
+        uint8_t v = 0;
+        if (nvs_get_u8(h, NVS_KEY_BACKLIGHT, &v) == ESP_OK && v <= 100) {
+            s_backlight_pct = v;
+        }
+        nvs_close(h);
+    }
+    /* Clamp a stale NVS value (e.g. one persisted before the min was
+     * raised) to the lowest still-allowed option. */
+    if (s_backlight_pct < CONFIG_DRAFTLING_BACKLIGHT_MIN_PCT) {
+        s_backlight_pct = CONFIG_DRAFTLING_BACKLIGHT_MIN_PCT;
+    }
+}
+
+static void save_backlight_to_nvs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_EDITOR, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, NVS_KEY_BACKLIGHT, (uint8_t)s_backlight_pct);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+static int find_backlight_option(int pct)
+{
+    for (int i = 0; i < BACKLIGHT_OPTION_COUNT; i++) {
+        if (BACKLIGHT_OPTIONS[i] == pct) return i;
+    }
+    /* Unknown value: prefer 50 % if it is still in the cycle,
+     * otherwise the first option. */
+    for (int i = 0; i < BACKLIGHT_OPTION_COUNT; i++) {
+        if (BACKLIGHT_OPTIONS[i] == 50) return i;
+    }
+    return 0;
+}
+#endif  /* CONFIG_DRAFTLING_DISPLAY_HAS_BACKLIGHT */
+
+#if defined(CONFIG_DRAFTLING_DISPLAY_CAN_ROTATE)
+/* ---- Runtime 180-degree display flip ----
+ * Toggled from the F1 -> Settings menu and persisted in NVS. Applied
+ * on top of the build-time base rotation by the LVGL port (a 180 flip
+ * never changes the reported resolution, so no widget rebuild is
+ * needed). Useful on boards whose USB-C / SD-card edge can face either
+ * way depending on the enclosure (e.g. Sunton ESP32-8048S043C). */
+#define NVS_KEY_ROTATE180 "rot180"
+static bool s_rotate180 = false;
+
+static void load_rotate180_from_nvs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_EDITOR, NVS_READONLY, &h) == ESP_OK) {
+        uint8_t v = 0;
+        if (nvs_get_u8(h, NVS_KEY_ROTATE180, &v) == ESP_OK) {
+            s_rotate180 = (v != 0);
+        }
+        nvs_close(h);
+    }
+}
+
+static void save_rotate180_to_nvs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_EDITOR, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, NVS_KEY_ROTATE180, s_rotate180 ? 1 : 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+#endif  /* CONFIG_DRAFTLING_DISPLAY_CAN_ROTATE */
+
+#if defined(CONFIG_DRAFTLING_DISPLAY_CAN_INVERT)
+/* ---- Inverted screen ----
+ * Toggled from the F1 -> Settings menu and persisted in NVS. When
+ * enabled, active (drawn / ink) pixels show the background and
+ * inactive pixels show the text -- a full visual invert, applied by
+ * display_set_invert() at flush time without touching the framebuffer
+ * or the LVGL widget tree. Currently only offered on the Waveshare
+ * ESP32-S3-RLCD-4.2 (see display_rlcd.cpp). */
+#define NVS_KEY_INVERT "invert"
+static bool s_invert = false;
+
+static void load_invert_from_nvs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_EDITOR, NVS_READONLY, &h) == ESP_OK) {
+        uint8_t v = 0;
+        if (nvs_get_u8(h, NVS_KEY_INVERT, &v) == ESP_OK) {
+            s_invert = (v != 0);
+        }
+        nvs_close(h);
+    }
+}
+
+static void save_invert_to_nvs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_EDITOR, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, NVS_KEY_INVERT, s_invert ? 1 : 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+#endif  /* CONFIG_DRAFTLING_DISPLAY_CAN_INVERT */
+
+/* ---- Append-only editing ----
+ * Toggled from the F1 -> Settings menu and persisted in NVS. When
+ * active, existing text can no longer be deleted or edited: Backspace,
+ * Delete and Ctrl+X (cut) are no-ops, and any key that would insert
+ * text moves the cursor to the very end of the document first (if it
+ * is not already there) so the new text is always appended. Enter
+ * (newline) is exempt from the end-of-document jump so a blank line
+ * can still be inserted wherever the cursor happens to be. */
+#define NVS_KEY_APPEND_ONLY "appendonly"
+static bool s_append_only = false;
+
+static void load_append_only_from_nvs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_EDITOR, NVS_READONLY, &h) == ESP_OK) {
+        uint8_t v = 0;
+        if (nvs_get_u8(h, NVS_KEY_APPEND_ONLY, &v) == ESP_OK) {
+            s_append_only = (v != 0);
+        }
+        nvs_close(h);
+    }
+}
+
+static void save_append_only_to_nvs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_EDITOR, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, NVS_KEY_APPEND_ONLY, s_append_only ? 1 : 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+/* ---- Active language layouts ----
+ * Toggled from the F1 -> Settings menu and persisted in NVS. Selects
+ * which of the compiled-in keyboard layouts (see kb_layout.h) Ctrl+L /
+ * Win+Space rotate through -- a build with several layouts enabled in
+ * Kconfig does not force every user to page through all of them just
+ * to get back to the one or two they actually use. Defaults to US and
+ * UA (see kb_layout.cpp's default_active_mask()). The mask itself is
+ * owned by kb_layout.cpp; this is just the NVS load/save wrapper. */
+#define NVS_KEY_ACTIVE_LAYOUTS "actlayouts"
+
+static void load_active_layouts_from_nvs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_EDITOR, NVS_READONLY, &h) == ESP_OK) {
+        uint32_t v = 0;
+        if (nvs_get_u32(h, NVS_KEY_ACTIVE_LAYOUTS, &v) == ESP_OK) {
+            kb_layout_set_active_mask(v);
+        }
+        nvs_close(h);
+    }
+}
+
+static void save_active_layouts_to_nvs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_EDITOR, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u32(h, NVS_KEY_ACTIVE_LAYOUTS, kb_layout_get_active_mask());
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+/* ---- Screen margins ----
+ * Pixels of physical panel hidden under an opaque bezel/enclosure
+ * cover on each edge (main/app_config.h's DISPLAY_LOGICAL_WIDTH/
+ * HEIGHT and this file's SCR_W/SCR_H both subtract these). Zero by
+ * default on every board; adjustable here. The LVGL display
+ * resolution is fixed for the life of the session, so a change only
+ * takes effect on the next restart -- these four locals track the
+ * *pending* (NVS-persisted) value for display/cycling, distinct from
+ * display_margin_*()'s frozen, currently-active value (see
+ * display_margins.h). */
+static int s_margin_left = 0, s_margin_right = 0, s_margin_top = 0, s_margin_bottom = 0;
+
+/* Pending display orientation (Settings -> Display orientation). Like
+ * the margins, this is frozen for the session (see
+ * display_orientation.h); this local tracks the NVS-persisted value
+ * that will apply on the next restart. */
+static bool s_pending_portrait = false;
+
+/* Pending "Display upside down" flag (Settings -> Display upside
+ * down). Like the orientation above, this is frozen for the session
+ * (see display_flip.h); this local tracks the NVS-persisted value
+ * that will apply on the next restart. */
+static bool s_pending_upside_down = false;
+
+/* Set whenever a restart-only display setting -- a margin, the
+ * display orientation, or the upside-down flip -- is changed during
+ * the current Settings visit; drives the "restart now?" prompt shown
+ * on the way out (see
+ * request_close_settings() / s_restart_confirm_open below), since that
+ * is the earliest point a restart can be applied without yanking the
+ * user out of the middle of adjusting settings. */
+static bool s_restart_needed = false;
+
+/* Full-takeover confirmation shown by request_close_settings() when
+ * leaving the Settings screen with a pending restart-only change --
+ * same one-widget-list-reused pattern as the color-theme picker below.
+ * sel 0 = restart now, 1 = keep editing and apply later. */
+static bool s_restart_confirm_open     = false;
+static int  s_restart_confirm_sel      = 0;
+static int  s_restart_confirm_sel_prev = -1;
+
+static void load_margins_from_nvs(void)
+{
+    display_margins_get_pending(&s_margin_left, &s_margin_right,
+                                &s_margin_top, &s_margin_bottom);
+}
+
+/* Cycle steps for each margin: 0-40 px in 2 px increments. Covers the
+ * range seen on real enclosures (the Xteink X4 Pro needed 12/8) with
+ * enough headroom for a wider bezel, without an unwieldy number of
+ * Enter presses per step. */
+#define MARGIN_OPTION_COUNT 21
+static const int MARGIN_OPTIONS[MARGIN_OPTION_COUNT] = {
+    0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20,
+    22, 24, 26, 28, 30, 32, 34, 36, 38, 40
+};
+
+static int find_margin_option(int px)
+{
+    for (int i = 0; i < MARGIN_OPTION_COUNT; i++) {
+        if (MARGIN_OPTIONS[i] == px) return i;
+    }
+    return 0;
+}
+
+/* True when the cursor sits at the very end of the active document's
+ * text (the only place where insertion is allowed while append-only
+ * editing is active). */
+static bool cursor_at_doc_end(void)
+{
+    size_t len = 0;
+    editor_get_text(&len);
+    return editor_get_cursor() >= len;
+}
+
+/* Recalculate derived layout values from the current body font. */
+static void recalc_layout(void)
+{
+    const lv_font_t *bf = body_font();
+    s_line_h = lv_font_get_line_height(bf);
+    s_char_w = char_width_for_font(bf);
+}
+
+/* Return the index into FONT_SIZE_OPTIONS for the given pixel size.
+ * Falls back to index 0 (the smallest offered size) when the size is
+ * not recognized. */
+static int find_font_size_option(int sz)
+{
+    for (int i = 0; i < FONT_SIZE_COUNT; i++) {
+        if (FONT_SIZE_OPTIONS[i] == sz) return i;
+    }
+    return 0;
+}
+
+static void load_font_size_from_nvs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_EDITOR, NVS_READONLY, &h) == ESP_OK) {
+        uint8_t val = 0;
+        if (nvs_get_u8(h, NVS_KEY_FONTSZ, &val) == ESP_OK) {
+            /* Accept the persisted value only if it is one of the
+             * sizes actually offered on this board (the option list
+             * differs between standard and HIDPI builds). */
+            bool valid = false;
+            for (int i = 0; i < FONT_SIZE_COUNT; i++) {
+                if (FONT_SIZE_OPTIONS[i] == val) { valid = true; break; }
+            }
+            if (valid) s_font_size = val;
+        }
+        nvs_close(h);
+    }
+}
+
+static void save_font_size_to_nvs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_EDITOR, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, NVS_KEY_FONTSZ, (uint8_t)s_font_size);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+/* LVGL objects.
+ *
+ * The per-document editor widgets (content container, cursor bar,
+ * "draftling" placeholder, line-label / selection-rectangle pools and
+ * their render caches) live in the pane_t pool defined further below
+ * and are reached through file-scope aliasing macros (s_cont_edit,
+ * s_cursor, s_img_logo, s_line_labels, ...). Everything that is shared
+ * across panes (the screen, title / status bars, file browser) stays a
+ * real global here. */
+static lv_obj_t *s_scr       = NULL;
+static lv_obj_t *s_lbl_title = NULL;
+#define TITLE_W (SCR_W - 4)   /* title label width, set in build_screens() */
+static lv_obj_t *s_lbl_status= NULL;
+static lv_obj_t *s_scr_browser = NULL;
+static lv_obj_t *s_list_files  = NULL;
+static lv_obj_t *s_lbl_br_status = NULL;
+/* Divider line between the two editor panes (split mode only). */
+static lv_obj_t *s_pane_divider = NULL;
+
+/* One-shot LVGL timer that restores the status bar to its standard
+ * text 3 seconds after a transient message (e.g. "File too large")
+ * was posted via editor_ui_set_status(). NULL when no message is
+ * currently pending auto-clear. Runs inside lv_timer_handler() and
+ * therefore does not need explicit draftling_lvgl_port_lock(). */
+static lv_timer_t *s_status_clear_timer = NULL;
+
+/* BLE connection prompt screen */
+static lv_obj_t *s_scr_ble_prompt  = NULL;
+static lv_obj_t *s_ble_prompt_lbl  = NULL;
+
+/* Menu overlay objects */
+static lv_obj_t *s_scr_menu     = NULL;
+static lv_obj_t *s_menu_list    = NULL;
+static lv_obj_t *s_lbl_menu_hdr = NULL;
+static int       s_menu_sel     = 0;
+/* Previously highlighted menu item, so update_list_highlight() can
+ * clear just the old selection on Up/Down navigation instead of
+ * re-styling every item (which would invalidate the entire menu list
+ * and trigger a full e-paper refresh on the PaperS3 backend). */
+static int       s_menu_sel_prev = -1;
+static bool      s_menu_open    = false;
+
+/* F1 menu item indices. Fixed 0-8 for every board; "SD card via USB"
+ * (9) only exists on boards with CONFIG_DRAFTLING_HAS_USB_MSC, so
+ * "Format SD card" / "Hardware information" / "Help" / "Sleep now" /
+ * "Close menu" shift down by one on every other board.
+ * Use the MENU_IDX_* constants instead of bare integers everywhere
+ * downstream so the two layouts stay in lock-step (mirrors the
+ * SETTINGS_IDX_* convention used by the Settings submenu below). */
+#define MENU_IDX_SETTINGS        0
+#define MENU_IDX_BLE_STATUS      1
+#define MENU_IDX_BLE_SCAN        2
+#define MENU_IDX_WIFI_CONNECT    3
+#define MENU_IDX_WIFI_NEW        4
+#define MENU_IDX_WIFI_DISCONNECT 5
+#define MENU_IDX_GIT_SYNC        6
+#define MENU_IDX_DRAFTBOX        7
+#define MENU_IDX_KB_LAYOUT       8
+#if defined(CONFIG_DRAFTLING_HAS_USB_MSC)
+#define MENU_IDX_USB_MSC         9
+#define _MENU_NEXT_AFTER_USB_MSC 10
+#else
+#define _MENU_NEXT_AFTER_USB_MSC 9
+#endif
+#define MENU_IDX_FORMAT_SD    _MENU_NEXT_AFTER_USB_MSC
+#define MENU_IDX_HWINFO       (_MENU_NEXT_AFTER_USB_MSC + 1)
+#define MENU_IDX_HELP         (_MENU_NEXT_AFTER_USB_MSC + 2)
+#define MENU_IDX_SLEEP        (_MENU_NEXT_AFTER_USB_MSC + 3)
+#define MENU_IDX_CLOSE        (_MENU_NEXT_AFTER_USB_MSC + 4)
+
+/* Number of menu items */
+#define MENU_ITEM_COUNT (_MENU_NEXT_AFTER_USB_MSC + 5)
+
+/* Header line of the F1 menu screen (s_lbl_menu_hdr); the "Format SD
+ * card" picker replaces it with its question while it is open. */
+#define MENU_HDR_TEXT "Menu - Up/Down, Enter to select, Esc to close"
+
+/* "Format SD card" picker: three steps rendered into s_menu_list (like
+ * the "SD card via USB" picker), with the question in the menu header.
+ * FMT_STEP_WIFI is skipped when no WiFi network is configured. */
+typedef enum {
+    FMT_STEP_NONE = 0,   /* picker closed */
+    FMT_STEP_WIFI,       /* keep or erase the WiFi settings */
+    FMT_STEP_CONFIRM1,   /* first confirmation */
+    FMT_STEP_CONFIRM2,   /* second confirmation */
+} fmt_step_t;
+static fmt_step_t s_fmt_step     = FMT_STEP_NONE;
+static int        s_fmt_sel      = 0;
+static int        s_fmt_sel_prev = -1;
+static bool       s_fmt_keep_wifi = false;
+/* Credentials read before formatting, written back to wifi.cfg after
+ * it when s_fmt_keep_wifi is set. Wiped when the picker closes. */
+static char       s_fmt_ssid[33];
+static char       s_fmt_pass[65];
+
+#if defined(CONFIG_DRAFTLING_HAS_USB_MSC)
+/* "SD card via USB" picker + deferred-apply state. Selecting the item
+ * opens a 3-row picker (Off / Read-only / Read-write, mirroring the
+ * color-theme picker's s_settings_list reuse, but built into
+ * s_menu_list instead since this item lives on the top-level F1 menu
+ * rather than in Settings). Picking a row stages it in
+ * s_usbmsc_pending_mode; the actual usb_msc_set_mode() call happens
+ * once the user leaves the picker itself, Enter or Esc (see
+ * close_usbmsc_picker()), not the whole F1 menu. */
+static bool          s_usbmsc_picker_open = false;
+static int           s_usbmsc_picker_sel  = 0;
+static int           s_usbmsc_picker_sel_prev = -1;
+static usb_msc_mode_t s_usbmsc_pending_mode = USB_MSC_MODE_OFF;
+
+static const char *usb_msc_mode_name(usb_msc_mode_t mode)
+{
+    switch (mode) {
+    case USB_MSC_MODE_READ_ONLY:  return "Read-only";
+    case USB_MSC_MODE_READ_WRITE: return "Read-write";
+    default:                      return "Off";
+    }
+}
+
+/* The F1 menu item is disabled (shown as unavailable, Enter is a
+ * no-op) only while it is off AND no SD card is mounted -- there is
+ * nothing yet for usb_msc to expose, and usb_msc_set_mode() would
+ * just fail with ESP_ERR_INVALID_STATE. Once a session is already
+ * running it stays selectable regardless of card state, so a card
+ * pulled out mid-session can still be switched back off. */
+static bool usbmsc_item_disabled(void)
+{
+    return usb_msc_get_mode() == USB_MSC_MODE_OFF && !sd_card_is_ready();
+}
+#endif
+
+#if !defined(CONFIG_DRAFTLING_DISPLAY_EPD)
+static lv_timer_t *s_blink_timer = NULL;
+#endif
+static bool s_cursor_visible = true;
+/* True when editor_ui_refresh() positioned the cursor inside the
+ * visible editor area on the last render. Per-pane (stored in pane_t)
+ * and reached through the s_cursor_on_screen alias. This is independent
+ * of LV_OBJ_FLAG_HIDDEN, which on LCD backends is also toggled by the
+ * blink timer (cursor_blink_cb) and would otherwise make visual
+ * Up/Down think the cursor is off-screen mid-blink and fall back
+ * to logical-line jumps. */
+static int  s_browser_sel    = 0;
+/* See s_menu_sel_prev. */
+static int  s_browser_sel_prev = -1;
+static int  s_browser_count  = 0;
+static sd_card_file_entry_t s_browser_entries[64];
+
+/* Settings screen objects */
+static lv_obj_t *s_scr_settings  = NULL;
+static lv_obj_t *s_settings_list = NULL;
+static int       s_settings_sel  = 0;
+/* See s_menu_sel_prev above. */
+static int       s_settings_sel_prev = -1;
+static bool      s_settings_open = false;
+static bool      s_factory_reset_confirm = false; /* awaiting second Enter */
+
+#if defined(CONFIG_DRAFTLING_DISPLAY_COLOR)
+/* Theme picker overlay (shares s_scr_settings / s_settings_list,
+ * shown in place of the regular settings list while open). */
+static bool s_theme_picker_open      = false;
+static int  s_theme_picker_sel       = 0;
+static int  s_theme_picker_sel_prev  = -1;
+#endif
+
+/* Active-language-layouts picker overlay (shares s_scr_settings /
+ * s_settings_list, shown in place of the regular settings list while
+ * open). One checklist row per compiled-in layout plus a "Done" row;
+ * Enter toggles the highlighted layout in/out of the active set
+ * immediately (no separate confirm step, mirroring Append-only /
+ * Rotate / Invert). */
+static bool s_layouts_picker_open      = false;
+static int  s_layouts_picker_sel       = 0;
+static int  s_layouts_picker_sel_prev  = -1;
+
+/* Passkey overlay objects */
+static lv_obj_t *s_passkey_panel = NULL;
+static lv_obj_t *s_passkey_label = NULL;
+
+/* Save-prompt overlay objects */
+static lv_obj_t *s_save_panel    = NULL;
+static lv_obj_t *s_save_hdr_lbl  = NULL;
+static lv_obj_t *s_save_name_lbl = NULL;
+static lv_obj_t *s_save_cur      = NULL;   /* blinking cursor in name field */
+static bool      s_save_open     = false;
+static char      s_save_buf[128] = "";     /* editable filename (no directory) */
+static int       s_save_pos      = 0;      /* cursor position in s_save_buf (byte) */
+/* The same overlay renames the file browser's selected file (F2 or Alt+R):
+ * s_rename_src then holds the full path of the file being renamed and
+ * the panel is moved onto whichever screen is showing the browser. */
+static bool      s_save_is_rename = false;
+static char      s_rename_src[512] = "";
+
+/* ---- WiFi "New connection" scan/pick flow ----
+ * Selecting the F1 menu's "WiFi: New connection..." row
+ * (MENU_IDX_WIFI_NEW) triggers a background scan and then reuses s_menu_list to show the
+ * results, mirroring the "SD card via USB" mode picker's reuse of the
+ * same list widget. Picking an open network connects immediately;
+ * picking a secured one raises a small password-entry overlay (its
+ * own top-level modal, parented to s_scr_menu, structurally a copy of
+ * the save-as prompt's header/value-label/cursor trio) before
+ * connecting. A successful connect is written to /sdcard/wifi.cfg so
+ * it is picked up automatically by Ctrl+W / boot-time reconnect
+ * afterwards -- see wifi_manager_save_to_file(). */
+static bool      s_wifi_scan_picker_open     = false;
+static bool      s_wifi_scan_in_progress     = false;
+static int       s_wifi_scan_picker_sel      = 0;
+static int       s_wifi_scan_picker_sel_prev = -1;
+static wifi_scan_result_t s_wifi_scan_results[WIFI_SCAN_MAX_RESULTS];
+static int       s_wifi_scan_count           = 0;
+/* The picker always appends a trailing "Rescan" row after the SSID
+ * list (or after the "No networks found" placeholder row when there
+ * are no results) -- see wifi_scan_rescan_row(). */
+
+static lv_obj_t *s_wifi_pw_panel    = NULL;
+static lv_obj_t *s_wifi_pw_hdr_lbl  = NULL;
+static lv_obj_t *s_wifi_pw_name_lbl = NULL;   /* shows the password as typed */
+static lv_obj_t *s_wifi_pw_cur      = NULL;
+static bool      s_wifi_pw_open     = false;
+static char      s_wifi_pw_ssid[33] = "";     /* SSID this password is for */
+static char      s_wifi_pw_buf[65]  = "";     /* matches wifi_config_t.sta.password size */
+static int       s_wifi_pw_pos      = 0;      /* byte cursor into s_wifi_pw_buf */
+
+/* ---- "Connect a Draftbox repository" prompt ----
+ * F1 menu row MENU_IDX_DRAFTBOX. A two-step single-line prompt on the
+ * menu screen, laid out like the WiFi password overlay. If WiFi is not
+ * connected yet, the panel first connects it (DBX_STEP_WIFI, like
+ * Ctrl+W) and moves on once wifi_state_cb() reports the result. Then
+ * the Draftbox site name (pre-filled with draftbox.art, or whatever was
+ * typed last time), then the 8-digit one-time password. Enter on the
+ * password runs git_sync_draftbox_connect() on a background task,
+ * which exchanges the password for an access token and writes the
+ * clone URL and token into git.cfg; the result goes to the status bar. */
+#define DBX_STEP_SITE 0
+#define DBX_STEP_OTP  1
+#define DBX_STEP_WIFI 2   /* waiting for the WiFi connection */
+static lv_obj_t *s_dbx_panel    = NULL;
+static lv_obj_t *s_dbx_hdr_lbl  = NULL;
+static lv_obj_t *s_dbx_val_lbl  = NULL;
+static lv_obj_t *s_dbx_cur      = NULL;
+static bool      s_dbx_open     = false;
+static int       s_dbx_step     = DBX_STEP_SITE;
+static char      s_dbx_site[128] = "draftbox.art";
+static int       s_dbx_site_pos = 0;
+static char      s_dbx_otp[10]  = "";        /* 8 digits; see text_field_key() */
+static int       s_dbx_otp_pos  = 0;
+
+/* ---- Message pop-up ----
+ * A modal panel with a title, a word-wrapped message and a "close" hint,
+ * moved onto the active screen when shown (like the delete prompt).
+ * Used for results that are too important for the status bar, e.g. the
+ * Draftbox connection. While s_msg_busy is set (an operation is still
+ * running) the hint is hidden and every key is ignored; the operation
+ * replaces the text with its result and clears the flag. */
+static lv_obj_t *s_msg_panel     = NULL;
+static lv_obj_t *s_msg_title_lbl = NULL;
+static lv_obj_t *s_msg_text_lbl  = NULL;
+static lv_obj_t *s_msg_hint_lbl  = NULL;
+static bool      s_msg_open      = false;
+static bool      s_msg_busy      = false;
+
+/* ---- Search / Replace overlay ----
+ * A single panel handles both Ctrl+F (find) and Ctrl+H (find +
+ * replace). When `s_search_replace_mode` is true, the panel exposes
+ * a second "Replace" field; Tab toggles focus between the two
+ * fields, Enter performs Find Next, Ctrl+Enter performs Replace +
+ * Find Next, and Esc closes the dialog. */
+static lv_obj_t *s_search_panel    = NULL;
+static lv_obj_t *s_search_hdr_lbl  = NULL;
+static lv_obj_t *s_search_find_hdr = NULL;
+static lv_obj_t *s_search_find_lbl = NULL;
+static lv_obj_t *s_search_repl_hdr = NULL;
+static lv_obj_t *s_search_repl_lbl = NULL;
+static lv_obj_t *s_search_cur      = NULL;
+static lv_obj_t *s_search_help_lbl = NULL;
+static bool      s_search_open     = false;
+static bool      s_search_replace_mode = false;
+static int       s_search_field    = 0;    /* 0 = find, 1 = replace */
+static char      s_search_buf[128] = "";
+static int       s_search_pos      = 0;    /* byte cursor into s_search_buf */
+static char      s_replace_buf[128] = "";
+static int       s_replace_pos     = 0;    /* byte cursor into s_replace_buf */
+/* Range of the most recent match in the document; used by Replace
+ * to know what to substitute. -1 means "no match selected". */
+static int       s_search_match_start = -1;
+static int       s_search_match_end   = -1;
+
+/* ---- Exit / sleep prompt overlay ----
+ * Shown when the editor has unsaved changes and the user asks to leave
+ * it: Esc (-> file browser) or Ctrl+P / F1 "Sleep now" (-> deep sleep).
+ * Offers three choices: save, proceed without saving, or cancel and
+ * keep editing. Navigated with Up/Down + Enter; Esc cancels.
+ *
+ * The same LVGL objects serve both destinations; s_exit_purpose picks
+ * which one the Save / Discard rows lead to, and the row labels are set
+ * to match when the overlay is shown. */
+typedef enum {
+    EXIT_PURPOSE_BROWSER,   /* Esc: leave the editor for the file browser */
+    EXIT_PURPOSE_SLEEP,     /* Ctrl+P / "Sleep now": enter deep sleep */
+} exit_purpose_t;
+
+static lv_obj_t *s_exit_panel    = NULL;
+static lv_obj_t *s_exit_hdr_lbl  = NULL;
+static lv_obj_t *s_exit_opt_lbl[3] = { NULL, NULL, NULL };
+static bool      s_exit_open     = false;
+static int       s_exit_sel      = 0;      /* 0=Save 1=proceed-no-save 2=Cancel */
+static exit_purpose_t s_exit_purpose = EXIT_PURPOSE_BROWSER;
+
+#define EXIT_OPT_SAVE   0
+#define EXIT_OPT_DISCARD 1
+#define EXIT_OPT_CANCEL 2
+#define EXIT_OPT_COUNT  3
+
+static const char *const EXIT_OPT_LABELS[EXIT_OPT_COUNT] = {
+    "Save and exit",
+    "Exit without saving",
+    "Cancel (keep editing)",
+};
+
+static const char *const SLEEP_OPT_LABELS[EXIT_OPT_COUNT] = {
+    "Save and sleep",
+    "Sleep without saving",
+    "Cancel (keep editing)",
+};
+
+/* ---- New-document format picker ----
+ * Ctrl+N (and N in the file browser) asks which format the new
+ * untitled document is written in. The overlay is moved onto the
+ * active screen when shown: the editor screen for Ctrl+N in the editor
+ * and the split-mode in-pane selector, the browser screen otherwise. */
+typedef enum {
+    NEWDOC_BROWSER,   /* full-screen file browser: replace the document */
+    NEWDOC_INPANE,    /* split-mode in-pane selector: the focused pane */
+    NEWDOC_EDITOR,    /* Ctrl+N in the editor: the focused pane */
+} newdoc_target_t;
+
+#define NEWFMT_COUNT 3
+static lv_obj_t *s_newfmt_panel = NULL;
+static lv_obj_t *s_newfmt_opt_lbl[NEWFMT_COUNT] = { NULL, NULL, NULL };
+static bool      s_newfmt_open  = false;
+static int       s_newfmt_sel   = 0;
+static newdoc_target_t s_newfmt_target = NEWDOC_BROWSER;
+
+static const editor_doc_format_t NEWFMT_FORMATS[NEWFMT_COUNT] = {
+    EDITOR_DOC_MARKDOWN, EDITOR_DOC_FOUNTAIN, EDITOR_DOC_TEXT,
+};
+static const char *const NEWFMT_LABELS[NEWFMT_COUNT] = {
+    "Markdown (.md)",
+    "Fountain screenplay (.fountain)",
+    "Plain text (.txt)",
+};
+
+/* ---- Delete-file confirmation ----
+ * Del or Alt+D in the file browser. Only offered for a file whose
+ * current content is already on the Git server (git_sync_file_status()),
+ * so a deletion can always be undone from the repository history. The
+ * overlay is moved onto the active screen when shown, like the format
+ * picker above. */
+#define DELCONF_DELETE 0
+#define DELCONF_CANCEL 1
+#define DELCONF_COUNT  2
+static lv_obj_t *s_del_panel   = NULL;
+static lv_obj_t *s_del_hdr_lbl = NULL;
+static lv_obj_t *s_del_opt_lbl[DELCONF_COUNT] = { NULL, NULL };
+static bool      s_del_open    = false;
+static int       s_del_sel     = DELCONF_CANCEL;
+static char      s_del_path[512] = "";
+/* Row to select after the deletion (the neighbouring file). */
+static char      s_del_next_name[256] = "";
+
+/* ---- Help screen ----
+ * F10 (or F1 -> Help) shows a scrollable page with the shortcuts of the
+ * current mode -- the editor or the file browser -- and, in the editor,
+ * the formatting cheat sheet of the focused document's format (see
+ * editor_format_t::help). Up/Down/PgUp/PgDn/Home/End scroll; Esc or
+ * Enter return to where the help was opened from. F1 -> "Hardware
+ * information" shows its page (show_hwinfo()) on the same screen. */
+typedef enum {
+    HELP_FROM_EDITOR,
+    HELP_FROM_BROWSER,   /* full-screen file browser */
+    HELP_FROM_INPANE,    /* split-mode in-pane file selector */
+} help_origin_t;
+
+static lv_obj_t *s_scr_help      = NULL;
+static lv_obj_t *s_lbl_help_hdr  = NULL;
+static lv_obj_t *s_help_cont     = NULL;   /* scrollable body */
+static lv_obj_t *s_help_lbl      = NULL;
+static bool      s_help_open     = false;
+static help_origin_t s_help_origin = HELP_FROM_EDITOR;
+
+/* BOARD_NAME from the board header, handed over by main.cpp
+ * (editor_ui_set_board_name()) for the hardware information page. */
+static const char *s_board_name  = NULL;
+
+/* ---- Device battery display ----
+ *
+ * Boards that have a wired-up battery monitor (BATT_ADC_PIN >= 0)
+ * show a percentage in the status bar of both the editor and the
+ * file browser. Each board defines this in app_config.h:
+ *   - Waveshare RLCD-4.2:   GPIO4, 3:1 divider
+ *   - M5Stack PaperS3:      GPIO3, 2:1 divider (no enable) */
+#if defined(CONFIG_DRAFTLING_HAS_BATTERY)
+#define DRAFTLING_HAS_BATT_INDICATOR 1
+static lv_obj_t  *s_lbl_dev_batt    = NULL;  /* editor screen */
+static lv_obj_t  *s_lbl_br_dev_batt = NULL;  /* file browser screen */
+static lv_obj_t  *s_lbl_ble_dev_batt = NULL; /* BLE prompt screen */
+/* On the original H752 the FastEPD panel ghosts/flickers when the
+ * battery label is rewritten on a periodic timer, because every
+ * rewrite drives an e-paper refresh. On that board only, switch to a
+ * "pull" model: no timer; the label is refreshed at natural redraw
+ * points via sync_battery_labels(), and only when the value actually
+ * changed. Every other board keeps the periodic timer below (cheap on
+ * colour LCD; the epdiy e-paper boards are unaffected per testing). */
+#if defined(CONFIG_DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO_H752)
+#define DRAFTLING_BATT_PULL_MODE 1
+#else
+static lv_timer_t *s_batt_timer     = NULL;
+#define BATT_POLL_MS 5000  /* refresh battery every 5 s (so charging
+                              * state / plug-in events show up quickly
+                              * on backends that expose it, INA226 on
+                              * the M5Stack Tab5 in particular) */
+#endif
+#endif
+
+/* ---- WiFi connectivity icon ----
+ * Shown in the right corner of both status bars whenever the WiFi
+ * stack reports STATE_CONNECTED. The Greybeard fonts do not cover
+ * U+1F6DC, so we render the symbol from a small embedded LVGL
+ * image (see wifi_icon.c). */
+static lv_obj_t *s_img_wifi    = NULL;  /* editor screen */
+static lv_obj_t *s_img_br_wifi = NULL;  /* file browser screen */
+
+/* ---- Key-event input queue ----
+ * The BLE callback runs on the HID host task and must not block on the
+ * LVGL mutex.  Key events are enqueued here from the BLE context (ISR-
+ * safe) and drained by an LVGL timer running on the GUI task. */
+#define KEY_QUEUE_LEN       CONFIG_DRAFTLING_KEY_QUEUE_LEN
+#define KEY_DRAIN_PERIOD_MS CONFIG_DRAFTLING_KEY_DRAIN_PERIOD_MS
+static QueueHandle_t s_key_queue = NULL;
+static lv_timer_t   *s_key_drain_timer = NULL;
+
+/* Maximum number of auto-generated draft filenames (draft_001..draft_999) */
+#define MAX_DRAFT_SEQ 999
+
+/* ---- Key repeat ----
+ * When a key is held down the BLE HID report keeps sending the same
+ * keycodes, but some keyboards only send a single report.  We implement
+ * software key repeat: after an initial delay (KEY_REPEAT_DELAY_MS) we
+ * start re-injecting the last key-down event at KEY_REPEAT_RATE_MS
+ * intervals.  The repeat is cancelled on key-up. */
+#define KEY_REPEAT_DELAY_MS   500
+#define KEY_REPEAT_RATE_MS    50
+/* Safety net for a key-up that never arrives -- e.g. BLE boot-protocol
+ * report diffing (see process_key_array() in ble_keyboard.cpp) cannot
+ * always tell "still held" apart from "released and something else
+ * changed", so a lost key-up is a real, observed failure mode, not
+ * theoretical. Without this, a stuck-held key repeats forever: every
+ * KEY_REPEAT_RATE_MS re-injection on an e-paper board also triggers a
+ * display refresh, so a stuck key can permanently saturate the system
+ * and silently starve all later real keystrokes from ever being
+ * processed -- confirmed on real hardware as the editor's content
+ * freezing indefinitely (repeated identical redraws in the log, but
+ * the text the user kept typing afterward never appears at all). No
+ * human intentionally holds a key this long while typing. */
+#define KEY_REPEAT_MAX_MS     5000
+static kb_event_t s_repeat_ev    = {};      /* last key-down event */
+static bool       s_repeat_held  = false;   /* is a key currently held? */
+static uint32_t   s_repeat_start = 0;       /* tick when key was pressed */
+static bool       s_repeat_firing = false;  /* past initial delay? */
+static lv_timer_t *s_repeat_timer = NULL;
+
+/* Standby timeout options in seconds: 0=Off, 300=5min, 600=10min, etc. */
+static const uint32_t TIMEOUT_OPTIONS[] = { 0, 300, 600, 900, 1800, 3600 };
+static const char *TIMEOUT_LABELS[]     = { "Off", "5 min", "10 min",
+                                            "15 min", "30 min", "60 min" };
+#define TIMEOUT_OPTION_COUNT  6
+
+/* Line label pool. Sized to fill the editor body on the smaller
+ * panels in portrait orientation (Settings -> Display orientation),
+ * where the tall side becomes the editor height -- e.g. the Xteink X4
+ * Pro is ~19 body rows tall in landscape but ~33 in portrait. The
+ * largest panels (Tab5, 7" Sunton) still cap the visible-line count in
+ * portrait, the same way they already do in landscape. Each extra slot
+ * costs one lazily-created LVGL label per pane plus a small struct
+ * entry -- see pane_t. */
+#define MAX_LINE_LABELS 40
+
+/* A "line" here is one source paragraph (run between '\n's) which can
+ * be arbitrarily long, so the rendered text for a slot must NOT be
+ * capped to a fixed size. Earlier revisions used a 1024-byte buffer
+ * and silently dropped trailing UTF-8 codepoints once a single
+ * paragraph filled it -- e.g. a 569-Cyrillic-char paragraph fits in
+ * exactly 1023 bytes and the next typed character (any 2-byte glyph)
+ * was discarded by the codepoint trimmer. We now build the per-line
+ * display string into a growable std::string and cache it the same
+ * way, so the cap is bounded only by available heap. */
+/* ---- Editor panes ----
+ *
+ * The editor body can be shown as one pane (the historical default) or
+ * split into two side-by-side (left / right) panes, each bound to its
+ * own editor_doc_t. Every per-document widget and render-cache slot
+ * lives in a pane_t. The large body of rendering, cursor, selection and
+ * touch code below was written against file-scope globals (s_cont_edit,
+ * s_cursor, s_line_labels[], s_prev_line_*[], ...). Rather than thread
+ * a pane pointer through dozens of helpers, those names are #defined as
+ * aliases onto the fields of the "current" pane s_rp -- mirroring the
+ * editor_doc_t aliasing trick in editor.cpp. Code that operates on a
+ * specific pane binds it first with pane_bind().
+ *
+ * Each pane keeps its own MAX_LINE_LABELS-slot label pool and
+ * per-slot render cache. A split layout halves each pane's width
+ * but keeps the full editor height, and each pane wraps text to its
+ * own (narrower) width.
+ *
+ * The per-slot render cache lets editor_ui_refresh() skip LVGL
+ * mutations whenever a slot's visible text / style / position are
+ * unchanged, which keeps the e-paper dirty region small enough for a
+ * fast partial refresh instead of a full-screen flash. */
+/* ---- WYSIWYG line views ----
+ *
+ * Each rendered body line is shown with its Markdown markup applied
+ * rather than as raw text: heading, blockquote and code-fence markers,
+ * the "**" / "*" / "_" / "~~" / "`" around inline spans and the "---"
+ * of a horizontal rule are hidden, and the styled characters are drawn
+ * bold / slanted / struck through / boxed. The one exception is the
+ * line holding the focused pane's cursor, whose markers stay visible
+ * so they can be seen and edited ("live preview", as in Obsidian or
+ * Typora); its styling is still applied.
+ *
+ * The lv_label per line is kept (its letter-position and hit-test APIs
+ * drive the cursor, selection and touch code); the styling is painted
+ * on top of it from an LV_EVENT_DRAW_MAIN_END handler
+ * (line_deco_draw_cb()). There are no bold or italic font assets:
+ * bold is a second copy of each glyph one pixel to the right, and
+ * italic re-draws each glyph as horizontal bands shifted progressively
+ * further right towards the top -- both work for every font family,
+ * size and script without adding flash.
+ *
+ * Because markers can be hidden, the label text no longer maps 1:1 to
+ * the raw line. line_view_t::d2r records, for every display character,
+ * the raw byte offset it came from; view_raw_to_disp() /
+ * view_disp_to_raw() translate cursor, selection and touch positions
+ * through it. The DECO_* decoration flags live in editor_format.h,
+ * shared with the per-format hooks (md_editor.cpp, fountain_editor.cpp). */
+
+/* A run of identically-decorated characters on one visual row, in
+ * the label's content-area coordinates, laid out left to right (RTL
+ * text gets one segment per character). */
+typedef struct {
+    int32_t  x, y, w;
+    uint32_t char_idx;    /* display index of the first character */
+    uint32_t byte_off;    /* its byte offset in the label text */
+    uint32_t count;       /* characters in the run */
+    uint8_t  flags;       /* DECO_* */
+} deco_seg_t;
+
+typedef struct {
+    std::vector<uint32_t>   d2r;    /* display char -> raw byte offset */
+    std::vector<uint8_t>    flags;  /* DECO_* per display char */
+    std::vector<deco_seg_t> segs;   /* laid out by layout_line_decorations() */
+    size_t  raw_len;                /* raw line length in bytes */
+    uint8_t bullet_level;           /* list nesting, picks the bullet shape */
+    bool    hr;                     /* draw a horizontal rule */
+} line_view_t;
+
+#define EDITOR_MAX_PANES 2
+
+typedef struct {
+    lv_obj_t   *cont;      /* per-pane content container */
+    lv_obj_t   *cursor;    /* thin vertical cursor bar */
+    lv_obj_t   *logo;      /* "draftling" placeholder when the doc is empty */
+    lv_obj_t   *line_labels[MAX_LINE_LABELS];
+    std::string prev_line_text[MAX_LINE_LABELS];
+    int  prev_line_type[MAX_LINE_LABELS];    /* md_line_type_t, -1 if cache empty */
+    int  prev_line_y[MAX_LINE_LABELS];       /* y_pos last used, -1 if cache empty */
+    int  prev_line_h[MAX_LINE_LABELS];       /* rendered_h last computed */
+    bool prev_line_visible[MAX_LINE_LABELS]; /* slot was visible (not hidden) */
+    bool prev_line_was_selected[MAX_LINE_LABELS]; /* line intersected the selection */
+    line_view_t view[MAX_LINE_LABELS];       /* display <-> raw mapping + styling */
+    editor_doc_t *doc;     /* bound document (NULL until acquired) */
+    int  x;                /* content-area left (screen x) */
+    int  w;                /* content-area width */
+    int  y;                /* content-area top (screen y) */
+    int  h;                /* content-area height */
+    bool cursor_on_screen; /* last refresh placed the cursor in view */
+
+    /* Per-pane view state (cursor / scroll / selection). When the same
+     * file is open in both panes they share one editor_doc_t (one
+     * buffer, one set of cursor/scroll/selection fields). To keep each
+     * pane's view independent, pane_bind() stashes the outgoing pane's
+     * view here and restores the incoming pane's view into the shared
+     * document. has_saved_view is false until the pane first adopts its
+     * document's current view (so a freshly opened file keeps the cursor
+     * restored from its sidecar metadata). */
+    size_t saved_cursor;       /* saved cursor (logical byte offset) */
+    int    saved_scroll;       /* saved scroll line */
+    int    saved_sel_anchor;   /* saved selection anchor (< 0 = none) */
+    bool   has_saved_view;     /* view captured at least once */
+
+    /* Number of logical lines actually rendered on screen by the last
+     * refresh_active_pane() call, i.e. how many lines fit in the pane
+     * once word-wrap is accounted for. Long/wrapped lines can each
+     * consume several visual rows, so this can be well below
+     * VISIBLE_LINES (which assumes one visual row per logical line).
+     * Page Up/Down use it to size a "page" jump to what is actually on
+     * screen instead of overshooting past the end of a short,
+     * long-line document. */
+    int    visible_line_count;
+
+    /* Pixels of the first rendered line (the scroll line) hidden above
+     * the pane's top edge. Scrolling is otherwise by whole logical
+     * lines, which cannot follow the cursor through a single paragraph
+     * taller than the pane: once that paragraph is the top line there
+     * is no further line to scroll to. top_px only applies while the
+     * pane still shows the same document from the same scroll line it
+     * was set for (top_px_doc / top_px_line), so any line-granular
+     * scroll implicitly resets it to 0. See pane_top_px(). */
+    int           top_px;
+    int           top_px_line;
+    editor_doc_t *top_px_doc;
+} pane_t;
+
+static pane_t  s_panes[EDITOR_MAX_PANES];
+static pane_t *s_rp          = &s_panes[0];  /* current render / active pane */
+static int     s_pane_count  = 1;            /* 1 = single, 2 = split */
+static int     s_focus       = 0;            /* focused pane index (0..count-1) */
+
+/* See the SCROLL_JUMP_FRACTION comment above; defined here (rather
+ * than alongside it) because VISIBLE_LINES dereferences s_rp. */
+static inline int scroll_jump_step(void)
+{
+    int step = (int)(VISIBLE_LINES * SCROLL_JUMP_FRACTION);
+    return step > 0 ? step : 1;
+}
+
+/* Current pane's in-line pixel offset of the scroll line (see
+ * pane_t::top_px); 0 once the scroll line or document has changed. */
+static int pane_top_px(void)
+{
+    if (s_rp->top_px <= 0) return 0;
+    if (s_rp->top_px_doc != s_rp->doc ||
+        s_rp->top_px_line != editor_get_scroll_line()) return 0;
+    return s_rp->top_px;
+}
+
+/* Set while a touch drag pans a pane: refresh_active_pane() then leaves
+ * top_px where the drag put it instead of pulling the cursor row back
+ * into view. */
+static bool s_touch_panning = false;
+
+static void pane_set_top_px(int px)
+{
+    s_rp->top_px      = px > 0 ? px : 0;
+    s_rp->top_px_line = editor_get_scroll_line();
+    s_rp->top_px_doc  = s_rp->doc;
+}
+
+/* Split layout: single pane, or a two-pane split along the display's
+ * long axis with the first pane occupying 1/2, 2/3 or 1/3 of it.
+ * Driven by the Ctrl+1 / Ctrl+2 / Ctrl+3 shortcuts.
+ *
+ * "First" is the left pane in landscape and the top pane in portrait
+ * (Settings -> Display orientation) -- the split always divides the
+ * long side, so a portrait screen splits into top/bottom rather than
+ * left/right. The SPLIT_LEFT_* names are historical; read them as
+ * "first pane = 2/3" etc. */
+typedef enum {
+    SPLIT_NONE = 0,   /* single pane (full size) */
+    SPLIT_HALF,       /* two panes, first = 1/2 */
+    SPLIT_LEFT_2_3,   /* two panes, first = 2/3 */
+    SPLIT_LEFT_1_3,   /* two panes, first = 1/3 */
+} split_mode_t;
+static split_mode_t s_split_mode = SPLIT_NONE;
+
+/* True while the editor screen is the active top-level screen, false
+ * while the file browser is. This is the authoritative source for
+ * key-event routing and refresh gating. It must NOT be derived from
+ * editor_get_mode(): the editor "mode" is a per-document property
+ * (editor.cpp aliases it onto the active document), and the active
+ * document is re-bound to the focused pane on every cursor blink and
+ * refresh. Reading the per-document mode to decide which screen we are
+ * on therefore breaks in split mode -- the focused pane can carry an
+ * EDITING mode while the browser is on screen, leaving keystrokes
+ * routed to the (hidden) editor and the browser apparently frozen. */
+static bool s_editor_screen_active = false;
+
+/* Which pane a file-browser "open" / "new" action should load into.
+ * Set by editor_ui_show_file_browser(): in single-pane mode this is
+ * pane 0 (replace the current document); while split it is the
+ * focused pane, so each panel opens a file for itself. */
+static int     s_open_target_pane = 0;
+
+/* In-pane file selector (split mode only).
+ *
+ * In single-pane mode the file browser is the full-screen s_scr_browser
+ * (an lv_list named s_list_files). While the editor is split, opening a
+ * file should not blank both panes; instead a compact file selector is
+ * overlaid on just the focused pane so the other pane keeps showing its
+ * document. s_inpane_list / s_inpane_hdr are that overlay (siblings of
+ * the pane containers on s_scr, raised to the foreground while open).
+ *
+ * s_browser_list is the list the shared browser logic (refresh_file_list,
+ * browser_activate_item, handle_browser_key) currently operates on: it
+ * normally aliases s_list_files and is repointed at s_inpane_list while
+ * the in-pane selector is open. */
+static lv_obj_t *s_inpane_list = NULL;
+static lv_obj_t *s_inpane_hdr  = NULL;
+static lv_obj_t *s_browser_list = NULL;
+static bool      s_inpane_browser_open = false;
+
+/* Defined further down with the rest of the file-browser code. */
+static void show_inpane_browser(void);
+static void close_inpane_browser(void);
+static editor_doc_t *open_into_pane(int target, const char *path);
+
+/* Alias the historical per-document globals onto the current pane. */
+#define s_cont_edit              (s_rp->cont)
+#define s_cursor                 (s_rp->cursor)
+#define s_img_logo               (s_rp->logo)
+#define s_line_labels            (s_rp->line_labels)
+#define s_prev_line_text         (s_rp->prev_line_text)
+#define s_prev_line_type         (s_rp->prev_line_type)
+#define s_prev_line_y            (s_rp->prev_line_y)
+#define s_prev_line_h            (s_rp->prev_line_h)
+#define s_prev_line_visible      (s_rp->prev_line_visible)
+#define s_prev_line_was_selected (s_rp->prev_line_was_selected)
+#define s_cursor_on_screen       (s_rp->cursor_on_screen)
+#define s_visible_line_count     (s_rp->visible_line_count)
+
+/* Number of logical lines to advance for a "page" jump (PgUp/PgDn,
+ * Ctrl+Up/Down): the count of lines actually visible on screen right
+ * now (s_visible_line_count), not VISIBLE_LINES -- VISIBLE_LINES is a
+ * pixel-height / single-row-height estimate that assumes one visual
+ * row per logical line, so on a document made of long, word-wrapped
+ * lines it can be several times the number of lines that actually
+ * fit, sending Page Down straight past the end of a short document.
+ * Falls back to VISIBLE_LINES before the pane has ever rendered
+ * (visible_line_count still at its zero-initialized default). */
+static inline int page_line_count(void)
+{
+    int n = s_visible_line_count;
+    return n > 0 ? n : VISIBLE_LINES;
+}
+
+/* Capture the live document's view (cursor / scroll / selection) into a
+ * pane's saved view state. Used to record a pane's view from the active
+ * document so a sibling pane that shares the same buffer can restore its
+ * own independent view. */
+static void pane_capture_view(pane_t *p)
+{
+    p->saved_cursor     = editor_get_cursor();
+    p->saved_scroll     = editor_get_scroll_line();
+    p->saved_sel_anchor = editor_get_sel_anchor();
+    p->has_saved_view   = true;
+}
+
+/* Push a pane's saved view back into the (now active) shared document so
+ * the document's cursor / scroll / selection reflect this pane. */
+static void pane_restore_view(pane_t *p)
+{
+    editor_set_cursor(p->saved_cursor);
+    editor_set_scroll_line(p->saved_scroll);
+    editor_set_sel_anchor(p->saved_sel_anchor);
+}
+
+/* Bind pane idx as the current pane: point the aliasing macros at it
+ * and make its document the engine's active document.
+ *
+ * Two panes that open the same file share one editor_doc_t (and thus one
+ * cursor / scroll / selection). To keep each pane's view independent,
+ * binding swaps view state in and out of the shared document: the
+ * outgoing pane's live view is captured, then the incoming pane's saved
+ * view is restored. Re-binding the already-current pane is a no-op for
+ * view state (the document already holds this pane's live view). */
+static void pane_bind(int idx)
+{
+    if (idx < 0) idx = 0;
+    if (idx >= EDITOR_MAX_PANES) idx = EDITOR_MAX_PANES - 1;
+    pane_t *target = &s_panes[idx];
+
+    if (target == s_rp) {
+        /* Same pane: keep the active document current. Adopt the
+         * document's view the first time (e.g. just after a file was
+         * opened into this pane, which reset has_saved_view). */
+        if (s_rp->doc) {
+            editor_set_active(s_rp->doc);
+            if (!s_rp->has_saved_view) pane_capture_view(s_rp);
+        }
+        return;
+    }
+
+    /* Switching panes: stash the outgoing pane's live view (only valid
+     * while its document is the active one). */
+    if (s_rp && s_rp->doc && s_rp->doc == editor_get_active()) {
+        pane_capture_view(s_rp);
+    }
+
+    s_rp = target;
+    if (s_rp->doc) {
+        editor_set_active(s_rp->doc);
+        if (s_rp->has_saved_view) {
+            pane_restore_view(s_rp);
+        } else {
+            /* First bind: adopt the document's current view (cursor /
+             * scroll restored from its sidecar metadata on open). */
+            pane_capture_view(s_rp);
+        }
+    }
+}
+
+/* Bind the focused pane (the one that receives keyboard input). */
+static void pane_bind_focus(void) { pane_bind(s_focus); }
+
+static void invalidate_render_cache(void)
+{
+    for (int i = 0; i < MAX_LINE_LABELS; i++) {
+        s_prev_line_text[i].clear();
+        s_prev_line_type[i]         = -1;
+        s_prev_line_y[i]            = -1;
+        s_prev_line_h[i]            = 0;
+        s_prev_line_visible[i]      = false;
+        s_prev_line_was_selected[i] = false;
+    }
+}
+
+/* Wipe every pane's render cache (used on theme rebuild / font change
+ * where all panes' labels were recreated). */
+static void invalidate_all_render_caches(void)
+{
+    pane_t *save = s_rp;
+    for (int p = 0; p < EDITOR_MAX_PANES; p++) {
+        s_rp = &s_panes[p];
+        invalidate_render_cache();
+    }
+    s_rp = save;
+}
+
+#if defined(CONFIG_DRAFTLING_DISPLAY_EPD)
+/* Force a clean full-screen repaint on the e-paper backends.
+ *
+ * On EPD the panel framebuffer persists between flushes and LVGL only
+ * redraws widgets whose content actually changed -- fine for incremental
+ * edits, but wrong whenever the framebuffer is wiped or the widget layout
+ * shifts without lv_scr_load() running a full screen redraw. In split mode
+ * the editor and its in-pane file selector share one screen (s_scr), so
+ * lv_scr_load(s_scr) is a no-op and no implicit full redraw happens. Two
+ * symptoms result:
+ *   - opening a file into one pane leaves the *other* pane blank, because
+ *     display_clear() cleared its pixels but LVGL never redrew its
+ *     (unchanged) labels;
+ *   - collapsing a split leaves the old divider / right-pane content as
+ *     ghosting, because only the changed regions were partially refreshed.
+ * Clearing the framebuffer, wiping every pane's render cache and
+ * invalidating the whole screen forces LVGL to repaint every widget into
+ * the freshly-cleared framebuffer; display_clear() also promotes the next
+ * flush to a flashing full refresh, clearing any accumulated ghosting.
+ * Mirrors the font-change repaint in the F1 settings handler. */
+static void epd_full_screen_repaint(void)
+{
+    display_clear(0xFF);
+    invalidate_all_render_caches();
+    if (s_scr) lv_obj_invalidate(s_scr);
+}
+#endif
+
+/* First pane's share (numerator/3, or /2 for HALF) of the usable long
+ * axis for the current split mode. */
+static void split_first_fraction(int total, int *first)
+{
+    switch (s_split_mode) {
+    case SPLIT_LEFT_2_3: *first = (total * 2) / 3; break;
+    case SPLIT_LEFT_1_3: *first = total / 3;       break;
+    case SPLIT_HALF:
+    default:             *first = total / 2;       break;
+    }
+    if (*first < 1) *first = 1;
+    if (*first > total - 1) *first = total - 1;
+}
+
+/* Recompute each pane's content-area rectangle from the current split
+ * state. The editor body occupies [EDITOR_Y, EDITOR_Y + EDITOR_H). A
+ * single pane fills it entirely; a two-pane split divides the display's
+ * long axis with a 1 px divider between the panes:
+ *
+ *   - landscape: left / right panes (vary x + width, full height), so
+ *     each pane wraps text to its own narrower width;
+ *   - portrait (Settings -> Display orientation): top / bottom panes
+ *     (vary y + height, full width), so each pane shows fewer rows.
+ *
+ * The first pane's share of the long axis is set by s_split_mode. */
+static void recalc_pane_geometry(void)
+{
+    if (s_pane_count <= 1) {
+        s_panes[0].x = 0;
+        s_panes[0].w = SCR_W;
+        s_panes[0].y = EDITOR_Y;
+        s_panes[0].h = EDITOR_H;
+        s_panes[1].x = 0;
+        s_panes[1].w = 0;
+        s_panes[1].y = EDITOR_Y;
+        s_panes[1].h = EDITOR_H;
+        return;
+    }
+
+    if (display_orientation_is_portrait()) {
+        /* Top / bottom split: vary y + height, full width. */
+        int total = EDITOR_H - 1;     /* 1 px reserved for the divider */
+        int top_h;
+        split_first_fraction(total, &top_h);
+        int bot_h = total - top_h;
+        s_panes[0].x = 0;
+        s_panes[0].w = SCR_W;
+        s_panes[0].y = EDITOR_Y;
+        s_panes[0].h = top_h;
+        s_panes[1].x = 0;
+        s_panes[1].w = SCR_W;
+        s_panes[1].y = EDITOR_Y + top_h + 1;
+        s_panes[1].h = bot_h;
+        return;
+    }
+
+    /* Left / right split: vary x + width, full height. */
+    int total = SCR_W - 1;            /* 1 px reserved for the divider */
+    int left_w;
+    split_first_fraction(total, &left_w);
+    int right_w = total - left_w;
+    s_panes[0].x = 0;
+    s_panes[0].w = left_w;
+    s_panes[0].y = EDITOR_Y;
+    s_panes[0].h = EDITOR_H;
+    s_panes[1].x = left_w + 1;
+    s_panes[1].w = right_w;
+    s_panes[1].y = EDITOR_Y;
+    s_panes[1].h = EDITOR_H;
+}
+
+/* Apply the current split geometry to the (already created) pane
+ * containers and the divider line. Hides inactive panes / the divider
+ * in single-pane mode. */
+static void layout_panes(void)
+{
+    recalc_pane_geometry();
+    for (int p = 0; p < EDITOR_MAX_PANES; p++) {
+        if (!s_panes[p].cont) continue;
+        if (p < s_pane_count) {
+            lv_obj_set_pos(s_panes[p].cont, s_panes[p].x, s_panes[p].y);
+            lv_obj_set_size(s_panes[p].cont, s_panes[p].w, s_panes[p].h);
+            lv_obj_remove_flag(s_panes[p].cont, LV_OBJ_FLAG_HIDDEN);
+            if (s_panes[p].logo)
+                lv_obj_set_width(s_panes[p].logo, s_panes[p].w);
+        } else {
+            lv_obj_add_flag(s_panes[p].cont, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (s_pane_divider) {
+        if (s_pane_count > 1) {
+            if (display_orientation_is_portrait()) {
+                /* Horizontal rule between the top and bottom panes. */
+                lv_obj_set_pos(s_pane_divider, 0, s_panes[0].y + s_panes[0].h);
+                lv_obj_set_size(s_pane_divider, SCR_W, 1);
+            } else {
+                /* Vertical rule between the left and right panes. */
+                lv_obj_set_pos(s_pane_divider, s_panes[0].x + s_panes[0].w, EDITOR_Y);
+                lv_obj_set_size(s_pane_divider, 1, EDITOR_H);
+            }
+            lv_obj_remove_flag(s_pane_divider, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(s_pane_divider, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+/* Styles */
+static lv_style_t s_style_body;
+static lv_style_t s_style_h1;
+static lv_style_t s_style_h2;
+static lv_style_t s_style_h3;
+static lv_style_t s_style_code;
+static lv_style_t s_style_quote;
+
+static void init_styles(void)
+{
+    /* base_dir AUTO: LVGL's style default is LTR, which makes
+     * LV_TEXT_ALIGN_AUTO always resolve to LEFT and breaks both the
+     * paragraph alignment and lv_label_get_letter_pos() cursor
+     * geometry for RTL text. AUTO detects the paragraph direction
+     * from the first strong character, so a line starting with
+     * Hebrew right-aligns (and keeps right alignment when Latin is
+     * mixed in), while LTR-starting lines stay left-aligned. */
+    lv_style_init(&s_style_body);
+    lv_style_set_text_font(&s_style_body, body_font());
+    lv_style_set_text_color(&s_style_body, theme_fg());
+    lv_style_set_pad_all(&s_style_body, 0);
+    lv_style_set_base_dir(&s_style_body, LV_BASE_DIR_AUTO);
+
+    lv_style_init(&s_style_h1);
+    lv_style_set_text_font(&s_style_h1, h1_font());
+    lv_style_set_text_color(&s_style_h1, theme_fg());
+    lv_style_set_base_dir(&s_style_h1, LV_BASE_DIR_AUTO);
+
+    lv_style_init(&s_style_h2);
+    lv_style_set_text_font(&s_style_h2, h2_font());
+    lv_style_set_text_color(&s_style_h2, theme_fg());
+    lv_style_set_base_dir(&s_style_h2, LV_BASE_DIR_AUTO);
+
+    lv_style_init(&s_style_h3);
+    lv_style_set_text_font(&s_style_h3, h3_font());
+    lv_style_set_text_color(&s_style_h3, theme_fg());
+    lv_style_set_base_dir(&s_style_h3, LV_BASE_DIR_AUTO);
+
+    lv_style_init(&s_style_code);
+    lv_style_set_text_font(&s_style_code, body_font());
+    lv_style_set_text_color(&s_style_code, theme_fg());
+    lv_style_set_border_width(&s_style_code, 1);
+    lv_style_set_border_color(&s_style_code, theme_fg());
+    lv_style_set_pad_left(&s_style_code, 4);
+    lv_style_set_base_dir(&s_style_code, LV_BASE_DIR_AUTO);
+
+    lv_style_init(&s_style_quote);
+    lv_style_set_text_font(&s_style_quote, body_font());
+    lv_style_set_text_color(&s_style_quote, theme_fg());
+    lv_style_set_border_side(&s_style_quote, LV_BORDER_SIDE_LEFT);
+    lv_style_set_border_width(&s_style_quote, 2);
+    lv_style_set_border_color(&s_style_quote, theme_fg());
+    lv_style_set_pad_left(&s_style_quote, 8);
+    lv_style_set_base_dir(&s_style_quote, LV_BASE_DIR_AUTO);
+
+    recalc_layout();
+
+    /* Styles changed -> all cached label content is now stale. */
+    invalidate_render_cache();
+}
+
+#if !defined(CONFIG_DRAFTLING_DISPLAY_EPD)
+static void cursor_blink_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    /* The in-pane file selector covers the focused pane; suppress the
+     * caret blink (which rebinds to the focused pane) while it is up. */
+    if (s_inpane_browser_open) return;
+    /* Blink only the focused pane's caret, and only while the refresh
+     * code actually placed it on-screen (s_cursor_on_screen). */
+    pane_bind_focus();
+    s_cursor_visible = !s_cursor_visible;
+    if (s_cursor && s_cursor_on_screen) {
+        if (s_cursor_visible) lv_obj_remove_flag(s_cursor, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(s_cursor, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+#endif
+
+#if defined(CONFIG_DRAFTLING_HAS_BATTERY)
+/* Build a battery level string for the status bar. */
+static void format_batt_str(char *buf, size_t len)
+{
+    int pct = battery_read_percent();
+    if (pct < 0) {
+        snprintf(buf, len, "----");
+        return;
+    }
+    /* Prepend a "+" charge indicator when the battery is actively
+     * being charged from an external supply (USB-C / DC jack). The
+     * ASCII '+' is used in place of a U+26A1 lightning bolt because
+     * the bundled Greybeard fonts do not cover that codepoint (see
+     * update_wifi_icons() for the same reasoning). Backends that
+     * cannot detect charge state return -1 and the glyph stays off. */
+    int chg = battery_read_charging();
+    if (chg == 1) {
+        snprintf(buf, len, "+%d%%", pct);
+    } else {
+        snprintf(buf, len, "%d%%", pct);
+    }
+}
+
+#if defined(DRAFTLING_BATT_PULL_MODE)
+/* H752 pull model: cache the formatted string, and only rewrite the
+ * labels when it actually changed (so a redraw point that hasn't seen
+ * a battery change costs no e-paper update). */
+static char s_cached_batt[20] = "";
+static bool s_batt_pending = false;
+
+static void update_battery_cache(void)
+{
+    char batt[20];
+    format_batt_str(batt, sizeof(batt));
+    if (strcmp(s_cached_batt, batt) != 0) {
+        strncpy(s_cached_batt, batt, sizeof(s_cached_batt) - 1);
+        s_cached_batt[sizeof(s_cached_batt) - 1] = '\0';
+        s_batt_pending = true;
+    }
+}
+
+static void sync_battery_labels(void)
+{
+    update_battery_cache();
+    if (!s_batt_pending) return;
+    s_batt_pending = false;
+    if (s_lbl_dev_batt)    lv_label_set_text(s_lbl_dev_batt, s_cached_batt);
+    if (s_lbl_br_dev_batt) lv_label_set_text(s_lbl_br_dev_batt, s_cached_batt);
+    if (s_lbl_ble_dev_batt) lv_label_set_text(s_lbl_ble_dev_batt, s_cached_batt);
+}
+
+/* Paint the current value on every battery label, including ones
+ * created (empty) since the last update -- see build_screens(). */
+static void battery_labels_repaint(void)
+{
+    s_cached_batt[0] = '\0';
+    sync_battery_labels();
+}
+#else
+/* The string the battery labels currently show. */
+static char s_shown_batt[20] = "";
+
+static void batt_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    char batt[20];
+    format_batt_str(batt, sizeof(batt));
+    /* lv_label_set_text() dirties a label even when the new text is
+     * identical to the current one (see update_title_bar()'s
+     * s_prev_title comment above) -- on e-paper backends that means
+     * this 5 s poll would otherwise trigger a screen refresh every
+     * cycle regardless of whether the percentage actually changed.
+     * On the Xteink X4 Pro's UC8179 controller a "fast" partial
+     * refresh re-triggers a whole-panel activation (no windowed
+     * partial on that silicon), so an unnoticed no-op battery-label
+     * redraw every 5 s was quietly re-activating the entire panel in
+     * the background -- visible as the screen continuing to change
+     * for tens of seconds after the user stopped interacting with it.
+     * Skip the call entirely when the string has not changed. */
+    if (strcmp(s_shown_batt, batt) != 0) {
+        if (s_lbl_dev_batt)    lv_label_set_text(s_lbl_dev_batt, batt);
+        if (s_lbl_br_dev_batt) lv_label_set_text(s_lbl_br_dev_batt, batt);
+        if (s_lbl_ble_dev_batt) lv_label_set_text(s_lbl_ble_dev_batt, batt);
+        strncpy(s_shown_batt, batt, sizeof(s_shown_batt) - 1);
+        s_shown_batt[sizeof(s_shown_batt) - 1] = '\0';
+    }
+}
+
+/* Paint the current value on every battery label, including ones
+ * created (empty) since the last update. Without this, a label built
+ * after the last change -- the BLE-prompt screen's, which build_screens()
+ * creates after the poll timer's first reading, or all of them after a
+ * color-theme rebuild -- would stay blank until the percentage moved. */
+static void battery_labels_repaint(void)
+{
+    s_shown_batt[0] = '\0';
+    batt_timer_cb(NULL);
+}
+/* No-op on the timer-driven boards: the call sites below are shared,
+ * but only the H752 pull model needs an explicit sync. */
+static inline void sync_battery_labels(void) {}
+#endif
+#else  /* !CONFIG_DRAFTLING_HAS_BATTERY */
+/* No battery indicator on this board: the shared sync_battery_labels()
+ * call sites compile to nothing. */
+static inline void sync_battery_labels(void) {}
+static inline void battery_labels_repaint(void) {}
+#endif
+
+/* Update the WiFi connectivity icons in both status bars: shown when
+ * the WiFi stack is connected, hidden otherwise. Once connected, the
+ * icon itself switches to the "6" dual-stack badge (wifi6_icon_*)
+ * whenever the STA interface also holds a global IPv6 address (see
+ * wifi_manager_has_global_ipv6()); the two variants differ in height,
+ * so the icon is re-centered vertically in the status bar every time
+ * it is (re)picked here rather than only once at creation. */
+static void update_wifi_icons(void)
+{
+    bool connected = wifi_manager_is_connected();
+    bool dual_stack = connected && wifi_manager_has_global_ipv6();
+    int icon_h = dual_stack ? WIFI6_ICON_H : WIFI_ICON_H;
+#if defined(CONFIG_DRAFTLING_EPD_BLACK_BACKGROUND) || \
+    defined(CONFIG_DRAFTLING_DISPLAY_COLOR)
+    const lv_image_dsc_t *icon = dual_stack ? &wifi6_icon_white : &wifi_icon_white;
+#else
+    const lv_image_dsc_t *icon = dual_stack ? &wifi6_icon_black : &wifi_icon_black;
+#endif
+    int icon_y = SCR_H - STATUS_H + (STATUS_H - icon_h) / 2;
+
+    if (s_img_wifi) {
+        lv_image_set_src(s_img_wifi, icon);
+        lv_obj_set_y(s_img_wifi, icon_y);
+        if (connected) lv_obj_remove_flag(s_img_wifi, LV_OBJ_FLAG_HIDDEN);
+        else           lv_obj_add_flag(s_img_wifi, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_img_br_wifi) {
+        lv_image_set_src(s_img_br_wifi, icon);
+        lv_obj_set_y(s_img_br_wifi, icon_y);
+        if (connected) lv_obj_remove_flag(s_img_br_wifi, LV_OBJ_FLAG_HIDDEN);
+        else           lv_obj_add_flag(s_img_br_wifi, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void update_title_bar(void)
+{
+    const char *path = editor_get_file_path();
+    const char *name;
+    switch (editor_get_format()) {
+    case EDITOR_DOC_FOUNTAIN: name = "Untitled screenplay"; break;
+    case EDITOR_DOC_TEXT:     name = "Untitled text";       break;
+    default:                  name = "Untitled";            break;
+    }
+    if (path) {
+        const char *slash = strrchr(path, '/');
+        name = slash ? slash + 1 : path;
+    }
+    char buf[384];
+    int line, col;
+    editor_get_cursor_pos(&line, &col);
+    int total_lines = editor_get_line_count();
+    /* Only worth telling the user which layout is active when there is
+     * more than one in the active set to rotate through (see the
+     * "Active language layouts" setting) -- with a single active
+     * layout Ctrl+L has nothing to switch to, so the tag would just be
+     * noise in the title bar. */
+    char layout_tag[16] = "";
+    if (kb_layout_active_count() > 1) {
+        snprintf(layout_tag, sizeof(layout_tag), "  [%s]",
+                 kb_layout_name(kb_layout_get()));
+    }
+#if defined(CONFIG_DRAFTLING_DISPLAY_EPD)
+    /* On e-paper boards the cursor moves on every keystroke, so the
+     * column counter is omitted to avoid dirtying the title bar on
+     * every edit. The line counter ("L %d/%d") only changes when the
+     * cursor moves to a different line, so the s_prev_title cache
+     * below collapses no-op redraws back to a single update. */
+    char tail[96];
+    snprintf(tail, sizeof(tail), "%s  L %d/%d%s",
+             editor_is_modified() ? " *" : "",
+             line + 1, total_lines, layout_tag);
+#else
+    char tail[96];
+    snprintf(tail, sizeof(tail), "%s  L %d/%d C:%d%s",
+             editor_is_modified() ? " *" : "",
+             line + 1, total_lines, col + 1, layout_tag);
+#endif
+
+    /* A long file name would push the counters off the line (the label
+     * used to wrap it over the header rule). The title font is
+     * monospace, so cut the name to the characters that fit next to
+     * the counters and end it with an ellipsis (U+2026, one cell; every
+     * base font carries the glyph). */
+    int avail = TITLE_W / char_width_for_font(FONT_11);
+    int name_max = avail - utf8_chars_in_bytes(tail, strlen(tail));
+    size_t name_len = strlen(name);
+    if (utf8_chars_in_bytes(name, name_len) > name_max) {
+        static const char ellipsis[] = "\xE2\x80\xA6";   /* U+2026 */
+        int keep = name_max - 1;
+        if (keep < 1) keep = 1;
+        size_t keep_bytes = utf8_byte_of_char(name, name_len, keep);
+        snprintf(buf, sizeof(buf), "%.*s%s%s", (int)keep_bytes, name, ellipsis, tail);
+    } else {
+        snprintf(buf, sizeof(buf), "%s%s", name, tail);
+    }
+
+    /* lv_label_set_text() in LVGL v9 unconditionally invalidates the
+     * label even when the new text is identical to the current one,
+     * which on e-paper backends dirties the entire title-bar strip
+     * on every keystroke.  Combined with the dirty region from the
+     * edited line that spans the top and bottom of the screen and
+     * triggers a full-screen refresh in the e-paper driver's ">75%"
+     * huge-area path.  Compare against the last text we pushed and
+     * skip the call when unchanged. */
+    static char s_prev_title[sizeof(buf)] = { 0 };
+    if (strcmp(s_prev_title, buf) != 0) {
+        lv_label_set_text(s_lbl_title, buf);
+        strncpy(s_prev_title, buf, sizeof(s_prev_title) - 1);
+        s_prev_title[sizeof(s_prev_title) - 1] = '\0';
+    }
+}
+
+static lv_style_t *style_for_type(md_line_type_t type)
+{
+    switch (type) {
+    case MD_LINE_H1:           return &s_style_h1;
+    case MD_LINE_H2:           return &s_style_h2;
+    case MD_LINE_H3:
+    case MD_LINE_H4:           return &s_style_h3;
+    case MD_LINE_CODE_FENCE:
+    case MD_LINE_CODE_CONTENT: return &s_style_code;
+    case MD_LINE_BLOCKQUOTE:   return &s_style_quote;
+    default:                   return &s_style_body;
+    }
+}
+
+/* Return the monospace cell width (in pixels) for a given font slot.
+ * The values are the advance widths stored in the generated font data
+ * divided by 16 (LVGL stores advances in 1/16-px units). Hack (used on
+ * high-density boards) and Greybeard have different per-slot widths. */
+static int char_width_for_font(const lv_font_t *font)
+{
+#ifdef CONFIG_DRAFTLING_DISPLAY_HIDPI
+    if (font == FONT_30) return 28;   /* hack_30 (47 px): adv_w 448 / 16 */
+    if (font == FONT_26) return 25;   /* hack_26 (41 px): adv_w 400 / 16 */
+    if (font == FONT_22) return 21;   /* hack_22 (34 px): adv_w 336 / 16 */
+    if (font == FONT_18) return 17;   /* hack_18 (28 px): adv_w 272 / 16 */
+    if (font == FONT_16) return 15;   /* hack_16 (25 px): adv_w 240 / 16 */
+    if (font == FONT_14) return 13;   /* hack_14 (21 px): adv_w 208 / 16 */
+    if (font == FONT_9)  return 10;   /* hack_9  (16 px): adv_w 160 / 16 */
+    return 11;                        /* hack_11 (19 px): adv_w 176 / 16 */
+#else
+    if (font == FONT_34) return 18;   /* adv_w 288 / 16 = 18 */
+    if (font == FONT_30) return 16;   /* adv_w 256 / 16 = 16 */
+    if (font == FONT_26) return 13;   /* adv_w 208 / 16 = 13 */
+    if (font == FONT_22) return 11;   /* adv_w 176 / 16 = 11 */
+    if (font == FONT_18) return 9;    /* adv_w 144 / 16 = 9 */
+    if (font == FONT_16) return 8;    /* adv_w 128 / 16 = 8 */
+    if (font == FONT_14) return 7;    /* adv_w 112 / 16 = 7 */
+    return 6;                         /* FONT_11: adv_w  96 / 16 = 6 */
+#endif
+}
+
+/* Count UTF-8 characters in the first byte_len bytes of text. */
+static int utf8_chars_in_bytes(const char *text, size_t byte_len)
+{
+    int count = 0;
+    for (size_t i = 0; i < byte_len; i++) {
+        if ((text[i] & 0xC0) != 0x80) count++;
+    }
+    return count;
+}
+
+
+/* Decode the UTF-8 codepoint at s[*i] (bounded by len) and advance *i
+ * past it. A malformed or truncated sequence decodes as its lead byte
+ * and advances by one, so callers always make progress. */
+static uint32_t utf8_decode(const char *s, size_t len, size_t *i)
+{
+    size_t p = *i;
+    unsigned char c = (unsigned char)s[p];
+    uint32_t cp;
+    size_t adv;
+    if (c < 0x80) {
+        cp = c; adv = 1;
+    } else if ((c & 0xE0) == 0xC0 && p + 1 < len) {
+        cp = ((uint32_t)(c & 0x1F) << 6) |
+             ((unsigned char)s[p + 1] & 0x3F);
+        adv = 2;
+    } else if ((c & 0xF0) == 0xE0 && p + 2 < len) {
+        cp = ((uint32_t)(c & 0x0F) << 12) |
+             (((unsigned char)s[p + 1] & 0x3F) << 6) |
+             ((unsigned char)s[p + 2] & 0x3F);
+        adv = 3;
+    } else if ((c & 0xF8) == 0xF0 && p + 3 < len) {
+        cp = ((uint32_t)(c & 0x07) << 18) |
+             (((unsigned char)s[p + 1] & 0x3F) << 12) |
+             (((unsigned char)s[p + 2] & 0x3F) << 6) |
+             ((unsigned char)s[p + 3] & 0x3F);
+        adv = 4;
+    } else {
+        cp = c; adv = 1;
+    }
+    *i = p + adv;
+    return cp;
+}
+
+/* Bidi class of a codepoint: +1 strong LTR (Latin, Greek, Cyrillic),
+ * -1 strong RTL (Hebrew, Arabic and their presentation forms), 0 for
+ * direction-neutral characters (spaces, digits, punctuation). */
+static int cp_strong_dir(uint32_t cp)
+{
+    /* Strong LTR */
+    if ((cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z')) return 1;
+    if (cp >= 0x00C0 && cp <= 0x024F) return 1;  /* Latin Extended */
+    if (cp >= 0x0370 && cp <= 0x03FF) return 1;  /* Greek */
+    if (cp >= 0x0400 && cp <= 0x04FF) return 1;  /* Cyrillic */
+    /* Strong RTL */
+    if (cp >= 0x0590 && cp <= 0x05FF) return -1; /* Hebrew */
+    if (cp >= 0x0600 && cp <= 0x06FF) return -1; /* Arabic */
+    if (cp >= 0x0700 && cp <= 0x074F) return -1; /* Syriac */
+    if (cp >= 0x0750 && cp <= 0x077F) return -1; /* Arabic Supplement */
+    if (cp >= 0xFB1D && cp <= 0xFEFF) return -1; /* Hebrew + Arabic
+                                                    Presentation Forms */
+    return 0;
+}
+
+/* Scan UTF-8 text for the first STRONG directional codepoint,
+ * mirroring LVGL's auto base-direction detection. Returns +1 for
+ * strong LTR, -1 for strong RTL, 0 if the text contains only
+ * direction-neutral characters (see cp_strong_dir()). */
+static int utf8_first_strong_dir(const char *s, size_t len)
+{
+    size_t i = 0;
+    while (i < len) {
+        int dir = cp_strong_dir(utf8_decode(s, len, &i));
+        if (dir != 0) return dir;
+    }
+    return 0;
+}
+
+/* ---- WYSIWYG line views (see the comment above line_view_t) ---- */
+
+/* Byte offset of the n-th UTF-8 codepoint of s, clamped to len. */
+static size_t utf8_byte_of_char(const char *s, size_t len, int n)
+{
+    size_t i = 0;
+    while (n-- > 0 && i < len) (void)utf8_decode(s, len, &i);
+    return i;
+}
+
+/* Build the display text for one raw line and its view (d2r mapping
+ * and per-character styling). reveal keeps every Markdown marker
+ * visible (the focused cursor line); otherwise the markers are hidden.
+ * The document's format (fmt) decides which markers are hidden and
+ * which line-wide styling applies; inline spans are applied here.
+ * Tabs are expanded to four spaces, since the bundled fonts have no
+ * tab glyph. An all-hidden line (e.g. a rule) displays as a single
+ * space so the label keeps one row of height. */
+static void build_line_view(const editor_format_t *fmt, const char *lt, size_t ll,
+                            const md_line_info_t *mi, bool reveal, long cursor,
+                            std::string &text, line_view_t *v)
+{
+    static std::vector<uint8_t> hide;
+    static std::vector<uint8_t> rflags;
+    hide.assign(ll, 0);
+    rflags.assign(ll, 0);
+
+    size_t content_off = (size_t)(mi->content - lt);
+    size_t content_end = content_off + mi->content_len;
+    if (content_off > ll) content_off = ll;
+    if (content_end > ll) content_end = ll;
+
+    fmt_marks_t marks = { hide.data(), rflags.data(), ll, content_off, content_end,
+                          reveal ? cursor : -1, false, 0 };
+    fmt->mark_line(mi, reveal, &marks);
+    v->hr = marks.hr;
+    v->bullet_level = marks.bullet_level;
+
+    for (int k = 0; k < mi->span_count; k++) {
+        const md_span_t *sp = &mi->spans[k];
+        size_t cs = content_off + sp->start;
+        size_t ce = content_off + sp->end;
+        size_t m  = sp->mark_len;
+        if (cs < m || ce + m > ll) continue;
+        uint8_t f = (sp->bold ? DECO_BOLD : 0) | (sp->italic ? DECO_ITALIC : 0) |
+                    (sp->code ? DECO_CODE : 0) | (sp->strikethrough ? DECO_STRIKE : 0) |
+                    (sp->underline ? DECO_UNDER : 0);
+        for (size_t b = cs; b < ce; b++) rflags[b] |= f;
+        if (!reveal) {
+            std::fill(hide.begin() + (cs - m), hide.begin() + cs, 1);
+            std::fill(hide.begin() + ce, hide.begin() + ce + m, 1);
+        }
+    }
+
+    text.clear();
+    v->d2r.clear();
+    v->flags.clear();
+    size_t b = 0;
+    while (b < ll) {
+        size_t start = b;
+        (void)utf8_decode(lt, ll, &b);
+        if (hide[start]) continue;
+        if (lt[start] == '\t') {
+            for (int t = 0; t < 4; t++) {
+                text.push_back(' ');
+                v->d2r.push_back((uint32_t)start);
+                v->flags.push_back(rflags[start]);
+            }
+            continue;
+        }
+        if (rflags[start] & (DECO_BULLET | DECO_BREAK)) text.push_back(' ');
+        else text.append(lt + start, b - start);
+        v->d2r.push_back((uint32_t)start);
+        v->flags.push_back(rflags[start]);
+    }
+    v->raw_len = ll;
+    if (text.empty()) text = " ";
+}
+
+/* Display character index at which raw byte offset rb of the line is
+ * shown. Offsets inside a hidden marker land on the next visible
+ * character. */
+static int view_raw_to_disp(const line_view_t *v, size_t rb)
+{
+    return (int)(std::lower_bound(v->d2r.begin(), v->d2r.end(), (uint32_t)rb) -
+                 v->d2r.begin());
+}
+
+/* Raw byte offset for display character index d (past the end -> end
+ * of the raw line, i.e. after any hidden closing marker). */
+static size_t view_disp_to_raw(const line_view_t *v, int d)
+{
+    if (d < 0) d = 0;
+    if ((size_t)d >= v->d2r.size()) return v->raw_len;
+    return v->d2r[(size_t)d];
+}
+
+static void push_deco_seg(line_view_t *v, const deco_seg_t &s)
+{
+    if (!v->segs.empty()) {
+        deco_seg_t &p = v->segs.back();
+        if (p.flags == s.flags && p.y == s.y &&
+            p.x + p.w == s.x && p.char_idx + p.count == s.char_idx) {
+            p.w += s.w;
+            p.count += s.count;
+            return;
+        }
+    }
+    v->segs.push_back(s);
+}
+
+/* Lay out the display characters [i0, i1) (first byte b0), which all
+ * share flags f, as row segments. For left-to-right text the run is
+ * checked against the label's own layout from its end points alone and
+ * only split (recursively) where it wraps, so a run costs a few
+ * lv_label_get_letter_pos() calls per visual row rather than one per
+ * character. Text containing RTL characters is laid out per character:
+ * LVGL reports an RTL character's position at its right edge. */
+static void layout_deco_range(lv_obj_t *label, const lv_font_t *font,
+                              const char *txt, size_t txt_len, bool line_rtl,
+                              bool has_rtl, line_view_t *v, uint32_t i0,
+                              uint32_t i1, uint32_t b0, uint8_t f)
+{
+    if (i0 >= i1) return;
+
+    if (has_rtl) {
+        size_t b = b0;
+        for (uint32_t i = i0; i < i1; i++) {
+            size_t cb = b;
+            uint32_t cp = utf8_decode(txt, txt_len, &b);
+            int dir = cp_strong_dir(cp);
+            bool rtl = dir < 0 || (dir == 0 && line_rtl);
+            int32_t gw = lv_font_get_glyph_width(font, cp, 0);
+            lv_point_t p;
+            lv_label_get_letter_pos(label, i, &p);
+            deco_seg_t s = { rtl ? p.x - gw : p.x, p.y, gw, i, (uint32_t)cb, 1, f };
+            push_deco_seg(v, s);
+        }
+        return;
+    }
+
+    lv_point_t p0;
+    lv_label_get_letter_pos(label, i0, &p0);
+    int32_t w = 0, last_w = 0;
+    size_t b = b0, mid_b = b0;
+    uint32_t mid = i0 + (i1 - i0) / 2;
+    for (uint32_t i = i0; i < i1; i++) {
+        if (i == mid) mid_b = b;
+        last_w = lv_font_get_glyph_width(font, utf8_decode(txt, txt_len, &b), 0);
+        w += last_w;
+    }
+    bool one_row = (i1 - i0 == 1);
+    if (!one_row) {
+        lv_point_t p1;
+        lv_label_get_letter_pos(label, i1 - 1, &p1);
+        one_row = (p1.y == p0.y && p1.x + last_w - p0.x == w);
+    }
+    if (one_row) {
+        deco_seg_t s = { p0.x, p0.y, w, i0, b0, i1 - i0, f };
+        push_deco_seg(v, s);
+        return;
+    }
+    layout_deco_range(label, font, txt, txt_len, line_rtl, false, v, i0, mid, b0, f);
+    layout_deco_range(label, font, txt, txt_len, line_rtl, false, v, mid, i1, (uint32_t)mid_b, f);
+}
+
+/* Compute v->segs for a label whose text / width were just set. */
+static void layout_line_decorations(lv_obj_t *label, const std::string &text,
+                                    line_view_t *v)
+{
+    v->segs.clear();
+    size_t n = v->flags.size();
+    bool any = false;
+    for (size_t i = 0; i < n && !any; i++) any = v->flags[i] != 0;
+    if (!any) return;
+
+    const lv_font_t *font = lv_obj_get_style_text_font(label, LV_PART_MAIN);
+    const char *txt = text.c_str();
+    size_t len = text.size();
+    bool has_rtl = false;
+    for (size_t b = 0; b < len && !has_rtl;) has_rtl = cp_strong_dir(utf8_decode(txt, len, &b)) < 0;
+    bool line_rtl = utf8_first_strong_dir(txt, len) < 0;
+
+    size_t b = 0;
+    uint32_t i = 0;
+    while (i < n && b < len) {
+        uint8_t f = v->flags[i];
+        uint32_t j = i;
+        size_t jb = b;
+        while (j < n && jb < len && v->flags[j] == f) {
+            (void)utf8_decode(txt, len, &jb);
+            j++;
+        }
+        if (f) {
+            layout_deco_range(label, font, txt, len, line_rtl, has_rtl, v,
+                              i, j, (uint32_t)b, f);
+        }
+        i = j;
+        b = jb;
+    }
+}
+
+static void deco_fill(lv_layer_t *layer, int32_t x1, int32_t y1, int32_t x2,
+                      int32_t y2, lv_color_t color)
+{
+    if (x2 < x1 || y2 < y1) return;
+    lv_draw_rect_dsc_t d;
+    lv_draw_rect_dsc_init(&d);
+    d.bg_color = color;
+    d.bg_opa   = LV_OPA_COVER;
+    lv_area_t a = { x1, y1, x2, y2 };
+    lv_draw_rect(layer, &d, &a);
+}
+
+/* Draw one glyph slanted: it is split into 4-row horizontal bands,
+ * each drawn shifted one more pixel right than the band below it,
+ * pivoting around the baseline (asc = rows above the baseline).
+ * Clipping each band goes through the layer's clip area, which LVGL
+ * documents as settable before adding draw tasks. */
+static void deco_draw_slanted(lv_layer_t *layer, lv_draw_label_dsc_t *dsc,
+                              uint32_t cp, int32_t x, int32_t top,
+                              int32_t lh, int32_t asc)
+{
+    const int32_t band = 4;
+    const lv_area_t orig = layer->_clip_area;
+    /* Centre the slant on the cell: shift everything left by half of
+     * the top band's shift. */
+    int32_t centre = (asc / band) / 2;
+    int32_t y0 = 0;
+    while (y0 < lh) {
+        /* Floor division so rows below the baseline shift left. */
+        int32_t d = asc - 1 - y0;
+        int32_t k = d >= 0 ? d / band : -((-d + band - 1) / band);
+        int32_t y1 = asc - 1 - k * band;
+        if (y1 > lh - 1) y1 = lh - 1;
+        lv_area_t clip = orig;
+        if (clip.y1 < top + y0) clip.y1 = top + y0;
+        if (clip.y2 > top + y1) clip.y2 = top + y1;
+        if (clip.y1 <= clip.y2) {
+            layer->_clip_area = clip;
+            lv_point_t pt = { x + k - centre, top };
+            lv_draw_character(layer, dsc, &pt, cp);
+        }
+        y0 = y1 + 1;
+    }
+    layer->_clip_area = orig;
+}
+
+/* Offset of a label's content area (where lv_label_get_letter_pos()
+ * coordinates start) from its outer top-left corner: padding plus
+ * border. Non-zero for the blockquote style (left bar + padding) and
+ * the code style (box + left padding); a cursor placed at the raw
+ * letter position would otherwise land inside the glyph. */
+static lv_point_t label_content_offset(lv_obj_t *label)
+{
+    lv_area_t oc, cc;
+    lv_obj_get_coords(label, &oc);
+    lv_obj_get_content_coords(label, &cc);
+    lv_point_t p = { cc.x1 - oc.x1, cc.y1 - oc.y1 };
+    return p;
+}
+
+/* Let the styling spill a few pixels past the label box: a faux-bold
+ * or slanted glyph in the last column, and the code-span box drawn
+ * just outside its cells. */
+static void line_deco_ext_size_cb(lv_event_t *e)
+{
+    lv_event_set_ext_draw_size(e, 3);
+}
+
+/* LV_EVENT_DRAW_MAIN_END handler of every editor line label: paints
+ * the view's rule, bullets and inline styling over the plain text the
+ * label has just drawn. Colors follow the label's own (a fully
+ * selected line is inverted) and its LV_PART_SELECTED style for
+ * characters inside a partial selection. */
+static void line_deco_draw_cb(lv_event_t *e)
+{
+    const line_view_t *v = (const line_view_t *)lv_event_get_user_data(e);
+    if (!v || (!v->hr && v->segs.empty())) return;
+    lv_obj_t *label = lv_event_get_target_obj(e);
+    lv_layer_t *layer = lv_event_get_layer(e);
+
+    lv_area_t ca;
+    lv_obj_get_content_coords(label, &ca);
+    const lv_font_t *font = lv_obj_get_style_text_font(label, LV_PART_MAIN);
+    int32_t lh  = lv_font_get_line_height(font);
+    int32_t asc = lh - font->base_line;
+    int32_t th  = lh >= 24 ? 2 : 1;         /* stroke thickness */
+    int32_t bdx = lh >= 40 ? 2 : 1;         /* faux-bold offset */
+
+    lv_color_t fg = lv_obj_get_style_text_color(label, LV_PART_MAIN);
+    lv_color_t bg = lv_obj_get_style_bg_opa(label, LV_PART_MAIN) >= LV_OPA_50
+                        ? lv_obj_get_style_bg_color(label, LV_PART_MAIN)
+                        : theme_bg();
+    lv_color_t sel_fg = lv_obj_get_style_text_color(label, LV_PART_SELECTED);
+    lv_color_t sel_bg = lv_obj_get_style_bg_color(label, LV_PART_SELECTED);
+    uint32_t ss = lv_label_get_text_selection_start(label);
+    uint32_t se = lv_label_get_text_selection_end(label);
+    bool has_sel = ss != LV_LABEL_TEXT_SELECTION_OFF &&
+                   se != LV_LABEL_TEXT_SELECTION_OFF && se > ss;
+
+    if (v->hr) {
+        int32_t y = ca.y1 + lh / 2 - th / 2;
+        deco_fill(layer, ca.x1, y, ca.x2, y + th - 1, fg);
+    }
+
+    const char *txt = lv_label_get_text(label);
+    size_t txt_len = strlen(txt);
+    lv_draw_label_dsc_t ld;
+    lv_draw_label_dsc_init(&ld);
+    ld.font = font;
+    ld.opa  = LV_OPA_COVER;
+
+    /* x-height centre (roughly), used by strikethrough and bullets. */
+    int32_t mid_y = asc - (asc * 3) / 10;
+
+    for (const deco_seg_t &s : v->segs) {
+        int32_t top = ca.y1 + s.y;
+        uint8_t f = s.flags;
+
+        /* Pass 1: per-character backgrounds / strokes; pass 2: glyphs.
+         * Italic cells are blanked in pass 1 so the slanted copies
+         * drawn in pass 2 are not overwritten by a neighbour's blank. */
+        for (int pass = 0; pass < 2; pass++) {
+            size_t b = s.byte_off;
+            int32_t cx = ca.x1 + s.x;
+            for (uint32_t k = 0; k < s.count && b < txt_len; k++) {
+                uint32_t cp = utf8_decode(txt, txt_len, &b);
+                int32_t gw = lv_font_get_glyph_width(font, cp, 0);
+                int32_t gx = cx;
+                cx += gw;
+                uint32_t ci = s.char_idx + k;
+                bool sel = has_sel && ci >= ss && ci < se;
+                lv_color_t cfg = sel ? sel_fg : fg;
+                lv_color_t cbg = sel ? sel_bg : bg;
+
+                if (pass == 0) {
+                    if (f & DECO_ITALIC) {
+                        deco_fill(layer, gx, top, gx + gw - 1, top + lh - 1, cbg);
+                    }
+                    continue;
+                }
+
+                if (f & DECO_BULLET) {
+                    int32_t d = gw / 2 + 1;
+                    if (d < 3) d = 3;
+                    int32_t x1 = gx + (gw - d) / 2;
+                    int32_t y1 = top + mid_y - d / 2;
+                    lv_draw_rect_dsc_t rd;
+                    lv_draw_rect_dsc_init(&rd);
+                    int shape = v->bullet_level % 3;
+                    rd.radius = shape == 2 ? 0 : LV_RADIUS_CIRCLE;
+                    if (shape == 1) {
+                        rd.bg_opa       = LV_OPA_TRANSP;
+                        rd.border_color = cfg;
+                        rd.border_width = th;
+                        rd.border_opa   = LV_OPA_COVER;
+                    } else {
+                        rd.bg_color = cfg;
+                        rd.bg_opa   = LV_OPA_COVER;
+                    }
+                    lv_area_t a = { x1, y1, x1 + d - 1, y1 + d - 1 };
+                    lv_draw_rect(layer, &rd, &a);
+                    continue;
+                }
+
+                if (f & DECO_BREAK) {
+                    /* A return arrow: a stem down the right of the cell
+                     * at x-height, a bar along the bottom and a solid
+                     * arrowhead at its left end. */
+                    int32_t a  = gw / 3 < 2 ? 2 : gw / 3;
+                    int32_t xl = gx + 1;
+                    int32_t xr = gx + gw - 1 - th;
+                    int32_t yb = top + asc - a;
+                    int32_t yt = top + asc - (asc * 6) / 10;
+                    if (yt > yb - a) yt = yb - a;
+                    deco_fill(layer, xl, yb, xr + th - 1, yb + th - 1, cfg);
+                    deco_fill(layer, xr, yt, xr + th - 1, yb + th - 1, cfg);
+                    for (int32_t i = 1; i <= a; i++)
+                        deco_fill(layer, xl + i, yb - i, xl + i, yb + th - 1 + i, cfg);
+                    continue;
+                }
+
+                ld.color = cfg;
+                if (f & DECO_ITALIC) {
+                    deco_draw_slanted(layer, &ld, cp, gx, top, lh, asc);
+                    if (f & DECO_BOLD) {
+                        deco_draw_slanted(layer, &ld, cp, gx + bdx, top, lh, asc);
+                    }
+                } else if (f & DECO_BOLD) {
+                    lv_point_t pt = { gx + bdx, top };
+                    lv_draw_character(layer, &ld, &pt, cp);
+                }
+                if (f & DECO_STRIKE) {
+                    int32_t y = top + mid_y - th / 2;
+                    deco_fill(layer, gx, y, gx + gw - 1, y + th - 1, cfg);
+                }
+                if (f & DECO_UNDER) {
+                    /* One row below the baseline, inside the cell. */
+                    int32_t y = top + asc + 1;
+                    if (y + th > top + lh) y = top + lh - th;
+                    deco_fill(layer, gx, y, gx + gw - 1, y + th - 1, cfg);
+                }
+            }
+        }
+
+        if (f & DECO_CODE) {
+            /* Box the run's cells. Over selected characters it blends
+             * into the highlight, which is fine. */
+            lv_draw_rect_dsc_t rd;
+            lv_draw_rect_dsc_init(&rd);
+            rd.bg_opa       = LV_OPA_TRANSP;
+            rd.border_color = fg;
+            rd.border_width = 1;
+            rd.border_opa   = LV_OPA_COVER;
+            lv_area_t a = { ca.x1 + s.x - 1, top, ca.x1 + s.x + s.w, top + lh - 1 };
+            lv_draw_rect(layer, &rd, &a);
+        }
+    }
+}
+
+/* Render the currently-bound pane (s_rp) for its bound document. The
+ * caller binds the pane (pane_bind) and decides whether this pane shows
+ * the cursor (draw_cursor is true only for the focused pane). The
+ * shared title / battery widgets are refreshed once by the
+ * editor_ui_refresh() wrapper, not here. */
+static void refresh_active_pane(bool draw_cursor)
+{
+    /* Show logo when no file is loaded and buffer is empty */
+    size_t text_len = 0;
+    const char *flat_text = editor_get_text(&text_len);
+    bool show_logo = (editor_get_file_path() == NULL && text_len == 0);
+    if (s_img_logo) {
+        if (show_logo) {
+            lv_obj_remove_flag(s_img_logo, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(s_img_logo, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    int total  = editor_get_line_count();
+
+    /* Selection range (byte offsets in flat text) */
+    size_t sel_start = 0, sel_end = 0;
+    bool has_sel = editor_selection_active();
+    if (has_sel) editor_get_selection_range(&sel_start, &sel_end);
+
+    int cur_line, cur_col;
+    editor_get_cursor_pos(&cur_line, &cur_col);
+
+    int cur_y = -1;      /* cursor y position (set when cursor line is rendered) */
+    int cur_x = -1;      /* cursor x position */
+    int cur_h = LINE_H;  /* cursor height (matches font of cursor line) */
+    bool cur_rendered = false;  /* cursor line was laid out this pass */
+
+    /* Render visible lines.  Wrapped lines consume more vertical space
+     * than a single LINE_H row, so the cursor may be pushed off-screen
+     * even though ensure_cursor_visible() thought it was in range.
+     * When that happens, increment scroll and re-render (bounded). */
+    for (int _scroll_retry = 0; _scroll_retry < MAX_LINE_LABELS;
+         _scroll_retry++) {
+        int scroll = editor_get_scroll_line();
+        const editor_format_t *fmt = editor_format_active();
+        fmt_scan_t scan;
+        editor_format_scan_begin(fmt, &scan);
+
+        /* Carry the format's line state (Markdown: code fences;
+         * Fountain: the element context) up to the scroll line */
+        for (int i = 0; i < scroll && i < total; i++) {
+            size_t ll;
+            const char *lt = editor_get_line(i, &ll);
+            fmt->parse_line(&scan, lt, ll, NULL);
+        }
+
+        std::string tmp;        /* final rendered text for the current slot */
+        line_view_t view_tmp;   /* its display <-> raw mapping + styling */
+        /* running y position in editor content area; the scroll line
+         * may start above the pane top (see pane_t::top_px) */
+        int top_px = pane_top_px();
+        int y_pos = -top_px;
+        int first_h = 0;     /* rendered height of the scroll line */
+        int first_pitch = LINE_H; /* its visual row pitch */
+        cur_y = -1;
+        cur_x = -1;
+        cur_h = LINE_H;
+        cur_rendered = false;
+        bool counted_visible = false; /* first hidden slot -> s_visible_line_count */
+
+        for (int i = 0; i < MAX_LINE_LABELS; i++) {
+            int line_idx = scroll + i;
+            if (line_idx >= total || y_pos >= s_rp->h) {
+                /* Record how many logical lines actually fit above this
+                 * slot -- see the pane_t::visible_line_count comment.
+                 * Once this branch triggers for a given i it triggers
+                 * for every later i too (line_idx and y_pos are both
+                 * monotonic), so the first hit gives the count. */
+                if (!counted_visible) {
+                    s_visible_line_count = i;
+                    counted_visible = true;
+                }
+                /* Only invalidate the slot when its visible state
+                 * actually changes; otherwise lv_obj_add_flag()
+                 * dirties the previous label rectangle on every
+                 * refresh and the union of all those rectangles
+                 * fills most of the editor area, defeating the
+                 * partial-update path on e-paper backends.
+                 *
+                 * Gate on the widget's *actual* LVGL visibility rather
+                 * than the s_prev_line_* cache: invalidate_render_cache()
+                 * (called on a font-size or theme change) resets those
+                 * cache flags to false while the labels are still shown
+                 * on screen holding the previous layout's text. Keying
+                 * off the cache would then skip hiding a genuinely-visible
+                 * stale label, so its old (differently-sized) content
+                 * survives the next full repaint as garbage -- exactly
+                 * the symptom seen after switching to a larger font and
+                 * re-opening a file. Checking the live HIDDEN flag hides
+                 * whatever is really on screen while still avoiding a
+                 * redundant invalidate when the slot is already hidden. */
+                if (s_line_labels[i] &&
+                    !lv_obj_has_flag(s_line_labels[i], LV_OBJ_FLAG_HIDDEN)) {
+                    lv_obj_add_flag(s_line_labels[i], LV_OBJ_FLAG_HIDDEN);
+                }
+                /* Always clear the cached state for hidden slots so a
+                 * later transition back to visible is forced through
+                 * the full re-render path with a clean baseline. */
+                s_prev_line_visible[i]      = false;
+                s_prev_line_was_selected[i] = false;
+                continue;
+            }
+
+            size_t ll;
+            const char *lt = editor_get_line(line_idx, &ll);
+
+            md_line_info_t mi;
+            fmt->parse_line(&scan, lt, ll, &mi);
+
+            /* Build the final display string (markers hidden except on
+             * the focused cursor line -- see line_view_t) up-front so
+             * we can compare against the cached previous content before
+             * touching any LVGL state. The std::string grows to fit, so
+             * paragraphs of arbitrary length render in full without
+             * truncation. */
+            bool reveal = draw_cursor && line_idx == cur_line;
+            long cur_b = reveal ? (long)utf8_byte_of_char(lt, ll, cur_col) : -1;
+            build_line_view(fmt, lt, ll, &mi, reveal, cur_b, tmp, &view_tmp);
+            line_view_t *view = &s_rp->view[i];
+
+            /* Determine whether this line intersects the active
+             * selection (used both for the highlight branches below
+             * and to disable the fast-path cache when selection is
+             * involved -- the inversion / overlay rendering needs
+             * full re-evaluation). */
+            bool line_intersects_sel = false;
+            if (has_sel) {
+                size_t loff = (size_t)(lt - flat_text);
+                size_t leoff = loff + ll;
+                if (sel_start < leoff && sel_end > loff) {
+                    line_intersects_sel = true;
+                } else if (leoff < text_len &&
+                           flat_text[leoff] == '\n' &&
+                           sel_start < leoff + 1 && sel_end > loff) {
+                    line_intersects_sel = true;
+                }
+            }
+
+            /* Fast path: when the visible text, markdown style, and y
+             * position for this slot all match the previous refresh
+             * AND no selection touches this line (now or last time),
+             * we can leave the LVGL label untouched -- which means no
+             * dirty rectangle for this slot and the e-paper backend
+             * issues a tight partial refresh covering only the line
+             * that actually changed. */
+            bool can_skip = s_line_labels[i] != NULL &&
+                            s_prev_line_visible[i] &&
+                            !line_intersects_sel &&
+                            !s_prev_line_was_selected[i] &&
+                            s_prev_line_type[i] == (int)mi.type &&
+                            s_prev_line_y[i] == y_pos &&
+                            s_prev_line_text[i] == tmp &&
+                            view->flags == view_tmp.flags &&
+                            view->hr == view_tmp.hr &&
+                            view->bullet_level == view_tmp.bullet_level;
+
+            int line_h;
+            int rendered_h;
+            if (can_skip) {
+                /* Reuse cached layout metrics; the label still holds
+                 * the same text/font/width so its rendered geometry
+                 * is unchanged. lv_label_get_letter_pos() (used for
+                 * the cursor below) is non-mutating and works on the
+                 * existing label state. The rendering (and so
+                 * view->segs) is unchanged too, but the raw line behind
+                 * it may differ (e.g. "*x*" vs "_x_"), so the mapping
+                 * is always refreshed. */
+                view->d2r.swap(view_tmp.d2r);
+                view->raw_len = view_tmp.raw_len;
+                rendered_h = s_prev_line_h[i];
+                const lv_font_t *line_font = lv_obj_get_style_text_font(
+                                                s_line_labels[i], LV_PART_MAIN);
+                line_h = lv_font_get_line_height(line_font ? line_font : body_font());
+            } else {
+                /* Create or reuse label */
+                if (!s_line_labels[i]) {
+                    s_line_labels[i] = lv_label_create(s_cont_edit);
+                    lv_obj_set_width(s_line_labels[i], s_rp->w - 4);
+                    lv_label_set_long_mode(s_line_labels[i], LV_LABEL_LONG_WRAP);
+                    lv_obj_add_event_cb(s_line_labels[i], line_deco_draw_cb,
+                                        LV_EVENT_DRAW_MAIN_END, view);
+                    lv_obj_add_event_cb(s_line_labels[i], line_deco_ext_size_cb,
+                                        LV_EVENT_REFR_EXT_DRAW_SIZE, NULL);
+                }
+                lv_obj_remove_flag(s_line_labels[i], LV_OBJ_FLAG_HIDDEN);
+                lv_obj_remove_style_all(s_line_labels[i]);
+                lv_obj_add_style(s_line_labels[i], style_for_type(mi.type), 0);
+                /* Re-apply width after style reset (remove_style_all clears it)
+                 * so that LV_LABEL_LONG_WRAP can wrap at the correct boundary. */
+                lv_obj_set_width(s_line_labels[i], s_rp->w - 4);
+                fmt->apply_layout(s_line_labels[i], mi.type, s_rp->w - 4);
+                /* Re-apply the LV_PART_SELECTED colors too (remove_style_all
+                 * wipes every part, not just LV_PART_MAIN) so the selection
+                 * highlight set below renders correctly. This uses LVGL's
+                 * native per-character text selection (lv_label_set_text_
+                 * selection_start/end) rather than a hand-rolled overlay,
+                 * so it draws correctly no matter how many visual rows a
+                 * wrapped line's selection spans. */
+                lv_obj_set_style_bg_color(s_line_labels[i], theme_fg(),
+                                          LV_PART_SELECTED);
+                lv_obj_set_style_bg_opa(s_line_labels[i], LV_OPA_COVER,
+                                        LV_PART_SELECTED);
+                lv_obj_set_style_text_color(s_line_labels[i], theme_bg(),
+                                            LV_PART_SELECTED);
+                lv_label_set_text_selection_start(s_line_labels[i],
+                                                  LV_LABEL_TEXT_SELECTION_OFF);
+                lv_label_set_text_selection_end(s_line_labels[i],
+                                                LV_LABEL_TEXT_SELECTION_OFF);
+                lv_label_set_text_static(s_line_labels[i], "");
+                lv_label_set_text(s_line_labels[i], tmp.c_str());
+                lv_obj_set_pos(s_line_labels[i], 2, y_pos);
+
+                /* Get the font for this line to compute correct line height */
+                const lv_font_t *line_font = lv_obj_get_style_text_font(
+                                                s_line_labels[i], LV_PART_MAIN);
+                line_h = lv_font_get_line_height(line_font ? line_font : body_font());
+
+                /* Determine actual rendered height (may be taller if text wraps) */
+                lv_obj_update_layout(s_line_labels[i]);
+                rendered_h = lv_obj_get_height(s_line_labels[i]);
+                if (rendered_h < line_h) rendered_h = line_h;
+
+                view->d2r.swap(view_tmp.d2r);
+                view->flags.swap(view_tmp.flags);
+                view->raw_len      = view_tmp.raw_len;
+                view->hr           = view_tmp.hr;
+                view->bullet_level = view_tmp.bullet_level;
+                layout_line_decorations(s_line_labels[i], tmp, view);
+
+                /* Update cache with what we just drew. */
+                s_prev_line_text[i]    = tmp;
+                s_prev_line_type[i]    = (int)mi.type;
+                s_prev_line_y[i]       = y_pos;
+                s_prev_line_h[i]       = rendered_h;
+                s_prev_line_visible[i] = true;
+            }
+
+            /* Selection highlight.  A fully-selected line uses color
+             * inversion on the whole label (black bg, white text).  A
+             * partial selection -- which may span more than one visual
+             * row when the line word-wraps -- uses LVGL's native
+             * per-character text selection (lv_label_set_text_selection_
+             * start/end, drawn via the LV_PART_SELECTED style applied
+             * above) so every wrapped row is highlighted accurately
+             * instead of a hand-rolled single-row overlay that silently
+             * over-highlighted (and mis-reported to the user as fully
+             * selected) any selection spanning more than one row. */
+            if (has_sel) {
+                size_t line_off = (size_t)(lt - flat_text);
+                size_t line_end_off = line_off + ll;
+                bool fully = (sel_start <= line_off &&
+                              sel_end >= line_end_off);
+                bool partial = !fully &&
+                    (sel_start < line_end_off && sel_end > line_off);
+                /* Include trailing newline for overlap check */
+                if (!fully && !partial && line_end_off < text_len &&
+                    flat_text[line_end_off] == '\n') {
+                    partial = (sel_start < line_end_off + 1 &&
+                               sel_end > line_off);
+                }
+                if (fully) {
+                    lv_obj_set_style_bg_color(s_line_labels[i],
+                                              theme_fg(), 0);
+                    lv_obj_set_style_bg_opa(s_line_labels[i],
+                                            LV_OPA_COVER, 0);
+                    lv_obj_set_style_text_color(s_line_labels[i],
+                                                theme_bg(), 0);
+                } else if (partial) {
+                    /* Compute selection byte range within this line */
+                    size_t raw_s = (sel_start > line_off)
+                                       ? sel_start - line_off : 0;
+                    size_t raw_e = (sel_end < line_end_off)
+                                       ? sel_end - line_off : ll;
+                    /* Convert raw byte offsets to display char indices
+                     * (hidden Markdown markers have no display char). */
+                    int disp_s = view_raw_to_disp(view, raw_s);
+                    int disp_e = view_raw_to_disp(view, raw_e);
+                    if (disp_e > disp_s) {
+                        lv_label_set_text_selection_start(
+                            s_line_labels[i], (uint32_t)disp_s);
+                        lv_label_set_text_selection_end(
+                            s_line_labels[i], (uint32_t)disp_e);
+                    }
+                }
+            }
+
+            /* Remember whether this slot is currently rendering a
+             * selected line so the next refresh can decide whether
+             * to invoke the full re-render path that clears the
+             * inversion / overlay. */
+            s_prev_line_was_selected[i] = line_intersects_sel;
+
+            /* If this is the cursor line, compute its pixel position.
+             * The cursor column counts UTF-8 characters from the raw
+             * line start; map it through the view, since the display
+             * text can differ from the raw line (hidden markers in an
+             * unfocused pane, expanded tabs). */
+            if (line_idx == cur_line) {
+                int col_in_display = view_raw_to_disp(
+                    view, utf8_byte_of_char(lt, ll, cur_col));
+
+                /* Use LVGL to find the actual pixel position of the cursor
+                 * character.  This correctly handles word-level wrapping
+                 * where the break point differs from a simple chars_per_row
+                 * calculation. */
+                lv_point_t lpos;
+                lv_label_get_letter_pos(s_line_labels[i],
+                                        (uint32_t)col_in_display, &lpos);
+                lv_point_t cofs = label_content_offset(s_line_labels[i]);
+                cur_x = 2 + cofs.x + lpos.x;
+                cur_y = y_pos + cofs.y + lpos.y;
+                cur_h = line_h;
+                cur_rendered = true;
+
+                /* A line with no strong directional character (empty
+                 * or whitespace-only) detects as LTR and parks the
+                 * cursor at the left edge. If the user has switched
+                 * to an RTL keyboard layout, the first typed
+                 * character will right-align the paragraph, so show
+                 * the cursor at the right edge it is about to type
+                 * from. */
+                if (kb_layout_is_rtl() &&
+                    utf8_first_strong_dir(tmp.c_str(), tmp.size()) == 0) {
+                    cur_x = s_rp->w - 4;
+                }
+            }
+
+            if (i == 0) {
+                first_h = rendered_h;
+                first_pitch = line_h + lv_obj_get_style_text_line_space(
+                                  s_line_labels[i], LV_PART_MAIN);
+                if (first_pitch <= 0) first_pitch = LINE_H;
+            }
+            y_pos += rendered_h;
+        }
+        /* Every slot fit on screen without tripping the count above
+         * (only possible when the whole MAX_LINE_LABELS-slot pool is
+         * filled with lines short enough to never exceed the pane
+         * height) -- fall back to the full pool size. */
+        if (!counted_visible) s_visible_line_count = MAX_LINE_LABELS;
+
+        /* If the cursor line is in the expected range but wrapped lines
+         * pushed it off-screen, scroll and re-render. Jump by
+         * scroll_jump_step() rather than a single line, same as every
+         * other scroll site in this file (see SCROLL_JUMP_FRACTION) --
+         * otherwise a wrapped paragraph near the bottom of the screen
+         * made this correction nudge by exactly one line while an
+         * unwrapped one jumped by ~60% via ensure_cursor_visible(),
+         * which felt like inconsistent, unpredictable scrolling.
+         * Clamped to cur_line so the jump cannot scroll past the very
+         * line it is trying to bring into view. Use cur_y + cur_h to
+         * ensure the full cursor row is visible. */
+        if (scroll < cur_line &&
+            (!cur_rendered || cur_y + cur_h > s_rp->h)) {
+            int new_scroll = scroll + scroll_jump_step();
+            if (new_scroll > cur_line) new_scroll = cur_line;
+            editor_set_scroll_line(new_scroll);
+            continue;
+        }
+
+        /* The cursor is inside the scroll line itself: a paragraph
+         * taller than the pane (or one partly hidden above the top
+         * edge) has no further whole line to scroll to, so shift the
+         * line within the pane instead (pane_t::top_px). The cursor
+         * row lands about SCROLL_JUMP_FRACTION of a screen away from
+         * the edge it crossed, like the line-granular jumps above,
+         * and top_px is kept a whole number of visual rows so no row
+         * is cut at the top edge. */
+        if (cur_line == scroll && cur_rendered && !s_touch_panning &&
+            (cur_y < 0 || cur_y + cur_h > s_rp->h)) {
+            int step_px = scroll_jump_step() * first_pitch;
+            int tgt = (cur_y < 0) ? step_px - cur_h
+                                  : s_rp->h - step_px;
+            if (tgt < 0) tgt = 0;
+            if (tgt > s_rp->h - cur_h) tgt = s_rp->h - cur_h;
+            int new_top = top_px + cur_y - tgt;
+            new_top = (new_top / first_pitch) * first_pitch;
+            if (new_top > first_h - first_pitch) new_top = first_h - first_pitch;
+            if (new_top < 0) new_top = 0;
+            if (new_top != top_px) {
+                pane_set_top_px(new_top);
+                continue;
+            }
+        } else if (top_px > 0 && top_px > first_h - first_pitch) {
+            /* The scroll line shrank (text deleted) below the hidden
+             * part: keep at least its last row on screen. */
+            pane_set_top_px(first_h - first_pitch);
+            continue;
+        }
+        break;
+    }
+
+    /* Update cursor position. Only the focused pane shows a caret; an
+     * unfocused pane keeps its cursor hidden. */
+    if (draw_cursor && cur_y >= 0 && cur_y + cur_h <= s_rp->h && s_cursor) {
+        lv_obj_set_size(s_cursor, 2, cur_h);
+        lv_obj_set_pos(s_cursor, cur_x, cur_y);
+        lv_obj_remove_flag(s_cursor, LV_OBJ_FLAG_HIDDEN);
+        s_cursor_visible = true;
+        s_cursor_on_screen = true;
+    } else if (s_cursor) {
+        lv_obj_add_flag(s_cursor, LV_OBJ_FLAG_HIDDEN);
+        s_cursor_on_screen = false;
+    }
+}
+
+/* Public refresh entry point: render every visible pane for its bound
+ * document, then refresh the shared title / battery widgets once. The
+ * focused pane is rendered last so the engine's active document is left
+ * pointing at it for subsequent key handling. */
+extern "C" void editor_ui_refresh(void)
+{
+    if (!s_editor_screen_active) return;
+
+    for (int p = 0; p < s_pane_count; p++) {
+        if (p == s_focus) continue;     /* focused pane drawn last */
+        pane_bind(p);
+        refresh_active_pane(false);
+    }
+    pane_bind_focus();
+    /* While the in-pane file selector overlays the focused pane, that
+     * pane is hidden behind the opaque list -- skip its (wasted) draw
+     * but still leave the active doc bound to it. */
+    if (!s_inpane_browser_open) {
+        refresh_active_pane(true);
+    }
+
+    update_title_bar();
+    sync_battery_labels();
+}
+
+/* Re-render only the focused pane. Used by the mid-navigation scroll
+ * steps in editor_ui_move_visual(): a full editor_ui_refresh() also
+ * binds and redraws the unfocused pane, which (when both panes share
+ * one document) momentarily retargets the active document at the other
+ * pane while capturing/restoring its saved view. Keeping the scroll
+ * step focused-pane-only means vertical cursor movement never touches
+ * the other pane, so the caret always stays within the focused pane
+ * until the user switches with Ctrl+Tab. */
+static void refresh_focused_pane(void)
+{
+    if (!s_editor_screen_active) return;
+    pane_bind_focus();
+    if (!s_inpane_browser_open) {
+        refresh_active_pane(true);
+    }
+}
+
+/* Like refresh_focused_pane() but also updates the shared title and
+ * battery widgets. Used as the post-key refresh for pure cursor
+ * navigation (arrows, Home/End, Page Up/Down, word/document moves):
+ * these never change document content, so re-rendering the unfocused
+ * pane is unnecessary. Avoiding the full editor_ui_refresh() keeps the
+ * binding (and therefore the visible caret) on the focused pane, so a
+ * cursor that reaches the beginning / end of the text cannot end up
+ * drawn in the other pane -- focus only ever moves with Ctrl+Tab.
+ * Content-changing keys still use the full editor_ui_refresh() so a
+ * sibling pane showing the same shared document repaints the edit. */
+static void refresh_focused_pane_and_title(void)
+{
+    if (!s_editor_screen_active) return;
+    refresh_focused_pane();
+    update_title_bar();
+    sync_battery_labels();
+}
+
+static void ensure_cursor_visible(void)
+{
+    int cur_line, cur_col;
+    (void)cur_col;
+    editor_get_cursor_pos(&cur_line, &cur_col);
+    int scroll = editor_get_scroll_line();
+    if (cur_line < scroll) {
+        int new_scroll = scroll - scroll_jump_step();
+        if (new_scroll < 0) new_scroll = 0;
+        /* The cursor jumped further than one scroll step (Ctrl+Home,
+         * Find, goto-line, ...) -- a partial jump would still leave
+         * it off-screen, so land on it exactly instead. */
+        if (cur_line < new_scroll) new_scroll = cur_line;
+        editor_set_scroll_line(new_scroll);
+    } else if (cur_line >= scroll + VISIBLE_LINES) {
+        int new_scroll = scroll + scroll_jump_step();
+        if (cur_line >= new_scroll + VISIBLE_LINES) {
+            new_scroll = cur_line - VISIBLE_LINES + 1;
+        }
+        editor_set_scroll_line(new_scroll);
+    }
+}
+
+/* Forward declarations: defined below in the menu / list-rendering
+ * section but referenced from the touch event callbacks immediately
+ * below, and from refresh_file_list() (so list rows pick up theme
+ * colors and the initial selection highlight). */
+static void apply_list_selection_styles(lv_obj_t *list, int sel);
+static void update_list_highlight(lv_obj_t *list, int sel, int prev_sel);
+
+/* ---- Pixel <-> document-offset helpers (used by both touch input
+ * and visual-line cursor navigation).  Always compiled so that the
+ * arrow-key handler can ask "which character is at pixel (x, y) of
+ * the rendered editor body?" regardless of whether the touchscreen
+ * driver is enabled. */
+
+/* Convert a point (in s_cont_edit local coordinates) to a byte
+ * offset within the editor's flat text buffer. Returns true on
+ * success and fills *out_off; returns false if the point landed on
+ * empty space below the last rendered line. */
+static bool ui_point_to_offset(int x, int y, size_t *out_off)
+{
+    if (!out_off) return false;
+
+    /* Walk the per-slot render cache to find which line contains
+     * the point. The cache is kept in lock-step with the visible
+     * labels by editor_ui_refresh(), so s_prev_line_y[i] /
+     * s_prev_line_h[i] describe the layout the user actually sees. */
+    int slot = -1;
+    for (int i = 0; i < MAX_LINE_LABELS; i++) {
+        /* The first slot may start above the pane top (pane_t::top_px),
+         * so a negative y is valid for a visible slot. */
+        if (!s_prev_line_visible[i]) continue;
+        int y1 = s_prev_line_y[i];
+        int y2 = y1 + s_prev_line_h[i];
+        if (y >= y1 && y < y2) { slot = i; break; }
+    }
+    if (slot < 0) {
+        /* Point lies below the last visible line -- map to end-of-document. */
+        size_t total = 0;
+        (void)editor_get_text(&total);
+        *out_off = total;
+        return true;
+    }
+
+    int line_idx = editor_get_scroll_line() + slot;
+    int total_lines = editor_get_line_count();
+    if (line_idx >= total_lines) {
+        size_t total = 0;
+        editor_get_text(&total);
+        *out_off = total;
+        return true;
+    }
+
+    size_t ll = 0;
+    const char *lt = editor_get_line(line_idx, &ll);
+    if (!lt) return false;
+
+    size_t flat_len = 0;
+    const char *flat = editor_get_text(&flat_len);
+    size_t line_off = (size_t)(lt - flat);
+
+    /* Translate (x_in_container) into (x_in_label). Each label is
+     * positioned at x=2 in the container (see build_editor_screen). */
+    int x_in_label = x - 2;
+    if (x_in_label < 0) x_in_label = 0;
+    int y_in_label = y - s_prev_line_y[slot];
+    if (y_in_label < 0) y_in_label = 0;
+
+    /* lv_label_get_letter_on returns a codepoint index into the
+     * displayed text. LVGL's BIDI reordering (LV_USE_BIDI) is enabled
+     * so Hebrew text renders right-to-left; for pure LTR content this
+     * lookup is a no-op. */
+    int disp_char = 0;
+    if (s_line_labels[slot]) {
+        /* lv_label_get_letter_on() discounts the label's padding but
+         * not its border (the blockquote bar, the code-block box), so
+         * take the border off here. */
+        lv_point_t cofs = label_content_offset(s_line_labels[slot]);
+        lv_point_t p;
+        p.x = x_in_label -
+              (cofs.x - lv_obj_get_style_pad_left(s_line_labels[slot], LV_PART_MAIN));
+        p.y = y_in_label -
+              (cofs.y - lv_obj_get_style_pad_top(s_line_labels[slot], LV_PART_MAIN));
+        /* bidi=true so taps on RTL/mixed lines map through LVGL's
+         * visual->logical reordering instead of the raw byte order. */
+        disp_char = (int)lv_label_get_letter_on(s_line_labels[slot], &p, true);
+    }
+    if (disp_char < 0) disp_char = 0;
+
+    /* Map the display character back to a raw byte offset through the
+     * view the slot was rendered with (hidden Markdown markers, drawn
+     * bullets and expanded tabs make the display text differ from the
+     * raw line). A point past the end of the rendered text lands after
+     * the last raw byte. */
+    size_t raw = view_disp_to_raw(&s_rp->view[slot], disp_char);
+    if (raw > ll) raw = ll;
+    *out_off = line_off + raw;
+    return true;
+}
+
+/* ---- Visual-line cursor movement ----
+ *
+ * The default editor_move_up()/_down() jump by *logical* lines,
+ * which on a long soft-wrapped paragraph skips the whole rendered
+ * block in one keystroke. The functions below instead step the
+ * cursor to the next/previous *visual* row, matching what most
+ * other editors do.
+ *
+ * s_visual_goal_x remembers the cursor's preferred x pixel across
+ * consecutive Up/Down presses so the column is preserved even when
+ * crossing shorter rows -- it is reset by handle_editor_key() on
+ * any non-vertical key. */
+static int s_visual_goal_x = -1;
+
+static void editor_ui_move_visual(int direction)
+{
+    /* direction: -1 = up, +1 = down */
+    /* Use the render-time on-screen flag rather than LV_OBJ_FLAG_HIDDEN:
+     * on LCD backends the blink timer toggles the HIDDEN flag every
+     * ~500 ms, and reading it here would intermittently make the
+     * function think the cursor is off-screen and fall back to
+     * logical-line jumps (skipping multiple visual rows in a
+     * soft-wrapped paragraph and resetting s_visual_goal_x). */
+    if (!s_cursor || !s_cursor_on_screen) {
+        if (direction < 0) editor_move_up();
+        else               editor_move_down();
+        s_visual_goal_x = -1;
+        return;
+    }
+
+    int cx = lv_obj_get_x(s_cursor);
+    int cy = lv_obj_get_y(s_cursor);
+    int ch = lv_obj_get_height(s_cursor);
+    int gx = (s_visual_goal_x >= 0) ? s_visual_goal_x : cx;
+    /* LVGL's lv_label_get_letter_on() uses an inclusive bottom-edge
+     * test (pos.y <= line_y + letter_height), so a y exactly on the
+     * boundary between visual rows N and N+1 snaps to row N.  For
+     * Up we step one pixel above the cursor top (cy - 1), which
+     * lands strictly inside the previous row.  For Down we have to
+     * step *past* the cursor bottom (cy + ch + 1), not merely onto
+     * it -- otherwise lv_label_get_letter_on() would return a
+     * letter on the same visual row and the cursor would not move. */
+    int target_y = (direction < 0) ? cy - 1 : cy + ch + 1;
+
+    /* Short-circuit at document boundaries so a Down press on the
+     * very last visual row of the document does not scroll past
+     * end-of-text. We still need this check up front because the
+     * scroll fall-through below assumes there is another logical
+     * line to bring into view. */
+    {
+        int cur_line, cur_col;
+        editor_get_cursor_pos(&cur_line, &cur_col);
+        (void)cur_col;
+        int total = editor_get_line_count();
+        if (direction > 0 && cur_line >= total - 1) {
+            /* Last logical line: see if any visual row remains
+             * within the current label below the cursor. If not,
+             * stay put. */
+            if (target_y >= s_rp->h) {
+                /* At-or-past viewport bottom on the last line: only a
+                 * label running past the bottom edge (a paragraph
+                 * taller than what is left of the pane) still has
+                 * rows below. */
+                int slot = cur_line - editor_get_scroll_line();
+                if (slot < 0 || slot >= MAX_LINE_LABELS ||
+                    !s_prev_line_visible[slot] ||
+                    s_prev_line_y[slot] + s_prev_line_h[slot] <= s_rp->h) {
+                    return;
+                }
+            }
+        }
+        if (direction < 0 && cur_line == 0) {
+            /* First logical line: if the cursor is already on the
+             * first visual row (cy <= 0, nothing of the line hidden
+             * above the top edge), there is no row above. */
+            if (cy <= 0 && pane_top_px() == 0) return;
+        }
+    }
+
+    /* If the target visual row is outside the rendered editor area,
+     * scroll and re-render so the row above/below becomes addressable
+     * via ui_point_to_offset(). Jumping by scroll_jump_step() rather
+     * than a single line means holding Up/Down at the edge of the
+     * viewport needs a scroll (and its refresh) only once every few
+     * rows instead of on every keypress -- see the comment on
+     * SCROLL_JUMP_FRACTION. This does not change which visual row the
+     * cursor lands on: target_y is still exactly one row above/below
+     * the cursor's own (not-yet-moved) rendered position, wherever
+     * that ends up after the jump. */
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (target_y >= 0 && target_y < s_rp->h) break;
+        int sc = editor_get_scroll_line();
+        int cur_line, cur_col;
+        editor_get_cursor_pos(&cur_line, &cur_col);
+        (void)cur_col;
+        if (cur_line == sc &&
+            ((direction < 0 && pane_top_px() > 0) ||
+             (direction > 0 && s_prev_line_visible[0] &&
+              s_prev_line_y[0] + s_prev_line_h[0] > s_rp->h))) {
+            /* The cursor is inside a paragraph taller than the pane
+             * and the target row is part of it: shift the paragraph
+             * within the pane (pane_t::top_px) instead of jumping
+             * whole lines, which would skip the rest of it. */
+            int step_px = scroll_jump_step() * ch;
+            int top = pane_top_px() + (direction < 0 ? -step_px : step_px);
+            int max_top = s_prev_line_y[0] + pane_top_px() +
+                          s_prev_line_h[0] - ch;
+            if (top > max_top) top = max_top;
+            pane_set_top_px(top);
+        } else if (direction < 0) {
+            if (sc <= 0) {
+                editor_move_up();
+                s_visual_goal_x = gx;
+                return;
+            }
+            int new_sc = sc - scroll_jump_step();
+            if (new_sc < 0) new_sc = 0;
+            editor_set_scroll_line(new_sc);
+        } else {
+            int total = editor_get_line_count();
+            if (sc + 1 >= total) {
+                editor_move_down();
+                s_visual_goal_x = gx;
+                return;
+            }
+            int new_sc = sc + scroll_jump_step();
+            if (new_sc > total - 1) new_sc = total - 1;
+            /* Never scroll past the cursor's own line: its remaining
+             * rows (a tall paragraph) would be skipped. */
+            if (new_sc > cur_line) new_sc = cur_line;
+            editor_set_scroll_line(new_sc);
+        }
+        refresh_focused_pane();
+        if (!s_cursor || !s_cursor_on_screen) {
+            if (direction < 0) editor_move_up();
+            else               editor_move_down();
+            s_visual_goal_x = gx;
+            return;
+        }
+        cy = lv_obj_get_y(s_cursor);
+        ch = lv_obj_get_height(s_cursor);
+        target_y = (direction < 0) ? cy - 1 : cy + ch + 1;
+    }
+
+    if (target_y < 0 || target_y >= s_rp->h) {
+        if (direction < 0) editor_move_up();
+        else               editor_move_down();
+        s_visual_goal_x = gx;
+        return;
+    }
+
+    size_t off;
+    if (ui_point_to_offset(gx, target_y, &off)) {
+        editor_set_cursor(off);
+        s_visual_goal_x = gx;
+    } else {
+        if (direction < 0) editor_move_up();
+        else               editor_move_down();
+        s_visual_goal_x = gx;
+    }
+}
+
+#if defined(CONFIG_DRAFTLING_TOUCHSCREEN)
+/* The three activate-on-tap callbacks for the touchable lists.
+ * They are defined further down with the rest of their respective
+ * list code; forward-declared here so list_touch_attach can store
+ * them as function pointers in the static touch contexts. */
+static void browser_activate_item(int row);
+static void menu_activate_item(int idx);
+static void settings_activate_item(int idx);
+#endif
+
+/* Defined with the exit/sleep overlay code further down; the F1 menu's
+ * "Sleep now" item (menu_activate_item) needs it before that point. */
+static void show_sleep_prompt(void);
+static void show_help(help_origin_t origin);
+static void show_hwinfo(help_origin_t origin);
+
+#if defined(CONFIG_DRAFTLING_HAS_USB_MSC)
+/* Defined with the split-layout code further down (editor_ui_apply_split_mode);
+ * commit_usb_msc_pending_mode(), called from close_usbmsc_picker()
+ * above it, collapses any split before handing the SD card to USB so
+ * no pane can be left silently editing a file it can no longer safely
+ * save. */
+static void editor_ui_apply_split_mode(split_mode_t mode);
+#endif
+
+/* ---- Touch input ----
+ *
+ * Touch is gated on CONFIG_DRAFTLING_TOUCHSCREEN. When enabled we
+ * register LVGL pointer-event handlers on:
+ *   - the editor content area (s_cont_edit): tap moves the cursor,
+ *     double-tap selects the word at the tap point, and vertical
+ *     swipes scroll the document.
+ *   - each list-row button in the main menu, settings menu, and
+ *     file browser: a tap highlights the row (single click) and a
+ *     second tap on the already-highlighted row activates it.
+ *     This mirrors the keyboard flow (arrow keys then Enter) so a
+ *     touch-only user can reach every command.
+ *
+ * The keyboard handlers are untouched and continue to work in
+ * parallel; touch is purely additive. */
+
+#if defined(CONFIG_DRAFTLING_TOUCHSCREEN)
+
+#include <cctype>
+#include <cstdlib>
+
+/* Treat as a "word" character: ASCII alnum / underscore, and any
+ * UTF-8 continuation/start byte (>= 0x80). This makes word-select
+ * work on Latin, Cyrillic, accented chars, etc. without needing a
+ * full Unicode category table. */
+static bool touch_is_word_byte(unsigned char c)
+{
+    if (c >= 0x80) return true;
+    if (c == '_') return true;
+    if (c >= '0' && c <= '9') return true;
+    if (c >= 'a' && c <= 'z') return true;
+    if (c >= 'A' && c <= 'Z') return true;
+    return false;
+}
+
+/* (ui_point_to_offset is defined unconditionally above so
+ * visual-line cursor movement can use it too.) */
+
+/* Last tap state for software double-tap detection. LVGL fires
+ * LV_EVENT_CLICKED on every release; a click whose press began within
+ * TOUCH_DOUBLE_TAP_MS of the previous click (release), close to it,
+ * is promoted to a "double tap". Timing from the previous release to
+ * this press (not release to release) keeps how long the finger rests
+ * on the glass out of the window. */
+static uint32_t s_last_tap_ms = 0;
+static uint32_t s_press_ms    = 0;
+static int      s_last_tap_x  = -1;
+static int      s_last_tap_y  = -1;
+#define TOUCH_DOUBLE_TAP_MS   400  /* same as the LVGL default short-click streak */
+/* Finger jitter tolerance. 12 px is ~1 mm on the high-density panels,
+ * tighter than a fingertip repeats (seen on the Seeed reTerminal
+ * Sticky's 3.97" 800x480 panel). */
+#if defined(CONFIG_DRAFTLING_DISPLAY_HIDPI)
+#define TOUCH_DOUBLE_TAP_PX    24
+#else
+#define TOUCH_DOUBLE_TAP_PX    12
+#endif
+
+/* Drag-to-scroll state. Touch panels here typically poll at 30-60 Hz
+ * with small per-frame deltas; LVGL's built-in gesture detector needs
+ * a fairly high velocity to fire, which makes "slow scroll a long
+ * document" feel unresponsive. So we implement drag-scrolling
+ * directly off LV_EVENT_PRESSED / _PRESSING / _RELEASED: every time
+ * the finger has moved one full line height vertically, scroll the
+ * document by one line and re-anchor. The accumulated drag distance
+ * also lets us suppress the LV_EVENT_CLICKED that LVGL emits on
+ * release after a drag, so a swipe never moves the cursor by
+ * accident. */
+static bool s_drag_active     = false;
+static int  s_drag_start_x    = 0;
+static int  s_drag_start_y    = 0;
+static int  s_drag_anchor_y   = 0;
+static int  s_drag_total_dy   = 0;
+#define TOUCH_DRAG_SUPPRESS_PX 8   /* clicks within this radius still count as taps */
+
+/* Convert a tap point (in s_cont_edit local coordinates) to a byte
+ * offset within the editor's flat text buffer. Returns true on
+ * success and fills *out_off; returns false if the tap landed on
+ * empty space below the last rendered line. */
+/* Convert a tap point (in s_cont_edit local coordinates) to a byte
+ * offset within the editor's flat text buffer. Implemented as a
+ * thin wrapper around ui_point_to_offset(), which is also reused
+ * by keyboard-driven visual-line cursor movement. */
+static bool touch_point_to_offset(int x, int y, size_t *out_off)
+{
+    return ui_point_to_offset(x, y, out_off);
+}
+
+/* Expand a single-tap byte offset into the selection range of the
+ * word containing it. */
+static void touch_select_word_at(size_t off)
+{
+    size_t flat_len = 0;
+    const char *flat = editor_get_text(&flat_len);
+    if (!flat || flat_len == 0) return;
+    if (off > flat_len) off = flat_len;
+
+    /* Walk left until non-word byte (UTF-8-safe: continuation bytes
+     * test as word chars so multi-byte codepoints are not split). */
+    size_t start = off;
+    while (start > 0 && touch_is_word_byte((unsigned char)flat[start - 1])) {
+        start--;
+    }
+    size_t end = off;
+    while (end < flat_len && touch_is_word_byte((unsigned char)flat[end])) {
+        end++;
+    }
+    if (start == end) return;  /* tapped on whitespace */
+
+    editor_clear_selection();
+    editor_set_cursor(start);
+    editor_set_selection_anchor();
+    editor_set_cursor(end);
+}
+
+/* Scroll the pane the finger is on by delta_lines WITHOUT moving the
+ * keyboard focus or the editing caret. A drag / swipe should only pan
+ * the touched pane's view; the caret must stay where the user is
+ * typing -- which may be the other pane. The touched pane is bound just
+ * long enough to update its scroll line and repaint it, then the
+ * focused-pane binding is restored. Binding the focused pane back does
+ * not repaint it, so its caret widget keeps its position / blink state.
+ * Only the focused pane ever draws a caret (refresh_active_pane's
+ * draw_cursor is true only when the touched pane is the focused one), so
+ * panning an unfocused pane never makes a caret appear in it. */
+static void touch_scroll_pane_by(int pane_idx, int delta_lines)
+{
+    if (delta_lines == 0) return;
+    if (pane_idx < 0 || pane_idx >= s_pane_count) pane_idx = s_focus;
+
+    bool refocus = (pane_idx != s_focus);
+    pane_bind(pane_idx);
+
+    int total      = editor_get_line_count();
+    int scroll     = editor_get_scroll_line();
+    int top        = pane_top_px();
+    /* Within a paragraph taller than the pane, pan by rows inside it
+     * (pane_t::top_px) before moving on to whole lines. */
+    int first_bottom = s_prev_line_visible[0]
+                     ? s_prev_line_y[0] + s_prev_line_h[0] : 0;
+    if ((delta_lines < 0 && top > 0) ||
+        (delta_lines > 0 && first_bottom > s_rp->h)) {
+        int new_top = top + delta_lines * LINE_H;
+        int max_top = top + first_bottom - LINE_H;
+        if (new_top > max_top) new_top = max_top;
+        if (new_top < 0) new_top = 0;
+        pane_set_top_px(new_top);
+        s_touch_panning = true;
+        refresh_active_pane(pane_idx == s_focus);
+        s_touch_panning = false;
+        standby_reset_timer();
+    } else {
+        int new_scroll = scroll + delta_lines;
+        if (new_scroll > total - 1) new_scroll = total - 1;
+        if (new_scroll < 0) new_scroll = 0;
+        if (new_scroll != scroll) {
+            editor_set_scroll_line(new_scroll);
+            refresh_active_pane(pane_idx == s_focus);
+            standby_reset_timer();
+        }
+    }
+
+    if (refocus) pane_bind_focus();
+}
+
+static void editor_touch_event_cb(lv_event_t *e)
+{
+    /* Bail out early if any modal overlay is open: the overlay's
+     * own keyboard handler owns the input. (A future revision could
+     * give overlays their own touch routing; for now we skip them.) */
+    if (s_menu_open || s_settings_open || s_save_open || s_search_open ||
+        s_exit_open) {
+        return;
+    }
+    if (!s_editor_screen_active) return;
+
+    /* The tapped pane index was stored in the container's user_data at
+     * creation. Focus is NOT moved here: a drag / swipe only pans the
+     * touched pane (see touch_scroll_pane_by), leaving the caret in the
+     * pane the user is editing. Keyboard focus follows a genuine TAP
+     * (the CLICKED branch below), which is the user explicitly placing
+     * the caret in that pane. */
+    int pane_idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (pane_idx < 0 || pane_idx >= s_pane_count) pane_idx = s_focus;
+
+    lv_event_code_t code = lv_event_get_code(e);
+
+    /* --- Drag-to-scroll ---
+     *
+     * On PRESSED we record the start point; on every PRESSING we
+     * compute the vertical delta from the last anchor and, once it
+     * exceeds one line height, scroll the document by that many
+     * lines. RELEASED leaves s_drag_total_dy set so the CLICKED
+     * branch below can ignore the release if the user actually
+     * dragged rather than tapped. */
+    if (code == LV_EVENT_PRESSED) {
+        lv_indev_t *indev = lv_indev_active();
+        if (!indev) return;
+        lv_point_t pt;
+        lv_indev_get_point(indev, &pt);
+        s_press_ms      = lv_tick_get();
+        s_drag_active   = true;
+        s_drag_start_x  = pt.x;
+        s_drag_start_y  = pt.y;
+        s_drag_anchor_y = pt.y;
+        s_drag_total_dy = 0;
+        return;
+    }
+
+    if (code == LV_EVENT_PRESSING) {
+        if (!s_drag_active) return;
+        lv_indev_t *indev = lv_indev_active();
+        if (!indev) return;
+        lv_point_t pt;
+        lv_indev_get_point(indev, &pt);
+
+        int dy = pt.y - s_drag_anchor_y;
+        s_drag_total_dy = pt.y - s_drag_start_y;
+
+        int line_h = LINE_H > 0 ? LINE_H : 1;
+        if (dy <= -line_h || dy >= line_h) {
+            int step = dy / line_h;
+            s_drag_anchor_y += step * line_h;
+
+            /* Finger moves down (dy>0, step>0)  -> scroll backward
+             *   (reveal lines above, like dragging the page down).
+             * Finger moves up   (dy<0, step<0)  -> scroll forward
+             *   (reveal lines below, like dragging the page up).
+             * Pan only the touched pane; keep the caret / focus put. */
+            touch_scroll_pane_by(pane_idx, -step);
+        }
+        return;
+    }
+
+    if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        s_drag_active = false;
+        /* s_drag_total_dy is consumed by the CLICKED branch below
+         * (LVGL fires CLICKED right after RELEASED on a short press). */
+        return;
+    }
+
+    if (code == LV_EVENT_CLICKED) {
+        /* Suppress the click if the user actually dragged: a swipe
+         * should scroll only, never move the caret. */
+        if (std::abs(s_drag_total_dy) > TOUCH_DRAG_SUPPRESS_PX) {
+            s_drag_total_dy = 0;
+            return;
+        }
+        s_drag_total_dy = 0;
+
+        /* A genuine tap places the caret -> move keyboard focus to the
+         * tapped pane and bind it so the pane-local coordinate math and
+         * caret update below operate on that pane's document. */
+        s_focus = pane_idx;
+        pane_bind_focus();
+
+        lv_indev_t *indev = lv_indev_active();
+        if (!indev) return;
+        lv_point_t pt;
+        lv_indev_get_point(indev, &pt);
+        /* Translate screen-space point into pane-local coordinates.
+         * The pane's content area starts at (s_rp->x, s_rp->y). */
+        int lx = pt.x - s_rp->x;
+        int ly = pt.y - s_rp->y;
+        if (ly < 0) return;
+
+        uint32_t now = lv_tick_get();
+        bool is_double = (s_press_ms - s_last_tap_ms) <= TOUCH_DOUBLE_TAP_MS &&
+                          (s_last_tap_x >= 0) &&
+                          (std::abs((int)(pt.x - s_last_tap_x)) <= TOUCH_DOUBLE_TAP_PX) &&
+                          (std::abs((int)(pt.y - s_last_tap_y)) <= TOUCH_DOUBLE_TAP_PX);
+        s_last_tap_ms = now;
+        s_last_tap_x  = pt.x;
+        s_last_tap_y  = pt.y;
+
+        size_t off = 0;
+        if (!touch_point_to_offset(lx, ly, &off)) return;
+
+        if (is_double) {
+            touch_select_word_at(off);
+        } else {
+            editor_clear_selection();
+            editor_set_cursor(off);
+        }
+        ensure_cursor_visible();
+        editor_ui_refresh();
+        standby_reset_timer();
+        return;
+    }
+
+    if (code == LV_EVENT_GESTURE) {
+        lv_indev_t *indev = lv_indev_active();
+        if (!indev) return;
+        lv_dir_t dir = lv_indev_get_gesture_dir(indev);
+        /* Reset the indev's gesture state so it does not fire again
+         * on the next refresh (LVGL leaves the last gesture latched
+         * until something consumes it). */
+        lv_indev_wait_release(indev);
+
+        int step = VISIBLE_LINES > 2 ? VISIBLE_LINES - 1 : 1;
+        if (dir == LV_DIR_TOP) {
+            /* Finger swiped up -> show content further down. Pan only
+             * the touched pane; keep the caret / focus put. */
+            touch_scroll_pane_by(pane_idx, +step);
+        } else if (dir == LV_DIR_BOTTOM) {
+            touch_scroll_pane_by(pane_idx, -step);
+        }
+        /* Horizontal swipes are ignored for now (no obvious editor
+         * action; could be wired to undo/redo later). */
+        return;
+    }
+}
+
+/* Tap-on-row helper for the menu / settings / file-browser lists.
+ * Stored as the LV_EVENT_CLICKED callback on every lv_list_add_btn
+ * (the row index is stuffed into the button's user_data).
+ *
+ * Behaviour: tap a row to highlight it (single click) and tap it
+ * again to activate (matching the keyboard's "arrow keys to focus
+ * + Enter to activate" flow). This avoids accidental activations
+ * on imprecise taps and lets the user inspect the highlight before
+ * committing. */
+typedef void (*list_activate_fn)(int idx);
+
+typedef struct {
+    int            *p_sel;       /* selection index storage */
+    int            *p_sel_prev;  /* selection-prev storage (NULL if none) */
+    lv_obj_t       *list;        /* list widget */
+    list_activate_fn activate;   /* fn to call when an already-selected row is tapped */
+    int             count;       /* number of items (for clamp) */
+} list_touch_ctx_t;
+
+/* One static context per touchable list. The refresh_*() functions
+ * fill these in (count, list) and rewire the click callbacks after
+ * (re)building rows so user_data is always in sync with the visible
+ * row order. */
+static list_touch_ctx_t s_menu_touch_ctx;
+static list_touch_ctx_t s_settings_touch_ctx;
+static list_touch_ctx_t s_browser_touch_ctx;
+
+static void list_touch_event_cb(lv_event_t *e)
+{
+    list_touch_ctx_t *ctx = (list_touch_ctx_t *)lv_event_get_user_data(e);
+    lv_obj_t *btn = (lv_obj_t *)lv_event_get_target(e);
+    if (!ctx || !ctx->p_sel || !btn) return;
+
+    /* The row index is the button's position among its siblings
+     * (LVGL keeps children in insertion order). Deriving it here
+     * avoids stomping the button's user_data slot, which the file
+     * browser uses to remember the entry index. */
+    int32_t idx32 = lv_obj_get_index(btn);
+    int idx = (int)idx32;
+    if (idx < 0 || idx >= ctx->count) return;
+
+    if (idx == *ctx->p_sel) {
+        /* Tapped the already-highlighted row -- activate it. */
+        if (ctx->activate) ctx->activate(idx);
+    } else {
+        /* First tap on a different row -- just move the highlight. */
+        if (ctx->p_sel_prev) *ctx->p_sel_prev = *ctx->p_sel;
+        *ctx->p_sel = idx;
+        update_list_highlight(ctx->list, *ctx->p_sel,
+                              ctx->p_sel_prev ? *ctx->p_sel_prev : -1);
+        if (ctx->p_sel_prev) *ctx->p_sel_prev = *ctx->p_sel;
+    }
+    standby_reset_timer();
+}
+
+/* Walk every row of `list` and attach list_touch_event_cb
+ * (LV_EVENT_CLICKED) with `ctx` as the user-data pointer. The row
+ * index is derived at click time via lv_obj_get_index() so each
+ * row's own user_data slot is left alone (the file browser uses
+ * that slot to store the underlying s_browser_entries[] index). */
+static void list_touch_attach(lv_obj_t *list, list_touch_ctx_t *ctx)
+{
+    if (!list || !ctx) return;
+    ctx->list = list;
+    uint32_t n = lv_obj_get_child_count(list);
+    ctx->count = (int)n;
+    for (uint32_t i = 0; i < n; i++) {
+        lv_obj_t *btn = lv_obj_get_child(list, (int32_t)i);
+        if (!btn) continue;
+        /* Remove any prior callback we registered so a second
+         * refresh_*() does not stack duplicates. */
+        lv_obj_remove_event_cb(btn, list_touch_event_cb);
+        lv_obj_add_event_cb(btn, list_touch_event_cb,
+                            LV_EVENT_CLICKED, ctx);
+    }
+}
+
+
+/* Tap handler for the BLE-prompt screen's upper-right "Off" button.
+ * Drops the device straight into deep sleep -- standby_enter_sleep()
+ * runs the pre-sleep autosave + per-board teardown the same way
+ * the inactivity timeout and the power-button long-press do, so
+ * this is the touch-only equivalent of those paths. */
+static void ble_prompt_off_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    standby_enter_sleep();
+}
+
+/* Tap handler for the BLE-prompt screen's "Forget KB" button.
+ * Clears all stored BLE keyboard pairings and immediately starts
+ * scanning for a new keyboard, allowing the user to pair with a
+ * different (or freshly reset) keyboard without needing a physical
+ * keyboard to navigate the settings menu. */
+static void ble_prompt_forget_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    ble_keyboard_forget_all();
+}
+
+#endif /* CONFIG_DRAFTLING_TOUCHSCREEN */
+
+/* ---- File browser ---- */
+
+/* The file browser status bar's "no transient message" text. Normally
+ * a fixed hint; while the SD card is handed to a USB host it instead
+ * reminds the user which keys still work (see commit_usb_msc_pending_mode()
+ * and the guards in browser_activate_item() / handle_browser_key()),
+ * since editor_ui_set_status()'s 3 s transient message would otherwise
+ * fade back to the normal (now-wrong) hint. Both call sites that used
+ * to hard-code "F1:Menu  N:New file" (editor_ui_show_file_browser()
+ * and restore_default_status()) go through this instead, so they and
+ * the auto-off idle timer (polled in key_drain_cb) all agree. */
+static void browser_status_hint(char *buf, size_t buf_size)
+{
+#if defined(CONFIG_DRAFTLING_HAS_USB_MSC)
+    usb_msc_mode_t mode = usb_msc_get_mode();
+    if (mode != USB_MSC_MODE_OFF) {
+        snprintf(buf, buf_size, "SD card via USB (%s) -- F1 to disable",
+                 mode == USB_MSC_MODE_READ_WRITE ? "read-write" : "read-only");
+        return;
+    }
+#endif
+    snprintf(buf, buf_size, "F1:Menu  N:New  F2:Rename");
+}
+
+static void refresh_file_list(const char *select_name = NULL)
+{
+    /* Remember the currently-selected entry's filename (if any) so we
+     * can restore the selection after the list is rebuilt. This keeps
+     * the highlight where the user left it when returning from the
+     * editor, and also preserves selection across a Git-sync refresh
+     * that added or removed files. select_name, when given, is
+     * selected instead (e.g. a file's new name after a rename). */
+    char remembered_name[sizeof(s_browser_entries[0].name)] = {0};
+    if (select_name) {
+        strncpy(remembered_name, select_name, sizeof(remembered_name) - 1);
+    } else if (s_browser_list && s_browser_sel >= 0 &&
+        s_browser_sel < (int)lv_obj_get_child_count(s_browser_list)) {
+        lv_obj_t *cur_btn = lv_obj_get_child(s_browser_list, s_browser_sel);
+        if (cur_btn) {
+            int cur_idx = (int)(intptr_t)lv_obj_get_user_data(cur_btn);
+            if (cur_idx >= 0 && cur_idx < s_browser_count) {
+                strncpy(remembered_name, s_browser_entries[cur_idx].name,
+                        sizeof(remembered_name) - 1);
+            }
+        }
+    }
+
+    const char *mp = sd_card_get_mount_point();
+    s_browser_count = sd_card_list_dir(mp, s_browser_entries, 64);
+    if (s_browser_count < 0) s_browser_count = 0;
+
+    /* Filter to show only documents (.md / .fountain / .txt) and
+     * directories */
+    lv_obj_clean(s_browser_list);
+
+    int restored_row = -1;
+    int row = 0;
+    for (int i = 0; i < s_browser_count; i++) {
+        const char *name = s_browser_entries[i].name;
+        bool show = s_browser_entries[i].is_dir;
+        if (!show) show = editor_path_format(name, NULL);
+        if (show) {
+            char label[sizeof(s_browser_entries[0].name) + 8];
+            if (s_browser_entries[i].is_dir)
+                snprintf(label, sizeof(label), "[DIR] %.255s", name);
+            else
+                snprintf(label, sizeof(label), "  %.255s", name);
+            lv_obj_t *btn = lv_list_add_btn(s_browser_list, NULL, label);
+            lv_obj_set_user_data(btn, (void *)(intptr_t)i);
+            if (remembered_name[0] && strcmp(name, remembered_name) == 0) {
+                restored_row = row;
+            }
+            row++;
+        }
+    }
+    s_browser_sel = (restored_row >= 0) ? restored_row : 0;
+    /* Clamp in case the list shrank below the saved selection. */
+    int new_count = (int)lv_obj_get_child_count(s_browser_list);
+    if (s_browser_sel >= new_count)
+        s_browser_sel = (new_count > 0) ? new_count - 1 : 0;
+    /* List was rebuilt -- no item carries a highlight yet, so the
+     * next update_list_highlight() call should not try to "clear"
+     * a stale previous selection. */
+    s_browser_sel_prev = -1;
+    /* Apply the editor theme colors (and initial highlight) to every
+     * row so list buttons render with theme_fg() text on theme_bg(),
+     * not the LVGL default greys that would be near-invisible on a
+     * black background. Mirror what refresh_menu_items() does. */
+    apply_list_selection_styles(s_browser_list, s_browser_sel);
+    s_browser_sel_prev = s_browser_sel;
+
+#if defined(CONFIG_DRAFTLING_TOUCHSCREEN)
+    /* Attach tap-to-select / tap-again-to-activate handlers to the
+     * file browser rows. Each row's user_data already carries the
+     * s_browser_entries[] index for the Enter-key path; the touch
+     * callback derives the visual row number via lv_obj_get_index()
+     * so user_data is preserved. */
+    s_browser_touch_ctx.p_sel      = &s_browser_sel;
+    s_browser_touch_ctx.p_sel_prev = &s_browser_sel_prev;
+    s_browser_touch_ctx.activate   = browser_activate_item;
+    list_touch_attach(s_browser_list, &s_browser_touch_ctx);
+#endif
+
+    sync_battery_labels();
+}
+
+extern "C" void editor_ui_show_file_browser(void)
+{
+    if (s_pane_count > 1) {
+        /* Split: overlay a compact file selector on just the focused
+         * pane, keeping the other pane's document on screen. The editor
+         * screen stays active; the in-pane selector flag (checked first
+         * in process_key_event) reroutes keys to the browser handler. */
+
+        /* The in-pane selector is drawn as a child of the editor screen
+         * (s_scr). At boot (or after a BLE (re)connect) the split layout
+         * is restored before any editor screen has been loaded -- the
+         * active LVGL screen is still the BLE prompt. Loading the overlay
+         * onto an off-screen canvas leaves the prompt frozen on screen
+         * and swallows keystrokes, so make the editor screen active and
+         * paint both panes before overlaying the selector. */
+        s_editor_screen_active = true;
+        if (lv_scr_act() != s_scr) {
+            lv_scr_load(s_scr);
+            editor_ui_refresh();
+        }
+        show_inpane_browser();
+        return;
+    }
+
+    /* Mark the browser as the active screen up front so key routing and
+     * refresh gating switch over immediately, regardless of the focused
+     * pane's per-document editor mode (see s_editor_screen_active). */
+    s_editor_screen_active = false;
+
+    /* Single-pane: opening a file replaces the current document, so
+     * close it now (historical behavior; the buffer is reloaded
+     * from disk when a file is picked). */
+    editor_close_file();
+    s_open_target_pane = 0;
+    /* Operate on the full-screen browser list. */
+    s_browser_list = s_list_files;
+    refresh_file_list();
+
+    /* The Wi-Fi connection state is conveyed by the Wi-Fi icon; the
+     * status bar shows the static hint so it doesn't compete with
+     * transient messages (e.g. Git-sync progress). */
+    if (s_lbl_br_status) {
+        char hint[64];
+        browser_status_hint(hint, sizeof(hint));
+        lv_label_set_text(s_lbl_br_status, hint);
+    }
+
+    sync_battery_labels();
+#if defined(CONFIG_DRAFTLING_DISPLAY_EPD)
+    /* This is the actual boot-time first screen on e-paper (the boot
+     * flow shows the file browser before the editor -- see
+     * editor_ui_init()). epd_full_screen_repaint() doesn't apply here:
+     * it only invalidates s_scr (the editor screen), not s_scr_browser,
+     * so it wouldn't force this screen's own widgets to redraw. Same
+     * underlying issue as the two lv_scr_load() call sites already
+     * fixed for the editor screen (apply_pending_connect_state()'s
+     * restore branch, editor_ui_show_editor()): a bare lv_scr_load()
+     * does not reliably force every child widget to redraw from a
+     * blank/stale framebuffer on this backend. Wipe the framebuffer
+     * and invalidate this screen explicitly instead of relying on
+     * lv_scr_load() alone. */
+    display_clear(0xFF);
+    lv_obj_invalidate(s_scr_browser);
+#endif
+    lv_scr_load(s_scr_browser);
+}
+
+extern "C" void editor_ui_show_editor(void)
+{
+    s_editor_screen_active = true;
+    editor_set_mode(EDITOR_MODE_EDITING);
+    sync_battery_labels();
+    lv_scr_load(s_scr);
+#if defined(CONFIG_DRAFTLING_DISPLAY_EPD)
+    /* This is the actual boot-time path into the editor on e-paper --
+     * the boot flow shows the file browser first (see editor_ui_init()),
+     * so this runs on the very first file/new-file pick of a session,
+     * not apply_pending_connect_state()'s "restore" branch (which only
+     * applies to a *second* connect after the editor was already
+     * showing). Same missing-repaint bug: refresh_active_pane()'s
+     * per-line cache and update_title_bar()'s s_prev_title are not
+     * reset by a bare lv_scr_load()+editor_ui_refresh(), so a screen
+     * that starts blank (as s_scr does before its first real paint)
+     * stays blank until something else forces a full redraw. Matches
+     * the fix already applied to apply_pending_connect_state(). */
+    epd_full_screen_repaint();
+#endif
+    editor_ui_refresh();
+}
+
+/* Available pixel width for the editor's bottom status label.
+ * Reserves room on the right for the battery percentage (when the
+ * board has a battery) and the small WiFi icon, so the status text
+ * never overlaps them and -- importantly -- never wraps to a second
+ * line (which would extend past SCR_H and cause LVGL to draw a
+ * screen scrollbar). The numbers mirror the layout in build_screens()
+ * for s_lbl_dev_batt and s_img_wifi. */
+static int status_avail_width(void)
+{
+    int right_reserved;
+#if defined(CONFIG_DRAFTLING_HAS_BATTERY)
+    /* Battery occupies SCR_W-80..SCR_W-2; WiFi icon sits at SCR_W-95.
+     * Leave a 2 px gap to the wifi icon. */
+    right_reserved = 95 + 2;
+#else
+    /* No battery; only the wifi icon at SCR_W-15. */
+    right_reserved = 15 + 2;
+#endif
+    int avail = SCR_W - 2 /* left margin */ - right_reserved;
+    if (avail < 0) avail = 0;
+    return avail;
+}
+
+/* Hide the editor's status label when its current text is wider than
+ * the available area (so only the battery percentage remains visible
+ * in the bottom bar); show it otherwise. Greybeard is monospaced, so
+ * the rendered width is utf8_chars * char_width(FONT_11). */
+static void update_status_visibility(void)
+{
+    if (!s_lbl_status) return;
+    const char *text = lv_label_get_text(s_lbl_status);
+    if (!text) text = "";
+    int chars = utf8_chars_in_bytes(text, strlen(text));
+    int text_w = chars * char_width_for_font(FONT_11);
+    if (text_w > status_avail_width()) {
+        lv_obj_add_flag(s_lbl_status, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_remove_flag(s_lbl_status, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+/* Default status-bar text for the editor screen. Kept in one place
+ * so the auto-clear timer and the initial label setup agree. */
+#define EDITOR_DEFAULT_STATUS \
+    "F1:Menu Ctrl+S:Save Ctrl+L:Layout Ctrl+G:Git Esc:Files"
+
+/* Restore the status bar of both screens to its standard, no-message
+ * state (the same text the screens show when they are first entered).
+ * The WiFi connection state is communicated by the Wi-Fi icon in the
+ * title / status bar, so the default text never mentions it -- otherwise
+ * it would reappear between transient Git-sync progress messages and
+ * confuse the user. */
+static void restore_default_status(void)
+{
+    if (s_lbl_status) {
+        lv_label_set_text(s_lbl_status, EDITOR_DEFAULT_STATUS);
+    }
+    update_status_visibility();
+    if (s_lbl_br_status) {
+        char hint[64];
+        browser_status_hint(hint, sizeof(hint));
+        lv_label_set_text(s_lbl_br_status, hint);
+    }
+}
+
+/* One-shot LVGL timer callback: clear the transient status message. */
+static void status_clear_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    /* The timer auto-deletes after firing because we set its repeat
+     * count to 1, so just drop our reference. */
+    s_status_clear_timer = NULL;
+    restore_default_status();
+}
+
+/* Cancel any pending auto-clear timer and restore the default status
+ * bar text immediately. Safe to call when no timer is pending (no-op
+ * in that case). Used by call sites that act as the "user moved on"
+ * signal -- e.g. selecting a different file in the browser. */
+static void cancel_status_clear_and_restore(void)
+{
+    if (s_status_clear_timer) {
+        lv_timer_delete(s_status_clear_timer);
+        s_status_clear_timer = NULL;
+        restore_default_status();
+    }
+}
+
+/* Internal: post a status message with a caller-chosen auto-clear
+ * timeout. editor_ui_set_status() is the public wrapper that picks
+ * the standard 3-second window. */
+static void set_status_with_timeout(const char *msg, uint32_t timeout_ms)
+{
+    ESP_LOGI(TAG, "Status: %s", msg);
+    if (s_lbl_status) lv_label_set_text(s_lbl_status, msg);
+    if (s_lbl_br_status) lv_label_set_text(s_lbl_br_status, msg);
+    update_status_visibility();
+    if (s_status_clear_timer) {
+        lv_timer_delete(s_status_clear_timer);
+        s_status_clear_timer = NULL;
+    }
+    if (timeout_ms > 0) {
+        s_status_clear_timer = lv_timer_create(status_clear_timer_cb, timeout_ms, NULL);
+        if (s_status_clear_timer) {
+            lv_timer_set_repeat_count(s_status_clear_timer, 1);
+        }
+    }
+    sync_battery_labels();
+}
+
+extern "C" void editor_ui_set_status(const char *msg)
+{
+    /* Auto-clear the message after 3 seconds so transient errors
+     * (e.g. "File too large") do not linger after the user has moved
+     * on to a different file or screen. The timer is one-shot and is
+     * recreated on every set_status call, so successive messages each
+     * get their own 3-second window. */
+    set_status_with_timeout(msg, 3000);
+}
+
+extern "C" void editor_ui_show_fatal(const char *msg)
+{
+    /* Full-screen, centered, word-wrapped variant of
+     * editor_ui_set_status() for unrecoverable boot-time errors
+     * (e.g. ESP-Hosted link to the on-board ESP32-C6 not coming up).
+     *
+     * The regular status label is FONT_11 with LV_LABEL_LONG_CLIP and
+     * a width constrained by status_avail_width(), so a multi-line
+     * instruction message would be silently clipped to its first line.
+     * Instead we build a dedicated screen and load it, so the message
+     * fills the panel and survives any future editor_ui_set_status()
+     * calls. The screen stays on until power-cycle / reset. */
+    ESP_LOGE(TAG, "Fatal: %s", msg);
+    if (!msg) msg = "";
+
+    lv_obj_t *scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, theme_bg(), 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(scr, 10, 0);
+    lv_obj_set_style_border_width(scr, 0, 0);
+    lv_obj_set_scrollbar_mode(scr, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *lbl = lv_label_create(scr);
+    lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(lbl, SCR_W - 20);
+    lv_obj_set_style_text_font(lbl, FONT_14, 0);
+    lv_obj_set_style_text_color(lbl, theme_fg(), 0);
+    lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_text(lbl, msg);
+    lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 0);
+
+    lv_scr_load(scr);
+}
+
+extern "C" void editor_ui_set_board_name(const char *name)
+{
+    s_board_name = name;
+}
+
+extern "C" void editor_ui_set_ble_prompt_text(const char *text)
+{
+    /* Update the bottom-half label on the boot "BLE prompt" screen.
+     * editor_ui_init() loads this screen with a generic "Initializing..."
+     * caption because at that point we do not yet know whether a
+     * USB keyboard will enumerate; main.cpp calls this function once
+     * it has decided to bring up BLE, so the "Searching for BLE
+     * keyboard..." message only appears on the no-USB path. */
+    if (!s_ble_prompt_lbl || !text) return;
+    lv_label_set_text(s_ble_prompt_lbl, text);
+}
+
+/* Apply the "selected" styling to item `sel` and the "unselected"
+ * styling to every other item.  Used after a full list rebuild. */
+static void apply_list_selection_styles(lv_obj_t *list, int sel)
+{
+    uint32_t count = lv_obj_get_child_count(list);
+    for (uint32_t i = 0; i < count; i++) {
+        lv_obj_t *child = lv_obj_get_child(list, i);
+        if ((int)i == sel) {
+            lv_obj_set_style_bg_color(child, theme_fg(), 0);
+            lv_obj_set_style_bg_opa(child, LV_OPA_COVER, 0);
+            lv_obj_set_style_text_color(child, theme_bg(), 0);
+        } else {
+            lv_obj_set_style_bg_opa(child, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_text_color(child, theme_fg(), 0);
+        }
+    }
+    /* After a full rebuild make sure the selected row is on screen.
+     * Without this, a list taller than the panel (e.g. on PaperS3 with
+     * the larger Hack font) keeps its previous scroll offset
+     * and the highlight may land outside the visible area. */
+    if (sel >= 0 && (uint32_t)sel < count) {
+        lv_obj_scroll_to_view(lv_obj_get_child(list, sel), LV_ANIM_OFF);
+    }
+}
+
+/* Move the highlight from `prev_sel` to `sel` by restyling only those
+ * two items.  This keeps the LVGL dirty rectangle limited to a couple
+ * of menu rows instead of the whole list, so e-paper backends can
+ * issue a partial refresh of just the affected area on Up/Down
+ * navigation. */
+static void update_list_highlight(lv_obj_t *list, int sel, int prev_sel)
+{
+    if (prev_sel == sel) return;
+    uint32_t count = lv_obj_get_child_count(list);
+    if (prev_sel >= 0 && (uint32_t)prev_sel < count) {
+        lv_obj_t *prev = lv_obj_get_child(list, prev_sel);
+        lv_obj_set_style_bg_opa(prev, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_text_color(prev, theme_fg(), 0);
+    }
+    if (sel >= 0 && (uint32_t)sel < count) {
+        lv_obj_t *cur = lv_obj_get_child(list, sel);
+        lv_obj_set_style_bg_color(cur, theme_fg(), 0);
+        lv_obj_set_style_bg_opa(cur, LV_OPA_COVER, 0);
+        lv_obj_set_style_text_color(cur, theme_bg(), 0);
+        /* Scroll the list so the highlighted row is always visible.
+         * Needed when the list is taller than the panel (e.g. on
+         * PaperS3 with the larger Hack font, where only a few
+         * items fit on screen).  LV_ANIM_OFF avoids smooth-scroll
+         * animation, which would force many extra e-paper refreshes. */
+        lv_obj_scroll_to_view(cur, LV_ANIM_OFF);
+    }
+}
+
+/* F1 menu letter accelerators. Each entry names the menu row, the
+ * letter that picks it (resolved with kb_layout_shortcut_char(), like
+ * the file browser's N) and the character index of that letter in the
+ * row's label, which menu_hotkey_draw_cb() paints bold. Every label
+ * text before the marked letter is ASCII, so the index is also a byte
+ * offset. */
+struct menu_hotkey_t {
+    int  idx;
+    char key;
+    int  pos;
+};
+
+static const menu_hotkey_t s_menu_hotkeys[] = {
+    { MENU_IDX_SETTINGS,        's', 0  },  /* "Settings..." */
+    { MENU_IDX_BLE_SCAN,        'b', 0  },  /* "BLE: Start scan" */
+    { MENU_IDX_WIFI_CONNECT,    'w', 0  },  /* "WiFi: ..." */
+    { MENU_IDX_WIFI_NEW,        'n', 6  },  /* "WiFi: New connection..." */
+    { MENU_IDX_WIFI_DISCONNECT, 'd', 6  },  /* "WiFi: Disconnect" */
+    { MENU_IDX_GIT_SYNC,        'g', 0  },  /* "Git Sync" */
+    { MENU_IDX_DRAFTBOX,        'c', 0  },  /* "Connect a Draftbox repository..." */
+    { MENU_IDX_KB_LAYOUT,       'k', 0  },  /* "Keyboard: ..." */
+#if defined(CONFIG_DRAFTLING_HAS_USB_MSC)
+    { MENU_IDX_USB_MSC,         'u', 12 },  /* "SD card via USB: ..." */
+#endif
+    { MENU_IDX_FORMAT_SD,       'f', 0  },  /* "Format SD card..." */
+    { MENU_IDX_HWINFO,          'i', 9  },  /* "Hardware information" */
+    { MENU_IDX_HELP,            'h', 0  },  /* "Help (F10)" */
+};
+
+/* Faux-bold spills a pixel or two past the label box. */
+static void menu_hotkey_ext_size_cb(lv_event_t *e)
+{
+    lv_event_set_ext_draw_size(e, 2);
+}
+
+/* LV_EVENT_DRAW_MAIN_END handler of a menu row label: redraws the
+ * accelerator letter one pixel to the right (the editor's faux-bold,
+ * see line_deco_draw_cb()). lv_list labels scroll circularly when the
+ * text does not fit, so follow the label's scroll offset and its
+ * second, wrapped-around copy the same way lv_label draws them. */
+static void menu_hotkey_draw_cb(lv_event_t *e)
+{
+    uint32_t ci = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+    lv_obj_t *label = lv_event_get_target_obj(e);
+    lv_layer_t *layer = lv_event_get_layer(e);
+    const char *txt = lv_label_get_text(label);
+    if (!txt || strlen(txt) <= ci) return;
+
+    const lv_font_t *font = lv_obj_get_style_text_font(label, LV_PART_MAIN);
+    int32_t bdx = lv_font_get_line_height(font) >= 40 ? 2 : 1;
+    lv_area_t ca;
+    lv_obj_get_content_coords(label, &ca);
+    lv_point_t pos;
+    lv_label_get_letter_pos(label, ci, &pos);
+
+    lv_draw_label_dsc_t ld;
+    lv_draw_label_dsc_init(&ld);
+    ld.font  = font;
+    ld.opa   = LV_OPA_COVER;
+    ld.color = lv_obj_get_style_text_color(label, LV_PART_MAIN);
+
+    const lv_label_t *lb = (const lv_label_t *)label;
+    int32_t x = ca.x1 + pos.x + lb->offset.x + bdx;
+    int32_t y = ca.y1 + pos.y + lb->offset.y;
+    int32_t wrap = 0;
+    if (lb->long_mode == LV_LABEL_LONG_MODE_SCROLL_CIRCULAR &&
+        lb->text_size.x > lv_area_get_width(&ca)) {
+        wrap = lb->text_size.x +
+               lv_font_get_glyph_width(font, ' ', ' ') * LV_LABEL_WAIT_CHAR_COUNT;
+    }
+
+    lv_area_t orig = layer->_clip_area;
+    lv_area_t clip = {
+        LV_MAX(orig.x1, ca.x1), LV_MAX(orig.y1, ca.y1),
+        LV_MIN(orig.x2, ca.x2 + bdx), LV_MIN(orig.y2, ca.y2)
+    };
+    if (clip.x1 > clip.x2 || clip.y1 > clip.y2) return;
+    layer->_clip_area = clip;
+    lv_point_t pt = { x, y };
+    lv_draw_character(layer, &ld, &pt, (uint8_t)txt[ci]);
+    if (wrap) {
+        pt.x = x + wrap;
+        lv_draw_character(layer, &ld, &pt, (uint8_t)txt[ci]);
+    }
+    layer->_clip_area = orig;
+}
+
+/* Mark the accelerator letters of the freshly built menu rows. */
+static void menu_mark_hotkeys(void)
+{
+    for (const menu_hotkey_t &h : s_menu_hotkeys) {
+        lv_obj_t *btn = lv_obj_get_child(s_menu_list, h.idx);
+        lv_obj_t *lbl = btn ? lv_obj_get_child(btn, 0) : NULL;
+        if (!lbl) continue;
+        lv_obj_add_event_cb(lbl, menu_hotkey_ext_size_cb,
+                            LV_EVENT_REFR_EXT_DRAW_SIZE, NULL);
+        lv_obj_add_event_cb(lbl, menu_hotkey_draw_cb, LV_EVENT_DRAW_MAIN_END,
+                            (void *)(uintptr_t)h.pos);
+        lv_obj_refresh_ext_draw_size(lbl);
+    }
+}
+
+static void refresh_menu_items(void)
+{
+    lv_obj_clean(s_menu_list);
+
+    char buf[80];
+
+    /* 0: Settings */
+    lv_list_add_btn(s_menu_list, NULL, "Settings...");
+
+    /* 1: BLE status */
+    snprintf(buf, sizeof(buf), "BLE: %s",
+             ble_keyboard_is_connected()
+                 ? ble_keyboard_get_device_name()
+                 : "not connected");
+    lv_list_add_btn(s_menu_list, NULL, buf);
+
+    /* 2: BLE scan */
+    lv_list_add_btn(s_menu_list, NULL, "BLE: Start scan");
+
+    /* 3: WiFi status / connect to the configured (wifi.cfg / NVS) SSID */
+    if (wifi_manager_is_connected()) {
+        snprintf(buf, sizeof(buf), "WiFi: %s (%s)",
+                 wifi_manager_get_ssid(), wifi_manager_get_ip());
+    } else {
+        char cfg_ssid[33];
+        if (wifi_manager_get_configured_ssid(cfg_ssid, sizeof(cfg_ssid))) {
+            snprintf(buf, sizeof(buf), "WiFi: Connect to %s", cfg_ssid);
+        } else {
+            snprintf(buf, sizeof(buf), "WiFi: Connect (not configured)");
+        }
+    }
+    lv_list_add_btn(s_menu_list, NULL, buf);
+
+    /* 4: WiFi scan / pick a new network */
+    lv_list_add_btn(s_menu_list, NULL, "WiFi: New connection...");
+
+    /* 5: WiFi disconnect */
+    lv_list_add_btn(s_menu_list, NULL, "WiFi: Disconnect");
+
+    /* 6: Git sync */
+    snprintf(buf, sizeof(buf), "Git Sync%s",
+             git_sync_is_configured() ? "" : " (not configured)");
+    lv_list_add_btn(s_menu_list, NULL, buf);
+
+    /* 7: Draftbox one-time password -> git.cfg */
+    lv_list_add_btn(s_menu_list, NULL, "Connect a Draftbox repository...");
+
+    /* 8: Keyboard layout */
+    snprintf(buf, sizeof(buf), "Keyboard: %s  (Enter to cycle)",
+             kb_layout_name(kb_layout_get()));
+    lv_list_add_btn(s_menu_list, NULL, buf);
+
+#if defined(CONFIG_DRAFTLING_HAS_USB_MSC)
+    /* 9: SD card via USB. Shows the staged choice (s_usbmsc_pending_mode),
+     * not necessarily what usb_msc is doing right now -- see the
+     * picker opened from menu_activate_item() and applied by
+     * commit_usb_msc_pending_mode(). See usbmsc_item_disabled() for
+     * when it is disabled instead. */
+    if (usbmsc_item_disabled()) {
+        snprintf(buf, sizeof(buf), "SD card via USB: (no SD card)");
+    } else {
+        snprintf(buf, sizeof(buf), "SD card via USB: %s  (Enter to change)",
+                 usb_msc_mode_name(s_usbmsc_pending_mode));
+    }
+    lv_list_add_btn(s_menu_list, NULL, buf);
+#endif
+
+    /* Format SD card */
+    lv_list_add_btn(s_menu_list, NULL,
+                    sd_card_get_handle() ? "Format SD card..."
+                                         : "Format SD card... (no SD card)");
+
+    /* Hardware information */
+    lv_list_add_btn(s_menu_list, NULL, "Hardware information");
+
+    /* Help */
+    lv_list_add_btn(s_menu_list, NULL, "Help (F10)");
+
+    /* Sleep now */
+    lv_list_add_btn(s_menu_list, NULL, "Sleep now");
+
+    /* Close menu */
+    lv_list_add_btn(s_menu_list, NULL, "Close menu (Esc / F1)");
+
+    menu_mark_hotkeys();
+
+    /* Highlight selection */
+    apply_list_selection_styles(s_menu_list, s_menu_sel);
+    s_menu_sel_prev = s_menu_sel;
+
+#if defined(CONFIG_DRAFTLING_TOUCHSCREEN)
+    /* Attach tap-to-select / tap-again-to-activate handlers to every
+     * row. The selection state is owned by the menu itself, so we
+     * pass the addresses of s_menu_sel / s_menu_sel_prev. */
+    s_menu_touch_ctx.p_sel      = &s_menu_sel;
+    s_menu_touch_ctx.p_sel_prev = &s_menu_sel_prev;
+    s_menu_touch_ctx.activate   = menu_activate_item;
+    list_touch_attach(s_menu_list, &s_menu_touch_ctx);
+#endif
+
+    sync_battery_labels();
+}
+
+/* Move only the highlight bar without rebuilding the list. */
+static void update_menu_highlight(void)
+{
+    update_list_highlight(s_menu_list, s_menu_sel, s_menu_sel_prev);
+    s_menu_sel_prev = s_menu_sel;
+}
+
+static void show_menu(void)
+{
+    s_menu_open = true;
+    s_menu_sel = 0;
+    /* Defensive reset: every normal exit from the picker / password
+     * prompt (Enter or Esc) already clears these, so this is only a
+     * safety net against a stale flag surviving some other path back
+     * to the top-level menu. */
+    s_wifi_scan_picker_open = false;
+    s_wifi_pw_open = false;
+    if (s_wifi_pw_panel) lv_obj_add_flag(s_wifi_pw_panel, LV_OBJ_FLAG_HIDDEN);
+    s_dbx_open = false;
+    if (s_dbx_panel) lv_obj_add_flag(s_dbx_panel, LV_OBJ_FLAG_HIDDEN);
+    s_fmt_step = FMT_STEP_NONE;
+    if (s_lbl_menu_hdr) lv_label_set_text(s_lbl_menu_hdr, MENU_HDR_TEXT);
+#if defined(CONFIG_DRAFTLING_HAS_USB_MSC)
+    /* Sync the staged choice to whatever usb_msc is actually doing
+     * right now -- picks up an auto-off that happened while the menu
+     * was closed. (Leaving the picker itself, Enter or Esc, already
+     * commits any staged choice -- see close_usbmsc_picker() -- so
+     * this should normally be a no-op.) */
+    s_usbmsc_picker_open = false;
+    s_usbmsc_pending_mode = usb_msc_get_mode();
+#endif
+    refresh_menu_items();
+    sync_battery_labels();
+#if defined(CONFIG_DRAFTLING_DISPLAY_EPD)
+    /* Same missing-repaint bug already fixed for the editor, file
+     * browser, and BLE-prompt-restore screen transitions: a bare
+     * lv_scr_load() does not reliably force this screen's widgets to
+     * redraw from a stale framebuffer on this backend.
+     * epd_full_screen_repaint() doesn't apply here -- it only
+     * invalidates s_scr (the editor screen), not s_scr_menu. */
+    display_clear(0xFF);
+    lv_obj_invalidate(s_scr_menu);
+#endif
+    lv_scr_load(s_scr_menu);
+}
+
+#if defined(CONFIG_DRAFTLING_HAS_USB_MSC)
+/* Called by close_usbmsc_picker() right after leaving the "SD card via
+ * USB" picker (Enter or Esc): applies s_usbmsc_pending_mode if it
+ * differs from what usb_msc is actually doing right now. Esc leaves
+ * s_usbmsc_pending_mode unchanged, so this is a no-op in that case.
+ *
+ * Turning it off restarts the device (see usb_msc.h) -- this function
+ * does not return in that case. */
+static void commit_usb_msc_pending_mode(void)
+{
+    usb_msc_mode_t cur = usb_msc_get_mode();
+    if (s_usbmsc_pending_mode == cur) return;
+
+    if (s_usbmsc_pending_mode == USB_MSC_MODE_OFF) {
+        usb_msc_set_mode(USB_MSC_MODE_OFF);
+        /* usb_msc_set_mode(OFF) alone does not give the ESP32-S3's
+         * native USB pins back to USB-Serial-JTAG (flashing, and
+         * usually the console too, on these single-USB-port boards)
+         * -- see usb_msc.h. Restart now rather than leave the board
+         * unflashable until a physical reset; a status message here
+         * would never actually be seen, since the restart cuts it
+         * off before the next LVGL flush. */
+        ESP_LOGI(TAG, "Restarting to restore USB-Serial-JTAG after SD-via-USB");
+        esp_restart();
+        /* does not return */
+    }
+
+    if (cur == USB_MSC_MODE_OFF) {
+        /* Taking the card away from local editing for the first time:
+         * auto-save whatever is open and collapse any split so no
+         * pane is left trying to save into the now-USB-owned card,
+         * then force the file browser -- close_menu() routes there
+         * whenever s_editor_screen_active is false, once the user
+         * eventually leaves the F1 menu too. */
+        if (editor_is_modified() && editor_get_file_path()) {
+            editor_save_file();
+        }
+        editor_ui_apply_split_mode(SPLIT_NONE);
+        s_editor_screen_active = false;
+    }
+
+    esp_err_t err = usb_msc_set_mode(s_usbmsc_pending_mode);
+    if (err != ESP_OK) {
+        s_usbmsc_pending_mode = usb_msc_get_mode();
+        editor_ui_set_status("SD card via USB: failed to start (no SD card?)");
+        return;
+    }
+
+    editor_ui_set_status(s_usbmsc_pending_mode == USB_MSC_MODE_READ_WRITE
+                          ? "SD card via USB: Read-write"
+                          : "SD card via USB: Read-only");
+}
+#endif
+
+static void close_menu(void)
+{
+    s_menu_open = false;
+    if (s_editor_screen_active)
+        editor_ui_show_editor();
+    else
+        editor_ui_show_file_browser();
+}
+
+/* ---- Settings screen ---- */
+
+static int find_timeout_option(uint32_t sec)
+{
+    for (int i = 0; i < TIMEOUT_OPTION_COUNT; i++) {
+        if (TIMEOUT_OPTIONS[i] == sec) return i;
+    }
+    return 2; /* default to 10 min */
+}
+
+/* ---- Settings menu items ----
+ * Indices vary slightly between monochrome and color builds; on
+ * color LCDs an extra "Color theme" item is inserted after the font
+ * size. Use the SETTINGS_IDX_* constants instead of bare integers
+ * everywhere downstream so the two layouts stay in lock-step.
+ *
+ * Backlight is gated separately on CONFIG_DRAFTLING_DISPLAY_HAS_BACKLIGHT
+ * so reflective-LCD / e-paper builds (no controllable backlight) skip
+ * the entry entirely. */
+#define SETTINGS_IDX_TIMEOUT  0
+#define SETTINGS_IDX_FONTSZ   1
+#define SETTINGS_IDX_MAXFILE  2
+#if defined(CONFIG_DRAFTLING_DISPLAY_HAS_BACKLIGHT) && !defined(CONFIG_DRAFTLING_DISPLAY_BACKLIGHT_BINARY)
+#define SETTINGS_IDX_BACKLIGHT 3
+#define _SETTINGS_NEXT_AFTER_BACKLIGHT 4
+#else
+#define SETTINGS_IDX_BACKLIGHT (-1)
+#define _SETTINGS_NEXT_AFTER_BACKLIGHT 3
+#endif
+#if defined(CONFIG_DRAFTLING_DISPLAY_COLOR)
+#define SETTINGS_IDX_THEME    (_SETTINGS_NEXT_AFTER_BACKLIGHT + 0)
+#define _SETTINGS_NEXT_AFTER_THEME (_SETTINGS_NEXT_AFTER_BACKLIGHT + 1)
+#else
+#define SETTINGS_IDX_THEME    (-1)
+#define _SETTINGS_NEXT_AFTER_THEME (_SETTINGS_NEXT_AFTER_BACKLIGHT + 0)
+#endif
+#if defined(CONFIG_DRAFTLING_DISPLAY_CAN_ROTATE)
+#define SETTINGS_IDX_ROTATE   (_SETTINGS_NEXT_AFTER_THEME + 0)
+#define _SETTINGS_NEXT_AFTER_ROTATE (_SETTINGS_NEXT_AFTER_THEME + 1)
+#else
+#define SETTINGS_IDX_ROTATE   (-1)
+#define _SETTINGS_NEXT_AFTER_ROTATE (_SETTINGS_NEXT_AFTER_THEME + 0)
+#endif
+#if defined(CONFIG_DRAFTLING_DISPLAY_CAN_INVERT)
+#define SETTINGS_IDX_INVERT   (_SETTINGS_NEXT_AFTER_ROTATE + 0)
+#define _SETTINGS_NEXT_AFTER_INVERT (_SETTINGS_NEXT_AFTER_ROTATE + 1)
+#else
+#define SETTINGS_IDX_INVERT   (-1)
+#define _SETTINGS_NEXT_AFTER_INVERT (_SETTINGS_NEXT_AFTER_ROTATE + 0)
+#endif
+#define SETTINGS_IDX_APPEND_ONLY   (_SETTINGS_NEXT_AFTER_INVERT + 0)
+#define SETTINGS_IDX_LAYOUTS       (_SETTINGS_NEXT_AFTER_INVERT + 1)
+#define SETTINGS_IDX_ORIENTATION   (_SETTINGS_NEXT_AFTER_INVERT + 2)
+#define _SETTINGS_NEXT_AFTER_ORIENTATION (_SETTINGS_NEXT_AFTER_INVERT + 3)
+#if defined(CONFIG_DRAFTLING_DISPLAY_CAN_ROTATE)
+/* Boards with the live-apply "Rotate 180" toggle above already offer
+ * this exact turn with no restart needed; do not also offer a second,
+ * restart-requiring way to do the same thing. */
+#define SETTINGS_IDX_UPSIDE_DOWN   (-1)
+#define _SETTINGS_NEXT_AFTER_UPSIDE_DOWN _SETTINGS_NEXT_AFTER_ORIENTATION
+#else
+#define SETTINGS_IDX_UPSIDE_DOWN   (_SETTINGS_NEXT_AFTER_ORIENTATION + 0)
+#define _SETTINGS_NEXT_AFTER_UPSIDE_DOWN (_SETTINGS_NEXT_AFTER_ORIENTATION + 1)
+#endif
+#define SETTINGS_IDX_MARGIN_LEFT   (_SETTINGS_NEXT_AFTER_UPSIDE_DOWN + 0)
+#define SETTINGS_IDX_MARGIN_RIGHT  (_SETTINGS_NEXT_AFTER_UPSIDE_DOWN + 1)
+#define SETTINGS_IDX_MARGIN_TOP    (_SETTINGS_NEXT_AFTER_UPSIDE_DOWN + 2)
+#define SETTINGS_IDX_MARGIN_BOTTOM (_SETTINGS_NEXT_AFTER_UPSIDE_DOWN + 3)
+/* "Sleep now" used to live here; it now lives in the F1 menu. */
+#define SETTINGS_IDX_RESET    (_SETTINGS_NEXT_AFTER_UPSIDE_DOWN + 4)
+#define SETTINGS_IDX_BACK     (_SETTINGS_NEXT_AFTER_UPSIDE_DOWN + 5)
+#define SETTINGS_ITEM_COUNT   (_SETTINGS_NEXT_AFTER_UPSIDE_DOWN + 6)
+
+static void refresh_settings_items(void)
+{
+    lv_obj_clean(s_settings_list);
+
+    char buf[80];
+    uint32_t cur = standby_get_timeout();
+    const char *cur_label = "custom";
+    int idx = find_timeout_option(cur);
+    if (idx >= 0 && idx < TIMEOUT_OPTION_COUNT)
+        cur_label = TIMEOUT_LABELS[idx];
+
+    /* Standby timeout */
+    snprintf(buf, sizeof(buf), "Standby timeout: %s", cur_label);
+    lv_list_add_btn(s_settings_list, NULL, buf);
+
+    /* Base font size */
+    {
+        int fi = find_font_size_option(s_font_size);
+        snprintf(buf, sizeof(buf), "Base font size: %s",
+                 FONT_SIZE_LABELS[fi]);
+        lv_list_add_btn(s_settings_list, NULL, buf);
+    }
+
+    /* Max file size (read-only).
+     * Sized dynamically by editor_init() from the PSRAM that was free
+     * at boot; surface it here so the user knows the hard upper limit
+     * for files they can open. */
+    snprintf(buf, sizeof(buf), "Max file size: %u KB (read-only)",
+             (unsigned)(editor_get_max_doc_size() / 1024));
+    lv_list_add_btn(s_settings_list, NULL, buf);
+
+#if defined(CONFIG_DRAFTLING_DISPLAY_HAS_BACKLIGHT) && !defined(CONFIG_DRAFTLING_DISPLAY_BACKLIGHT_BINARY)
+    /* Backlight brightness (LCD boards with a controllable backlight) */
+    snprintf(buf, sizeof(buf), "Backlight: %d%%", s_backlight_pct);
+    lv_list_add_btn(s_settings_list, NULL, buf);
+#endif
+
+#if defined(CONFIG_DRAFTLING_DISPLAY_COLOR)
+    /* Color theme (color LCDs only) */
+    snprintf(buf, sizeof(buf), "Color theme: %s",
+             COLOR_THEMES[s_theme_idx].name);
+    lv_list_add_btn(s_settings_list, NULL, buf);
+#endif
+
+#if defined(CONFIG_DRAFTLING_DISPLAY_CAN_ROTATE)
+    /* Runtime 180-degree display flip */
+    snprintf(buf, sizeof(buf), "Rotate 180: %s",
+             s_rotate180 ? "on" : "off");
+    lv_list_add_btn(s_settings_list, NULL, buf);
+#endif
+
+#if defined(CONFIG_DRAFTLING_DISPLAY_CAN_INVERT)
+    /* Inverted screen */
+    snprintf(buf, sizeof(buf), "Inverted screen: %s",
+             s_invert ? "on" : "off");
+    lv_list_add_btn(s_settings_list, NULL, buf);
+#endif
+
+    /* Append-only editing */
+    snprintf(buf, sizeof(buf), "Append-only editing: %s",
+             s_append_only ? "on" : "off");
+    lv_list_add_btn(s_settings_list, NULL, buf);
+
+    /* Active language layouts -- comma-separated summary of the
+     * layouts Ctrl+L / Win+Space currently rotate through. */
+    {
+        char names[64] = "";
+        for (int i = 0; i < KB_LAYOUT_COUNT; i++) {
+            kb_layout_id_t id = (kb_layout_id_t)i;
+            if (!kb_layout_is_active(id)) continue;
+            if (names[0]) strncat(names, ", ", sizeof(names) - strlen(names) - 1);
+            strncat(names, kb_layout_name(id), sizeof(names) - strlen(names) - 1);
+        }
+        snprintf(buf, sizeof(buf), "Active layouts: %s (Enter to edit)", names);
+        lv_list_add_btn(s_settings_list, NULL, buf);
+    }
+
+    /* Display orientation -- landscape (default) or portrait (the whole
+     * UI turned another 90 degrees). Frozen for the session like the
+     * margins below, so it only takes effect on a restart. */
+    snprintf(buf, sizeof(buf), "Display orientation: %s (restart to apply)",
+             s_pending_portrait ? "Portrait" : "Landscape");
+    lv_list_add_btn(s_settings_list, NULL, buf);
+
+#if !defined(CONFIG_DRAFTLING_DISPLAY_CAN_ROTATE)
+    /* Display upside down -- adds a further 180-degree turn on top of
+     * whatever the orientation setting above already produces. Frozen
+     * for the session like the orientation, so it only takes effect on
+     * a restart. Boards with the live-apply "Rotate 180" toggle
+     * (CONFIG_DRAFTLING_DISPLAY_CAN_ROTATE) skip this row -- see the
+     * SETTINGS_IDX_UPSIDE_DOWN comment above. */
+    snprintf(buf, sizeof(buf), "Display upside down: %s (restart to apply)",
+             s_pending_upside_down ? "On" : "Off");
+    lv_list_add_btn(s_settings_list, NULL, buf);
+#endif
+
+    /* Screen margins -- pixels of panel hidden under the enclosure on
+     * each edge. Zero by default; the LVGL display resolution is fixed
+     * for the session, so a change is not visible until a restart --
+     * request_close_settings() offers one as soon as the user leaves
+     * this screen with a pending change, hence the reminder suffix. */
+    snprintf(buf, sizeof(buf), "Margin left: %dpx (restart to apply)", s_margin_left);
+    lv_list_add_btn(s_settings_list, NULL, buf);
+    snprintf(buf, sizeof(buf), "Margin right: %dpx (restart to apply)", s_margin_right);
+    lv_list_add_btn(s_settings_list, NULL, buf);
+    snprintf(buf, sizeof(buf), "Margin top: %dpx (restart to apply)", s_margin_top);
+    lv_list_add_btn(s_settings_list, NULL, buf);
+    snprintf(buf, sizeof(buf), "Margin bottom: %dpx (restart to apply)", s_margin_bottom);
+    lv_list_add_btn(s_settings_list, NULL, buf);
+
+    /* Factory reset */
+    if (s_factory_reset_confirm) {
+        lv_list_add_btn(s_settings_list, NULL,
+                        "Factory reset -- ENTER again to confirm");
+    } else {
+        lv_list_add_btn(s_settings_list, NULL, "Factory reset");
+    }
+
+    /* Back */
+    lv_list_add_btn(s_settings_list, NULL, "Back (Esc)");
+
+    /* Highlight selection */
+    apply_list_selection_styles(s_settings_list, s_settings_sel);
+    s_settings_sel_prev = s_settings_sel;
+
+#if defined(CONFIG_DRAFTLING_TOUCHSCREEN)
+    s_settings_touch_ctx.p_sel      = &s_settings_sel;
+    s_settings_touch_ctx.p_sel_prev = &s_settings_sel_prev;
+    s_settings_touch_ctx.activate   = settings_activate_item;
+    list_touch_attach(s_settings_list, &s_settings_touch_ctx);
+#endif
+
+    sync_battery_labels();
+}
+
+/* Move only the highlight bar without rebuilding the list. */
+static void update_settings_highlight(void)
+{
+    update_list_highlight(s_settings_list, s_settings_sel, s_settings_sel_prev);
+    s_settings_sel_prev = s_settings_sel;
+}
+
+#if defined(CONFIG_DRAFTLING_DISPLAY_COLOR)
+/* ---- Color-theme picker ----
+ * Renders the available themes into the same s_settings_list widget
+ * while s_theme_picker_open is true, so we do not need a second
+ * screen. The current selection is highlighted on entry. */
+static void refresh_theme_picker_items(void)
+{
+    lv_obj_clean(s_settings_list);
+    char buf[80];
+    for (int i = 0; i < COLOR_THEME_COUNT; i++) {
+        snprintf(buf, sizeof(buf), "%s%s",
+                 (i == s_theme_idx) ? "* " : "  ",
+                 COLOR_THEMES[i].name);
+        lv_list_add_btn(s_settings_list, NULL, buf);
+    }
+    lv_list_add_btn(s_settings_list, NULL, "  Cancel (Esc)");
+    apply_list_selection_styles(s_settings_list, s_theme_picker_sel);
+    s_theme_picker_sel_prev = s_theme_picker_sel;
+
+    sync_battery_labels();
+}
+
+static void update_theme_picker_highlight(void)
+{
+    update_list_highlight(s_settings_list, s_theme_picker_sel,
+                          s_theme_picker_sel_prev);
+    s_theme_picker_sel_prev = s_theme_picker_sel;
+}
+
+/* Cancel the picker and re-render the regular settings list. */
+static void close_theme_picker(void)
+{
+    s_theme_picker_open = false;
+    refresh_settings_items();
+}
+#endif
+
+/* ---- Active-language-layouts picker ----
+ * Renders one checklist row per compiled-in layout into the same
+ * s_settings_list widget while s_layouts_picker_open is true, plus a
+ * trailing "Done" row. Unlike the theme picker, Enter toggles the
+ * highlighted row's membership in the active set immediately (applied
+ * and persisted on the spot) rather than picking one value and
+ * confirming -- there is no "cancel", since each toggle already is
+ * the final state. */
+static void refresh_layouts_picker_items(void)
+{
+    lv_obj_clean(s_settings_list);
+    char buf[80];
+    for (int i = 0; i < KB_LAYOUT_COUNT; i++) {
+        kb_layout_id_t id = (kb_layout_id_t)i;
+        snprintf(buf, sizeof(buf), "[%s] %s",
+                 kb_layout_is_active(id) ? "x" : " ",
+                 kb_layout_name(id));
+        lv_list_add_btn(s_settings_list, NULL, buf);
+    }
+    lv_list_add_btn(s_settings_list, NULL, "  Done (Esc)");
+    apply_list_selection_styles(s_settings_list, s_layouts_picker_sel);
+    s_layouts_picker_sel_prev = s_layouts_picker_sel;
+
+    sync_battery_labels();
+}
+
+static void update_layouts_picker_highlight(void)
+{
+    update_list_highlight(s_settings_list, s_layouts_picker_sel,
+                          s_layouts_picker_sel_prev);
+    s_layouts_picker_sel_prev = s_layouts_picker_sel;
+}
+
+static void close_layouts_picker(void)
+{
+    s_layouts_picker_open = false;
+    refresh_settings_items();
+}
+
+/* ---- Restart-to-apply prompt ----
+ * Renders into the same s_settings_list widget while
+ * s_restart_confirm_open is true -- same reused-list pattern as the
+ * color-theme picker above. Shown by request_close_settings() when the
+ * user leaves the Settings screen having changed a restart-only
+ * display setting this visit (a margin, or the display orientation). */
+static void refresh_restart_confirm_items(void)
+{
+    lv_obj_clean(s_settings_list);
+    lv_list_add_btn(s_settings_list, NULL, "Restart now to apply changes");
+    lv_list_add_btn(s_settings_list, NULL, "Keep editing (apply later)");
+    apply_list_selection_styles(s_settings_list, s_restart_confirm_sel);
+    s_restart_confirm_sel_prev = s_restart_confirm_sel;
+}
+
+static void update_restart_confirm_highlight(void)
+{
+    update_list_highlight(s_settings_list, s_restart_confirm_sel,
+                          s_restart_confirm_sel_prev);
+    s_restart_confirm_sel_prev = s_restart_confirm_sel;
+}
+
+static void close_settings(void);
+
+/* Leaves the Settings screen, but if a restart-only display setting (a
+ * margin or the display orientation) was changed this visit, offers to
+ * restart immediately instead of closing straight away -- the LVGL
+ * display resolution and rotation are fixed for the session (see
+ * display_margins.h / display_orientation.h), so a restart is the only
+ * way to apply the change without waiting for the next natural
+ * reboot/wake. */
+static void request_close_settings(void)
+{
+    if (s_restart_needed) {
+        s_restart_confirm_open = true;
+        s_restart_confirm_sel = 0;
+        refresh_restart_confirm_items();
+        return;
+    }
+    close_settings();
+}
+
+static void show_settings(void)
+{
+    s_settings_open = true;
+    s_menu_open = false;
+    s_settings_sel = 0;
+    s_factory_reset_confirm = false;
+    s_restart_needed = false;
+    s_restart_confirm_open = false;
+#if defined(CONFIG_DRAFTLING_DISPLAY_COLOR)
+    s_theme_picker_open = false;
+#endif
+    s_layouts_picker_open = false;
+    refresh_settings_items();
+    sync_battery_labels();
+#if defined(CONFIG_DRAFTLING_DISPLAY_EPD)
+    /* Same missing-repaint bug as show_menu() -- see its comment. */
+    display_clear(0xFF);
+    lv_obj_invalidate(s_scr_settings);
+#endif
+    lv_scr_load(s_scr_settings);
+}
+
+static void close_settings(void)
+{
+    s_settings_open = false;
+#if defined(CONFIG_DRAFTLING_DISPLAY_COLOR)
+    s_theme_picker_open = false;
+#endif
+    s_layouts_picker_open = false;
+    show_menu();
+}
+
+/* Cycles a settings row's discrete value forward (dir=+1) or backward
+ * (dir=-1). Enter has always meant "next value"; the Left/Right arrow
+ * keys reuse this exact logic (dir=-1 for Left, dir=+1 for Right) so
+ * a row can be adjusted either direction without repeatedly wrapping
+ * all the way around via Enter. Returns false for rows that are not a
+ * simple in-place value cycle (Theme opens a sub-picker instead;
+ * Max file size, Factory reset and Back are actions, not
+ * values), so callers can no-op the arrow keys on those rows. */
+static bool settings_cycle_item(int idx, int dir)
+{
+    if (idx == SETTINGS_IDX_TIMEOUT) {
+        uint32_t cur = standby_get_timeout();
+        int opt = find_timeout_option(cur);
+        opt = (opt + dir + TIMEOUT_OPTION_COUNT) % TIMEOUT_OPTION_COUNT;
+        standby_set_timeout(TIMEOUT_OPTIONS[opt]);
+        refresh_settings_items();
+        return true;
+    } else if (idx == SETTINGS_IDX_FONTSZ) {
+        int fi = find_font_size_option(s_font_size);
+        fi = (fi + dir + FONT_SIZE_COUNT) % FONT_SIZE_COUNT;
+        s_font_size = FONT_SIZE_OPTIONS[fi];
+        save_font_size_to_nvs();
+        init_styles();
+        refresh_settings_items();
+        /* The new font changes widget geometry on every screen and in
+         * every pane. Pixels left over from the previous (differently
+         * sized) layout would otherwise survive in the persistent
+         * display buffer -- and stale line geometry lingers in each
+         * pane's render cache -- and reappear as garbage the next time
+         * the editor screen is drawn (for example after re-opening a
+         * file). Wipe the framebuffer, drop every pane's cached line
+         * geometry so each label is fully re-laid-out, and invalidate
+         * the active screen so LVGL repaints everything. This runs on
+         * all backends because both the e-paper and the persistent
+         * framebuffer LCDs keep stale pixels in regions the new layout
+         * no longer covers. display_clear() also promotes the next
+         * flush to a flashing full refresh on e-paper, clearing any
+         * accumulated ghosting. */
+#if defined(CONFIG_DRAFTLING_EPD_BLACK_BACKGROUND)
+        display_clear(0x00);
+#else
+        display_clear(0xFF);
+#endif
+        /* Also wipe LVGL's own draw buffers. On the reflective-LCD
+         * FULL render-mode path LVGL keeps two screen-sized buffers
+         * and can flush a stale one (holding the pre-change layout)
+         * when the next screen is only partially invalidated -- for
+         * example after re-opening a file -- which surfaces as garbage
+         * in the untouched regions. display_clear() only wipes the
+         * panel framebuffer, not these buffers. */
+        draftling_lvgl_port_clear_buffers();
+        invalidate_all_render_caches();
+        lv_obj_invalidate(lv_scr_act());
+        return true;
+#if defined(CONFIG_DRAFTLING_DISPLAY_HAS_BACKLIGHT) && !defined(CONFIG_DRAFTLING_DISPLAY_BACKLIGHT_BINARY)
+    } else if (idx == SETTINGS_IDX_BACKLIGHT) {
+        int bi = find_backlight_option(s_backlight_pct);
+        bi = (bi + dir + BACKLIGHT_OPTION_COUNT) % BACKLIGHT_OPTION_COUNT;
+        s_backlight_pct = BACKLIGHT_OPTIONS[bi];
+        save_backlight_to_nvs();
+        display_set_backlight(s_backlight_pct);
+        refresh_settings_items();
+        return true;
+#endif
+#if defined(CONFIG_DRAFTLING_DISPLAY_CAN_ROTATE)
+    } else if (idx == SETTINGS_IDX_ROTATE) {
+        /* Only two states, so either direction just toggles it.
+         * Applied immediately so the user sees the new orientation
+         * without leaving the menu; persisted in NVS and re-applied
+         * at boot. A 180 flip does not change the reported
+         * resolution, so the widget tree stays valid -- the LVGL port
+         * just repaints the whole panel in the new orientation. */
+        s_rotate180 = !s_rotate180;
+        save_rotate180_to_nvs();
+        draftling_lvgl_port_set_flip180(s_rotate180);
+        refresh_settings_items();
+        return true;
+#endif
+#if defined(CONFIG_DRAFTLING_DISPLAY_CAN_INVERT)
+    } else if (idx == SETTINGS_IDX_INVERT) {
+        /* Only two states, so either direction just toggles it.
+         * Applied immediately so the user sees the new polarity
+         * without leaving the menu; persisted in NVS and re-applied
+         * at boot. display_set_invert() only changes what
+         * display_flush() sends to the panel, so no repaint of the
+         * LVGL widget tree is needed. */
+        s_invert = !s_invert;
+        save_invert_to_nvs();
+        display_set_invert(s_invert);
+        refresh_settings_items();
+        return true;
+#endif
+    } else if (idx == SETTINGS_IDX_APPEND_ONLY) {
+        /* Only two states, so either direction just toggles it. No
+         * hardware side effects, so just flip the flag, persist it,
+         * and refresh the label. */
+        s_append_only = !s_append_only;
+        save_append_only_to_nvs();
+        refresh_settings_items();
+        return true;
+    } else if (idx == SETTINGS_IDX_ORIENTATION) {
+        /* Landscape <-> portrait. Only two states, so either direction
+         * toggles. Persisted to NVS for the next boot; the LVGL
+         * rotation and the whole widget tree are fixed for the session
+         * (see display_orientation.h), so request_close_settings()
+         * offers a restart on the way out. */
+        s_pending_portrait = !s_pending_portrait;
+        display_orientation_set_portrait(s_pending_portrait);
+        s_restart_needed = true;
+        refresh_settings_items();
+        return true;
+#if !defined(CONFIG_DRAFTLING_DISPLAY_CAN_ROTATE)
+    } else if (idx == SETTINGS_IDX_UPSIDE_DOWN) {
+        /* Only two states, so either direction toggles. Persisted to
+         * NVS for the next boot; like the orientation above, the LVGL
+         * rotation and the whole widget tree are fixed for the
+         * session (see display_flip.h), so request_close_settings()
+         * offers a restart on the way out. */
+        s_pending_upside_down = !s_pending_upside_down;
+        display_flip_set_upside_down(s_pending_upside_down);
+        s_restart_needed = true;
+        refresh_settings_items();
+        return true;
+#endif
+    } else if (idx == SETTINGS_IDX_MARGIN_LEFT) {
+        int oi = find_margin_option(s_margin_left);
+        oi = (oi + dir + MARGIN_OPTION_COUNT) % MARGIN_OPTION_COUNT;
+        s_margin_left = MARGIN_OPTIONS[oi];
+        display_margins_set(s_margin_left, s_margin_right, s_margin_top, s_margin_bottom);
+        s_restart_needed = true;
+        refresh_settings_items();
+        return true;
+    } else if (idx == SETTINGS_IDX_MARGIN_RIGHT) {
+        int oi = find_margin_option(s_margin_right);
+        oi = (oi + dir + MARGIN_OPTION_COUNT) % MARGIN_OPTION_COUNT;
+        s_margin_right = MARGIN_OPTIONS[oi];
+        display_margins_set(s_margin_left, s_margin_right, s_margin_top, s_margin_bottom);
+        s_restart_needed = true;
+        refresh_settings_items();
+        return true;
+    } else if (idx == SETTINGS_IDX_MARGIN_TOP) {
+        int oi = find_margin_option(s_margin_top);
+        oi = (oi + dir + MARGIN_OPTION_COUNT) % MARGIN_OPTION_COUNT;
+        s_margin_top = MARGIN_OPTIONS[oi];
+        display_margins_set(s_margin_left, s_margin_right, s_margin_top, s_margin_bottom);
+        s_restart_needed = true;
+        refresh_settings_items();
+        return true;
+    } else if (idx == SETTINGS_IDX_MARGIN_BOTTOM) {
+        int oi = find_margin_option(s_margin_bottom);
+        oi = (oi + dir + MARGIN_OPTION_COUNT) % MARGIN_OPTION_COUNT;
+        s_margin_bottom = MARGIN_OPTIONS[oi];
+        display_margins_set(s_margin_left, s_margin_right, s_margin_top, s_margin_bottom);
+        s_restart_needed = true;
+        refresh_settings_items();
+        return true;
+    }
+    return false;
+}
+
+static void settings_activate_item(int idx)
+{
+    /* Moving away from the factory-reset item cancels confirmation */
+    if (idx != SETTINGS_IDX_RESET && s_factory_reset_confirm) {
+        s_factory_reset_confirm = false;
+        refresh_settings_items();
+    }
+
+    if (settings_cycle_item(idx, 1)) {
+        /* Handled -- Enter always means "next value", same as before. */
+    } else if (idx == SETTINGS_IDX_MAXFILE) {
+        /* Read-only display of the dynamically-sized editor buffer.
+         * Enter is a no-op; the value is fixed at editor_init() time. */
+    } else if (idx == SETTINGS_IDX_LAYOUTS) {
+        /* Open the active-layouts checklist sub-list. Each row toggles
+         * immediately on Enter (applied + persisted on the spot); Esc
+         * returns to the settings list. */
+        s_layouts_picker_sel = 0;
+        s_layouts_picker_open = true;
+        refresh_layouts_picker_items();
+#if defined(CONFIG_DRAFTLING_DISPLAY_COLOR)
+    } else if (idx == SETTINGS_IDX_THEME) {
+        /* Open the theme picker sub-list. The user navigates with
+         * Up/Down and confirms with Enter; only on Enter is the new
+         * theme persisted and the screens rebuilt. Esc returns to
+         * the settings list without changes. */
+        s_theme_picker_open = true;
+        s_theme_picker_sel = s_theme_idx;
+        refresh_theme_picker_items();
+#endif
+    } else if (idx == SETTINGS_IDX_RESET) {
+        /* Factory reset -- requires double-press confirmation */
+        if (s_factory_reset_confirm) {
+            ESP_LOGW(TAG, "Factory reset: erasing NVS and restarting");
+            nvs_flash_erase();
+            esp_restart();
+            /* does not return */
+        } else {
+            s_factory_reset_confirm = true;
+            refresh_settings_items();
+        }
+    } else if (idx == SETTINGS_IDX_BACK) {
+        request_close_settings();
+    }
+}
+
+static void handle_settings_key(const kb_event_t *ev)
+{
+    if (s_restart_confirm_open) {
+        switch (ev->keycode) {
+        case KB_KEY_UP:
+        case KB_KEY_DOWN:
+            s_restart_confirm_sel = s_restart_confirm_sel == 0 ? 1 : 0;
+            update_restart_confirm_highlight();
+            break;
+        case KB_KEY_ENTER:
+            if (s_restart_confirm_sel == 0) {
+                ESP_LOGI(TAG, "Restarting to apply new display settings");
+                esp_restart();
+                /* does not return */
+            }
+            s_restart_confirm_open = false;
+            close_settings();
+            break;
+        case KB_KEY_ESCAPE:
+            /* Same as "keep editing" -- Escape leaving the user stuck
+             * re-answering the same prompt would be worse than just
+             * deferring the restart, since the new value is already
+             * saved to NVS and will apply on the next natural
+             * restart/sleep-wake regardless. */
+            s_restart_confirm_open = false;
+            close_settings();
+            break;
+        default:
+            break;
+        }
+        return;
+    }
+
+#if defined(CONFIG_DRAFTLING_DISPLAY_COLOR)
+    if (s_theme_picker_open) {
+        /* Total picker rows: COLOR_THEME_COUNT themes + 1 "Cancel" row. */
+        const int picker_count = COLOR_THEME_COUNT + 1;
+        switch (ev->keycode) {
+        case KB_KEY_UP:
+            if (s_theme_picker_sel > 0) s_theme_picker_sel--;
+            update_theme_picker_highlight();
+            break;
+        case KB_KEY_DOWN:
+            if (s_theme_picker_sel < picker_count - 1) s_theme_picker_sel++;
+            update_theme_picker_highlight();
+            break;
+        case KB_KEY_ENTER:
+            if (s_theme_picker_sel >= 0 &&
+                s_theme_picker_sel < COLOR_THEME_COUNT) {
+                /* Apply the selected theme. The theme drives the bg
+                 * color of every screen and the text color of dozens
+                 * of widgets configured at create time, so we tear
+                 * the screens down and rebuild them in place against
+                 * the new palette -- no esp_restart() required. */
+                if (s_theme_picker_sel != s_theme_idx) {
+                    s_theme_idx = s_theme_picker_sel;
+                    save_theme_to_nvs();
+                    /* close_theme_picker() restores the regular
+                     * settings list state; rebuild_screens_for_theme()
+                     * then deletes every screen (including the one
+                     * holding s_settings_list) and re-creates them
+                     * under the new theme, restoring the user's
+                     * current screen at the end. */
+                    close_theme_picker();
+                    rebuild_screens_for_theme();
+                    return;
+                }
+                /* No change -> just close the picker. */
+                close_theme_picker();
+            } else {
+                /* Cancel row */
+                close_theme_picker();
+            }
+            break;
+        case KB_KEY_ESCAPE:
+            close_theme_picker();
+            break;
+        default:
+            break;
+        }
+        return;
+    }
+#endif
+
+    if (s_layouts_picker_open) {
+        /* Total picker rows: KB_LAYOUT_COUNT checklist rows + 1 "Done" row. */
+        const int picker_count = KB_LAYOUT_COUNT + 1;
+        switch (ev->keycode) {
+        case KB_KEY_UP:
+            if (s_layouts_picker_sel > 0) s_layouts_picker_sel--;
+            update_layouts_picker_highlight();
+            break;
+        case KB_KEY_DOWN:
+            if (s_layouts_picker_sel < picker_count - 1) s_layouts_picker_sel++;
+            update_layouts_picker_highlight();
+            break;
+        case KB_KEY_ENTER:
+        case KB_KEY_SPACE:
+            /* Space is equivalent to Enter here so a row can be
+             * toggled without leaving the home row -- there is no
+             * text field on this screen for Space to type into. */
+            if (s_layouts_picker_sel >= 0 &&
+                s_layouts_picker_sel < KB_LAYOUT_COUNT) {
+                kb_layout_id_t id = (kb_layout_id_t)s_layouts_picker_sel;
+                /* kb_layout_set_active() silently refuses to remove the
+                 * last active layout, so the checklist can never be
+                 * emptied out from under the user. */
+                if (kb_layout_set_active(id, !kb_layout_is_active(id))) {
+                    save_active_layouts_to_nvs();
+                    refresh_layouts_picker_items();
+                }
+            } else {
+                /* Done row */
+                close_layouts_picker();
+            }
+            break;
+        case KB_KEY_ESCAPE:
+            close_layouts_picker();
+            break;
+        default:
+            break;
+        }
+        return;
+    }
+
+    switch (ev->keycode) {
+    case KB_KEY_UP:
+        if (s_settings_sel > 0) s_settings_sel--;
+        if (s_factory_reset_confirm) {
+            /* Cancelling confirmation changes the item label, so we
+             * need a full rebuild; otherwise just move the highlight. */
+            s_factory_reset_confirm = false;
+            refresh_settings_items();
+        } else {
+            update_settings_highlight();
+        }
+        break;
+    case KB_KEY_DOWN:
+        if (s_settings_sel < SETTINGS_ITEM_COUNT - 1) s_settings_sel++;
+        if (s_factory_reset_confirm) {
+            s_factory_reset_confirm = false;
+            refresh_settings_items();
+        } else {
+            update_settings_highlight();
+        }
+        break;
+    case KB_KEY_ENTER:
+        settings_activate_item(s_settings_sel);
+        break;
+    case KB_KEY_LEFT:
+        /* Previous value on the highlighted row, without moving the
+         * highlight -- a no-op on rows settings_cycle_item() does not
+         * own (Theme, Max file, Factory reset, Back). */
+        settings_cycle_item(s_settings_sel, -1);
+        break;
+    case KB_KEY_RIGHT:
+        settings_cycle_item(s_settings_sel, 1);
+        break;
+    case KB_KEY_ESCAPE:
+        request_close_settings();
+        break;
+    default:
+        break;
+    }
+}
+
+/* Forward declarations for WiFi background connect (defined below) */
+static void wifi_connect_task(void *arg);
+static void wifi_connect_async(void);
+static void wifi_scan_task(void *arg);
+static void wifi_scan_async(void);
+static void wifi_connect_picked_task(void *arg);
+static void wifi_connect_picked_async(const char *ssid, const char *password);
+static void draftbox_connect_async(const char *site, const char *otp);
+/* Forward declaration: the password prompt's Esc handler returns to
+ * the picker list defined further down. */
+static void refresh_wifi_scan_picker_items(void);
+
+/* ---- WiFi password-entry overlay ----
+ * Raised by the WiFi scan picker below when the user picks a secured
+ * network. A top-level modal in its own right (parented to
+ * s_scr_menu, not the picker's s_menu_list), structurally a copy of
+ * the save-as prompt's header/value-label/cursor trio. The password is
+ * shown in clear text so the user can see what they type. Esc backs out to the SSID list rather than closing the whole
+ * menu, so a wrong network pick is cheap to undo. */
+static void refresh_wifi_pw_prompt(void)
+{
+    if (!s_wifi_pw_panel) return;
+
+    lv_label_set_text(s_wifi_pw_name_lbl, s_wifi_pw_buf);
+
+    int cw = char_width_for_font(FONT_11);
+    int chars = 0;
+    for (int i = 0; i < s_wifi_pw_pos; i++) {
+        if ((s_wifi_pw_buf[i] & 0xC0) != 0x80) chars++;
+    }
+    lv_obj_set_pos(s_wifi_pw_cur, chars * cw, overlay_row_y());
+    lv_obj_remove_flag(s_wifi_pw_cur, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void show_wifi_password_prompt(const char *ssid)
+{
+    strncpy(s_wifi_pw_ssid, ssid, sizeof(s_wifi_pw_ssid) - 1);
+    s_wifi_pw_ssid[sizeof(s_wifi_pw_ssid) - 1] = '\0';
+    s_wifi_pw_buf[0] = '\0';
+    s_wifi_pw_pos = 0;
+
+    char hdr[64];
+    snprintf(hdr, sizeof(hdr), "Password for %.32s (Enter/Esc):", s_wifi_pw_ssid);
+    lv_label_set_text(s_wifi_pw_hdr_lbl, hdr);
+
+    s_wifi_pw_open = true;
+    lv_obj_remove_flag(s_wifi_pw_panel, LV_OBJ_FLAG_HIDDEN);
+    refresh_wifi_pw_prompt();
+}
+
+static void close_wifi_pw_prompt(void)
+{
+    s_wifi_pw_open = false;
+    lv_obj_add_flag(s_wifi_pw_panel, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void wifi_pw_prompt_confirm(void)
+{
+    if (s_wifi_pw_buf[0] == '\0') return; /* empty password -- keep editing */
+    char ssid[33];
+    strncpy(ssid, s_wifi_pw_ssid, sizeof(ssid) - 1);
+    ssid[sizeof(ssid) - 1] = '\0';
+    close_wifi_pw_prompt();
+    s_wifi_scan_picker_open = false;
+    close_menu();
+    wifi_connect_picked_async(ssid, s_wifi_pw_buf);
+}
+
+/* Line-editing keys shared by the single-line text prompts on the menu
+ * screen (WiFi password, Draftbox site / password): cursor movement,
+ * Backspace / Delete and printable text in the active keyboard layout.
+ * buf is UTF-8, pos a byte offset kept on a character boundary. Enter
+ * and Esc are the caller's. */
+static void text_field_key(char *buf, size_t buf_sz, int *pos, const kb_event_t *ev)
+{
+    switch (ev->keycode) {
+    case KB_KEY_LEFT:
+        if (*pos > 0) {
+            do { (*pos)--; }
+            while (*pos > 0 && (buf[*pos] & 0xC0) == 0x80);
+        }
+        break;
+    case KB_KEY_RIGHT:
+        if (*pos < (int)strlen(buf)) {
+            (*pos)++;
+            while (*pos < (int)strlen(buf) && (buf[*pos] & 0xC0) == 0x80)
+                (*pos)++;
+        }
+        break;
+    case KB_KEY_HOME:
+        *pos = 0;
+        break;
+    case KB_KEY_END:
+        *pos = (int)strlen(buf);
+        break;
+    case KB_KEY_BACKSPACE:
+        if (*pos > 0) {
+            int prev = *pos - 1;
+            while (prev > 0 && (buf[prev] & 0xC0) == 0x80) prev--;
+            int len = (int)strlen(buf);
+            memmove(buf + prev, buf + *pos, (size_t)(len - *pos + 1));
+            *pos = prev;
+        }
+        break;
+    case KB_KEY_DELETE: {
+        int len = (int)strlen(buf);
+        if (*pos < len) {
+            int next = *pos + 1;
+            while (next < len && (buf[next] & 0xC0) == 0x80) next++;
+            memmove(buf + *pos, buf + next, (size_t)(len - next + 1));
+        }
+        break;
+    }
+    default: {
+        bool ctrl = (ev->modifier & (KB_MOD_LCTRL | KB_MOD_RCTRL)) != 0;
+        if (ctrl) break; /* swallow ctrl combos */
+        const char *text = kb_layout_translate(ev->keycode, ev->modifier);
+        if (text && text[0]) {
+            if ((unsigned char)text[0] < 0x20) break; /* reject control chars */
+            size_t tlen = strlen(text);
+            size_t cur_len = strlen(buf);
+            if (cur_len + tlen < buf_sz - 1) {
+                memmove(buf + *pos + tlen, buf + *pos, cur_len - (size_t)*pos + 1);
+                memcpy(buf + *pos, text, tlen);
+                *pos += (int)tlen;
+            }
+        }
+        break;
+    }
+    }
+}
+
+static void handle_wifi_pw_prompt_key(const kb_event_t *ev)
+{
+    switch (ev->keycode) {
+    case KB_KEY_ENTER:
+        wifi_pw_prompt_confirm();
+        return;
+    case KB_KEY_ESCAPE:
+        /* Back to the SSID list, not out of the whole menu. */
+        close_wifi_pw_prompt();
+        refresh_wifi_scan_picker_items();
+        return;
+    default:
+        text_field_key(s_wifi_pw_buf, sizeof(s_wifi_pw_buf), &s_wifi_pw_pos, ev);
+        break;
+    }
+    refresh_wifi_pw_prompt();
+}
+
+/* ---- Message pop-up (see s_msg_panel) ---- */
+static void show_msg_popup(const char *title, const char *text, bool busy)
+{
+    if (!s_msg_panel) return;
+    lv_label_set_text(s_msg_title_lbl, title);
+    lv_label_set_text(s_msg_text_lbl, text);
+    if (busy) lv_obj_add_flag(s_msg_hint_lbl, LV_OBJ_FLAG_HIDDEN);
+    else      lv_obj_remove_flag(s_msg_hint_lbl, LV_OBJ_FLAG_HIDDEN);
+    s_msg_busy = busy;
+    s_msg_open = true;
+    lv_obj_set_parent(s_msg_panel, lv_scr_act());
+    lv_obj_remove_flag(s_msg_panel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_msg_panel);
+    lv_obj_update_layout(s_msg_panel);
+    lv_obj_align(s_msg_panel, LV_ALIGN_CENTER, 0, 0);
+}
+
+static void close_msg_popup(void)
+{
+    s_msg_open = false;
+    s_msg_busy = false;
+    if (s_msg_panel) lv_obj_add_flag(s_msg_panel, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void handle_msg_popup_key(const kb_event_t *ev)
+{
+    if (s_msg_busy) return;
+    if (ev->keycode == KB_KEY_ENTER || ev->keycode == KB_KEY_ESCAPE)
+        close_msg_popup();
+}
+
+#if defined(CONFIG_DRAFTLING_TOUCHSCREEN)
+static void msg_popup_touch_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!s_msg_busy) close_msg_popup();
+}
+#endif
+
+/* ---- Draftbox prompt (see s_dbx_panel) ---- */
+static void refresh_dbx_prompt(void)
+{
+    if (!s_dbx_panel) return;
+
+    if (s_dbx_step == DBX_STEP_WIFI) {
+        char cfg_ssid[33];
+        char hdr[80];
+        if (wifi_manager_get_configured_ssid(cfg_ssid, sizeof(cfg_ssid)))
+            snprintf(hdr, sizeof(hdr), "Connecting WiFi to %s... (Esc: cancel)", cfg_ssid);
+        else
+            snprintf(hdr, sizeof(hdr), "Connecting WiFi... (Esc: cancel)");
+        lv_label_set_text(s_dbx_hdr_lbl, hdr);
+        lv_label_set_text(s_dbx_val_lbl, "");
+        lv_obj_add_flag(s_dbx_cur, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+
+    bool site = (s_dbx_step == DBX_STEP_SITE);
+    const char *buf = site ? s_dbx_site : s_dbx_otp;
+    int pos = site ? s_dbx_site_pos : s_dbx_otp_pos;
+
+    lv_label_set_text(s_dbx_hdr_lbl, site
+        ? "Draftbox site (Enter: next, Esc: cancel):"
+        : "8-digit one-time password (Enter/Esc):");
+    lv_label_set_text(s_dbx_val_lbl, buf);
+
+    int cw = char_width_for_font(FONT_11);
+    int chars = 0;
+    for (int i = 0; i < pos; i++) {
+        if ((buf[i] & 0xC0) != 0x80) chars++;
+    }
+    lv_obj_set_pos(s_dbx_cur, chars * cw, overlay_row_y());
+    lv_obj_remove_flag(s_dbx_cur, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void show_dbx_prompt(bool wait_wifi)
+{
+    s_dbx_step = wait_wifi ? DBX_STEP_WIFI : DBX_STEP_SITE;
+    s_dbx_site_pos = (int)strlen(s_dbx_site);
+    memset(s_dbx_otp, 0, sizeof(s_dbx_otp));
+    s_dbx_otp_pos = 0;
+    s_dbx_open = true;
+    lv_obj_remove_flag(s_dbx_panel, LV_OBJ_FLAG_HIDDEN);
+    refresh_dbx_prompt();
+}
+
+static void close_dbx_prompt(void)
+{
+    s_dbx_open = false;
+    memset(s_dbx_otp, 0, sizeof(s_dbx_otp));
+    s_dbx_otp_pos = 0;
+    lv_obj_add_flag(s_dbx_panel, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* Outcome of the WiFi connection started for the prompt (from
+ * wifi_state_cb() or wifi_connect_task(), LVGL lock held). On success
+ * go on to the site name; on failure close the prompt and explain why
+ * in a pop-up (reason is a full sentence; unused on success). */
+static void dbx_wifi_done(bool connected, const char *reason)
+{
+    if (!s_dbx_open || s_dbx_step != DBX_STEP_WIFI) return;
+    if (connected) {
+        s_dbx_step = DBX_STEP_SITE;
+        refresh_dbx_prompt();
+    } else {
+        close_dbx_prompt();
+        char text[200];
+        snprintf(text, sizeof(text), "Could not connect to WiFi.\n%s",
+                 reason ? reason : "");
+        show_msg_popup("Draftbox", text, false);
+    }
+}
+
+static void handle_dbx_prompt_key(const kb_event_t *ev)
+{
+    if (s_dbx_step == DBX_STEP_WIFI) {
+        /* Only Esc while connecting; the connection attempt itself
+         * carries on in the background. */
+        if (ev->keycode == KB_KEY_ESCAPE) close_dbx_prompt();
+        return;
+    }
+    switch (ev->keycode) {
+    case KB_KEY_ENTER:
+        if (s_dbx_step == DBX_STEP_SITE) {
+            if (s_dbx_site[0] == '\0') return; /* keep editing */
+            s_dbx_step = DBX_STEP_OTP;
+        } else {
+            if (strlen(s_dbx_otp) != 8) return; /* keep editing */
+            char site[sizeof(s_dbx_site)];
+            char otp[sizeof(s_dbx_otp)];
+            strlcpy(site, s_dbx_site, sizeof(site));
+            strlcpy(otp, s_dbx_otp, sizeof(otp));
+            close_dbx_prompt();
+            /* The menu stays open underneath; the pop-up shows the
+             * progress and then the result. */
+            char text[192];
+            snprintf(text, sizeof(text), "Connecting to %s...", site);
+            show_msg_popup("Draftbox", text, true);
+            draftbox_connect_async(site, otp);
+            memset(otp, 0, sizeof(otp));
+            return;
+        }
+        break;
+    case KB_KEY_ESCAPE:
+        if (s_dbx_step == DBX_STEP_OTP) {
+            /* Back to the site name, e.g. to fix a typo. */
+            memset(s_dbx_otp, 0, sizeof(s_dbx_otp));
+            s_dbx_otp_pos = 0;
+            s_dbx_step = DBX_STEP_SITE;
+            break;
+        }
+        close_dbx_prompt();
+        return;
+    default:
+        if (s_dbx_step == DBX_STEP_SITE) {
+            text_field_key(s_dbx_site, sizeof(s_dbx_site), &s_dbx_site_pos, ev);
+        } else {
+            /* Digits only; editing keys pass through. */
+            const char *text = kb_layout_translate(ev->keycode, ev->modifier);
+            bool printable = text && (unsigned char)text[0] >= 0x20;
+            if (!printable || (text[0] >= '0' && text[0] <= '9' && !text[1]))
+                text_field_key(s_dbx_otp, sizeof(s_dbx_otp), &s_dbx_otp_pos, ev);
+        }
+        break;
+    }
+    refresh_dbx_prompt();
+}
+
+/* ---- WiFi scan/connect picker ----
+ * Renders scan results into the same s_menu_list widget while
+ * s_wifi_scan_picker_open is true, mirroring the "SD card via USB"
+ * picker's reuse of s_menu_list below. A trailing "Rescan" row always
+ * follows the SSID list (or the "No networks found" placeholder). */
+static void refresh_wifi_scan_picker_items(void)
+{
+    lv_obj_clean(s_menu_list);
+    char buf[48];
+    if (s_wifi_scan_in_progress) {
+        lv_list_add_btn(s_menu_list, NULL, "Scanning...");
+    } else {
+        if (s_wifi_scan_count == 0) {
+            lv_list_add_btn(s_menu_list, NULL, "No networks found");
+        }
+        for (int i = 0; i < s_wifi_scan_count; i++) {
+            snprintf(buf, sizeof(buf), "%s%.32s",
+                     s_wifi_scan_results[i].open ? "" : "[locked] ",
+                     s_wifi_scan_results[i].ssid);
+            lv_list_add_btn(s_menu_list, NULL, buf);
+        }
+        lv_list_add_btn(s_menu_list, NULL, "Rescan");
+    }
+    apply_list_selection_styles(s_menu_list, s_wifi_scan_picker_sel);
+    s_wifi_scan_picker_sel_prev = s_wifi_scan_picker_sel;
+    sync_battery_labels();
+}
+
+static void update_wifi_scan_picker_highlight(void)
+{
+    update_list_highlight(s_menu_list, s_wifi_scan_picker_sel,
+                          s_wifi_scan_picker_sel_prev);
+    s_wifi_scan_picker_sel_prev = s_wifi_scan_picker_sel;
+}
+
+/* Leave the picker back to the regular F1 menu list without
+ * connecting (Esc). */
+static void close_wifi_scan_picker(void)
+{
+    s_wifi_scan_picker_open = false;
+    refresh_menu_items();
+}
+
+/* (Re)start a scan: shows "Scanning..." immediately: the background
+ * task calls refresh_wifi_scan_picker_items() again once results (or
+ * a failure) are in -- see wifi_scan_task(). */
+static void start_wifi_scan(void)
+{
+    s_wifi_scan_in_progress = true;
+    s_wifi_scan_picker_sel = 0;
+    refresh_wifi_scan_picker_items();
+    wifi_scan_async();
+}
+
+/* Row index of the trailing "Rescan" entry: right after the last SSID
+ * row normally, but when there are no results the picker inserts a
+ * "No networks found" placeholder row first (see
+ * refresh_wifi_scan_picker_items()), which "Rescan" then follows
+ * instead. */
+static int wifi_scan_rescan_row(void)
+{
+    return (s_wifi_scan_count > 0) ? s_wifi_scan_count : 1;
+}
+
+/* Enter on a picker row: the trailing row is "Rescan" (see
+ * wifi_scan_rescan_row()); an open network connects immediately, a
+ * secured one raises the password prompt first. */
+static void wifi_scan_picker_activate(int idx)
+{
+    if (idx == wifi_scan_rescan_row()) {
+        start_wifi_scan();
+        return;
+    }
+    if (idx < 0 || idx >= s_wifi_scan_count) return; /* also covers the "No networks found" row */
+
+    const wifi_scan_result_t *ap = &s_wifi_scan_results[idx];
+    if (ap->open) {
+        s_wifi_scan_picker_open = false;
+        close_menu();
+        wifi_connect_picked_async(ap->ssid, "");
+    } else {
+        show_wifi_password_prompt(ap->ssid);
+    }
+}
+
+#if defined(CONFIG_DRAFTLING_HAS_USB_MSC)
+/* ---- "SD card via USB" picker ----
+ * Renders the 3 modes into the same s_menu_list widget while
+ * s_usbmsc_picker_open is true, mirroring the color-theme picker's
+ * reuse of s_settings_list. Picking a row (Enter) stages the choice
+ * in s_usbmsc_pending_mode; either way (Enter or Esc), leaving the
+ * picker back to the regular F1 menu list runs
+ * commit_usb_msc_pending_mode() -- see close_usbmsc_picker(). */
+static void refresh_usbmsc_picker_items(void)
+{
+    lv_obj_clean(s_menu_list);
+    char buf[40];
+    static const usb_msc_mode_t kModes[3] = {
+        USB_MSC_MODE_OFF, USB_MSC_MODE_READ_ONLY, USB_MSC_MODE_READ_WRITE
+    };
+    for (int i = 0; i < 3; i++) {
+        snprintf(buf, sizeof(buf), "%s%s",
+                 (kModes[i] == s_usbmsc_pending_mode) ? "* " : "  ",
+                 usb_msc_mode_name(kModes[i]));
+        lv_list_add_btn(s_menu_list, NULL, buf);
+    }
+    apply_list_selection_styles(s_menu_list, s_usbmsc_picker_sel);
+    s_usbmsc_picker_sel_prev = s_usbmsc_picker_sel;
+    sync_battery_labels();
+}
+
+static void update_usbmsc_picker_highlight(void)
+{
+    update_list_highlight(s_menu_list, s_usbmsc_picker_sel,
+                          s_usbmsc_picker_sel_prev);
+    s_usbmsc_picker_sel_prev = s_usbmsc_picker_sel;
+}
+
+/* Leave the picker (Enter or Esc) and re-render the regular F1 menu
+ * list. This is the point where the staged choice actually takes
+ * effect -- see commit_usb_msc_pending_mode(). Esc leaves
+ * s_usbmsc_pending_mode unchanged, so the commit is a no-op then.
+ *
+ * Turning USB-MSC off restarts the device (see usb_msc.h) -- this
+ * function does not return in that case. */
+static void close_usbmsc_picker(void)
+{
+    s_usbmsc_picker_open = false;
+    commit_usb_msc_pending_mode();
+    refresh_menu_items();
+}
+#endif
+
+/* ---- "Format SD card" picker (see fmt_step_t) ---- */
+#if defined(CONFIG_DRAFTLING_TOUCHSCREEN)
+static list_touch_ctx_t s_fmt_touch_ctx;
+#endif
+static void fmt_picker_activate(int idx);
+
+static void refresh_fmt_picker_items(void)
+{
+    char buf[96];
+    lv_obj_clean(s_menu_list);
+    switch (s_fmt_step) {
+    case FMT_STEP_WIFI:
+        lv_label_set_text(s_lbl_menu_hdr,
+                          "Format SD card: keep the WiFi settings?");
+        snprintf(buf, sizeof(buf), "Keep WiFi settings (%s)", s_fmt_ssid);
+        lv_list_add_btn(s_menu_list, NULL, buf);
+        lv_list_add_btn(s_menu_list, NULL, "Erase WiFi settings");
+        lv_list_add_btn(s_menu_list, NULL, "Cancel");
+        break;
+    case FMT_STEP_CONFIRM1:
+        lv_label_set_text(s_lbl_menu_hdr,
+                          "Format SD card: ALL files will be erased");
+        lv_list_add_btn(s_menu_list, NULL, "Cancel");
+        lv_list_add_btn(s_menu_list, NULL, "Erase all files on the SD card");
+        break;
+    case FMT_STEP_CONFIRM2:
+        lv_label_set_text(s_lbl_menu_hdr,
+                          "Really format the SD card? Cannot be undone.");
+        lv_list_add_btn(s_menu_list, NULL, "Cancel");
+        lv_list_add_btn(s_menu_list, NULL,
+                        s_fmt_keep_wifi
+                            ? "Yes, format now (keep WiFi settings)"
+                            : "Yes, format now (erase WiFi settings)");
+        break;
+    default:
+        return;
+    }
+    apply_list_selection_styles(s_menu_list, s_fmt_sel);
+    s_fmt_sel_prev = s_fmt_sel;
+#if defined(CONFIG_DRAFTLING_TOUCHSCREEN)
+    s_fmt_touch_ctx.p_sel      = &s_fmt_sel;
+    s_fmt_touch_ctx.p_sel_prev = &s_fmt_sel_prev;
+    s_fmt_touch_ctx.activate   = fmt_picker_activate;
+    list_touch_attach(s_menu_list, &s_fmt_touch_ctx);
+#endif
+    sync_battery_labels();
+}
+
+static void update_fmt_picker_highlight(void)
+{
+    update_list_highlight(s_menu_list, s_fmt_sel, s_fmt_sel_prev);
+    s_fmt_sel_prev = s_fmt_sel;
+}
+
+static void fmt_set_step(fmt_step_t step)
+{
+    s_fmt_step = step;
+    s_fmt_sel = 0;   /* "Keep WiFi" / "Cancel" */
+    refresh_fmt_picker_items();
+}
+
+/* Back to the regular F1 menu list without formatting. */
+static void close_fmt_picker(void)
+{
+    s_fmt_step = FMT_STEP_NONE;
+    memset(s_fmt_pass, 0, sizeof(s_fmt_pass));
+    lv_label_set_text(s_lbl_menu_hdr, MENU_HDR_TEXT);
+    refresh_menu_items();
+}
+
+/* Why the card cannot be formatted right now, or NULL if it can. */
+static const char *fmt_blocked_reason(void)
+{
+#if defined(CONFIG_DRAFTLING_HAS_USB_MSC)
+    if (usb_msc_get_mode() != USB_MSC_MODE_OFF)
+        return "SD card via USB active -- disable it first";
+#endif
+    if (!sd_card_get_handle()) return "Format SD card: no SD card";
+    if (git_sync_get_state() == GIT_SYNC_IN_PROGRESS)
+        return "Format SD card: wait for Git sync to finish";
+    return NULL;
+}
+
+typedef struct {
+    bool keep_wifi;
+    char ssid[33];
+    char pass[65];
+} fmt_args_t;
+
+/* Formats the card off the LVGL task (it can take several seconds on
+ * a large card), then restores or erases the WiFi settings and
+ * restarts, so nothing keeps pointing at the deleted files (open
+ * documents, the Git repository, git.cfg). */
+static void fmt_task(void *arg)
+{
+    fmt_args_t *a = (fmt_args_t *)arg;
+    char text[256];
+
+    esp_err_t ret = sd_card_format();
+    if (ret == ESP_OK) {
+        const char *wifi_msg;
+        if (a->keep_wifi) {
+            wifi_msg = (wifi_manager_save_to_file(a->ssid, a->pass) == ESP_OK)
+                ? "The WiFi settings were written to the new wifi.cfg."
+                : "Could not write wifi.cfg; the WiFi settings stay in "
+                  "the device memory.";
+        } else {
+            wifi_msg = (wifi_manager_forget() == ESP_OK)
+                ? "The WiFi settings were erased."
+                : "Could not erase the WiFi settings from the device memory.";
+        }
+        snprintf(text, sizeof(text),
+                 "The SD card is formatted.\n%s\n"
+                 "The device will restart in a few seconds.", wifi_msg);
+    } else {
+        snprintf(text, sizeof(text),
+                 "Formatting failed: %s.\nRestart the device before "
+                 "using the SD card again.", esp_err_to_name(ret));
+    }
+    memset(a, 0, sizeof(*a));
+    free(a);
+
+    draftling_lvgl_port_lock(-1);
+    /* On success the device restarts on its own: show it as busy, so
+     * there is no "press Enter" hint and keys are ignored. */
+    show_msg_popup("Format SD card", text, ret == ESP_OK);
+    draftling_lvgl_port_unlock();
+
+    if (ret == ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        esp_restart();
+    }
+    vTaskDelete(NULL);
+}
+
+static void fmt_start(void)
+{
+    const char *why = fmt_blocked_reason();
+    if (why) {
+        close_fmt_picker();
+        editor_ui_set_status(why);
+        return;
+    }
+    fmt_args_t *a = (fmt_args_t *)calloc(1, sizeof(fmt_args_t));
+    if (!a) {
+        close_fmt_picker();
+        editor_ui_set_status("Format SD card: out of memory");
+        return;
+    }
+    a->keep_wifi = s_fmt_keep_wifi;
+    strlcpy(a->ssid, s_fmt_ssid, sizeof(a->ssid));
+    strlcpy(a->pass, s_fmt_pass, sizeof(a->pass));
+    close_fmt_picker();
+
+    /* The files are about to disappear: drop unsaved edits so no
+     * auto-save writes them back onto the fresh card, and keep
+     * standby from sleeping in the middle of the format. */
+    editor_discard_all_changes();
+    standby_reset_timer();
+    show_msg_popup("Format SD card",
+                   "Formatting the SD card...\n"
+                   "Do not remove the card or switch the device off.", true);
+
+    if (xTaskCreatePinnedToCore(fmt_task, "sd_format", 6 * 1024, a, 3,
+                                NULL, 0) != pdPASS) {
+        memset(a, 0, sizeof(*a));
+        free(a);
+        show_msg_popup("Format SD card",
+                       "Formatting failed: could not start the task.", false);
+    }
+}
+
+static void fmt_picker_activate(int idx)
+{
+    switch (s_fmt_step) {
+    case FMT_STEP_WIFI:
+        if (idx == 2) { close_fmt_picker(); break; }
+        s_fmt_keep_wifi = (idx == 0);
+        fmt_set_step(FMT_STEP_CONFIRM1);
+        break;
+    case FMT_STEP_CONFIRM1:
+        if (idx == 1) fmt_set_step(FMT_STEP_CONFIRM2);
+        else          close_fmt_picker();
+        break;
+    case FMT_STEP_CONFIRM2:
+        if (idx == 1) fmt_start();
+        else          close_fmt_picker();
+        break;
+    default:
+        break;
+    }
+}
+
+/* Entry point from the F1 menu row. */
+static void open_fmt_picker(void)
+{
+    const char *why = fmt_blocked_reason();
+    if (why) {
+        editor_ui_set_status(why);
+        return;
+    }
+    s_fmt_keep_wifi = false;
+    bool have_wifi = wifi_manager_get_configured(s_fmt_ssid, sizeof(s_fmt_ssid),
+                                                 s_fmt_pass, sizeof(s_fmt_pass));
+    fmt_set_step(have_wifi ? FMT_STEP_WIFI : FMT_STEP_CONFIRM1);
+}
+
+static void menu_activate_item(int idx)
+{
+    switch (idx) {
+    case MENU_IDX_SETTINGS:
+        show_settings();
+        break;
+    case MENU_IDX_BLE_STATUS: /* no action */
+        break;
+    case MENU_IDX_BLE_SCAN:
+        /* BLE may be idle (disabled) when another keyboard owns input
+         * -- e.g. a USB or Tab5 keyboard was present at boot. Re-enable
+         * it first so an on-demand scan can actually start. No-op when
+         * BLE is already active. */
+        ble_keyboard_enable();
+        ble_keyboard_start_scan();
+        editor_ui_set_status("BLE: scanning...");
+        close_menu();
+        break;
+    case MENU_IDX_WIFI_CONNECT:
+        /* Same fast reconnect-from-wifi.cfg/NVS as Ctrl+W. */
+        if (!wifi_manager_is_connected()) {
+            editor_ui_set_status("WiFi: connecting...");
+            close_menu();
+            wifi_connect_async();
+        }
+        break;
+    case MENU_IDX_WIFI_NEW:
+        /* Opens the scan/pick picker in s_menu_list -- see the "WiFi
+         * scan/connect picker" block above. Also usable while
+         * connected: picking a network switches to it. */
+        s_wifi_scan_picker_open = true;
+        start_wifi_scan();
+        break;
+    case MENU_IDX_WIFI_DISCONNECT:
+        wifi_manager_disconnect();
+        editor_ui_set_status("WiFi: disconnected");
+        close_menu();
+        break;
+    case MENU_IDX_GIT_SYNC:
+#if defined(CONFIG_DRAFTLING_HAS_USB_MSC)
+        /* Git sync reads and writes the SD card directly (its own
+         * .git/ history plus the working tree), same as any other
+         * file I/O -- refuse it while the card belongs to a USB host,
+         * same as handle_browser_key()'s guard. This item is only
+         * reachable via the F1 menu, which stays reachable so the
+         * user can switch SD-via-USB back off; the menu is not itself
+         * gated the way the file browser is. */
+        if (usb_msc_get_mode() != USB_MSC_MODE_OFF) {
+            editor_ui_set_status("SD card via USB active -- disable it first");
+            break;
+        }
+#endif
+        /* Auto-save unsaved edits so the sync task pushes the latest content. */
+        if (editor_is_modified() && editor_get_file_path()) {
+            editor_save_file();
+        }
+        if (git_sync_is_configured() && wifi_manager_is_connected()) {
+            close_menu();
+            if (git_sync_start(GIT_SYNC_BOTH) == ESP_OK) {
+                editor_ui_set_status("Git: syncing...");
+            } else {
+                char sbuf[128];
+                const char *err = git_sync_get_last_error();
+                snprintf(sbuf, sizeof(sbuf), "Git: %s",
+                         (err && err[0]) ? err : "failed to start sync");
+                editor_ui_set_status(sbuf);
+            }
+        } else if (!wifi_manager_is_connected()) {
+            editor_ui_set_status("Git: connect WiFi first");
+        } else {
+            editor_ui_set_status("Git: not configured");
+        }
+        break;
+    case MENU_IDX_DRAFTBOX:
+#if defined(CONFIG_DRAFTLING_HAS_USB_MSC)
+        /* Writes git.cfg on the SD card -- same guard as Git Sync. */
+        if (usb_msc_get_mode() != USB_MSC_MODE_OFF) {
+            editor_ui_set_status("SD card via USB active -- disable it first");
+            break;
+        }
+#endif
+        if (wifi_manager_is_connected()) {
+            show_dbx_prompt(false);
+        } else {
+            /* Connect first, the same way as Ctrl+W, unless an attempt
+             * is already running -- then just wait for its outcome. */
+            show_dbx_prompt(true);
+            if (wifi_manager_get_state() != WIFI_STATE_CONNECTING)
+                wifi_connect_async();
+        }
+        break;
+    case MENU_IDX_KB_LAYOUT:
+        kb_layout_next();
+        refresh_menu_items();
+        break;
+#if defined(CONFIG_DRAFTLING_HAS_USB_MSC)
+    case MENU_IDX_USB_MSC:
+        if (usbmsc_item_disabled()) {
+            editor_ui_set_status("SD card via USB: insert an SD card first");
+            break;
+        }
+        /* Open the picker sub-list. Up/Down to navigate, Enter to
+         * stage a choice, Esc to return without changing it -- either
+         * way, leaving the picker applies it (see
+         * close_usbmsc_picker() / commit_usb_msc_pending_mode()). */
+        s_usbmsc_picker_open = true;
+        s_usbmsc_picker_sel = (s_usbmsc_pending_mode == USB_MSC_MODE_READ_ONLY) ? 1
+                            : (s_usbmsc_pending_mode == USB_MSC_MODE_READ_WRITE) ? 2
+                            : 0;
+        refresh_usbmsc_picker_items();
+        break;
+#endif
+    case MENU_IDX_FORMAT_SD:
+        open_fmt_picker();
+        break;
+    case MENU_IDX_HWINFO:
+        s_menu_open = false;
+        show_hwinfo(s_editor_screen_active ? HELP_FROM_EDITOR : HELP_FROM_BROWSER);
+        break;
+    case MENU_IDX_HELP:
+        /* The help describes the screen the menu was opened from. */
+        s_menu_open = false;
+        show_help(s_editor_screen_active ? HELP_FROM_EDITOR : HELP_FROM_BROWSER);
+        break;
+    case MENU_IDX_SLEEP:
+        /* Leave the menu first so, if we prompt about unsaved changes,
+         * the dialog is drawn on the editor screen it lives on. With no
+         * unsaved changes (or if the menu was opened from the file
+         * browser) go straight to deep sleep. */
+        close_menu();
+        if (s_editor_screen_active && editor_is_modified()) {
+            show_sleep_prompt();
+        } else {
+            standby_enter_sleep();
+        }
+        break;
+    case MENU_IDX_CLOSE:
+        close_menu();
+        break;
+    default:
+        break;
+    }
+}
+
+static void handle_menu_key(const kb_event_t *ev)
+{
+    if (s_wifi_scan_picker_open) {
+        /* Up/Down/Enter/Esc only -- ignore keys while a scan is still
+         * in flight (s_wifi_scan_in_progress) so Enter can't activate
+         * the placeholder "Scanning..." row. */
+        int last_row = wifi_scan_rescan_row();
+        switch (ev->keycode) {
+        case KB_KEY_UP:
+            if (!s_wifi_scan_in_progress && s_wifi_scan_picker_sel > 0)
+                s_wifi_scan_picker_sel--;
+            update_wifi_scan_picker_highlight();
+            break;
+        case KB_KEY_DOWN:
+            if (!s_wifi_scan_in_progress && s_wifi_scan_picker_sel < last_row)
+                s_wifi_scan_picker_sel++;
+            update_wifi_scan_picker_highlight();
+            break;
+        case KB_KEY_ENTER:
+            if (!s_wifi_scan_in_progress)
+                wifi_scan_picker_activate(s_wifi_scan_picker_sel);
+            break;
+        case KB_KEY_ESCAPE:
+            close_wifi_scan_picker();
+            break;
+        default:
+            break;
+        }
+        return;
+    }
+
+    if (s_fmt_step != FMT_STEP_NONE) {
+        int last_row = (s_fmt_step == FMT_STEP_WIFI) ? 2 : 1;
+        switch (ev->keycode) {
+        case KB_KEY_UP:
+            if (s_fmt_sel > 0) s_fmt_sel--;
+            update_fmt_picker_highlight();
+            break;
+        case KB_KEY_DOWN:
+            if (s_fmt_sel < last_row) s_fmt_sel++;
+            update_fmt_picker_highlight();
+            break;
+        case KB_KEY_ENTER:
+            fmt_picker_activate(s_fmt_sel);
+            break;
+        case KB_KEY_ESCAPE:
+            close_fmt_picker();
+            break;
+        default:
+            break;
+        }
+        return;
+    }
+
+#if defined(CONFIG_DRAFTLING_HAS_USB_MSC)
+    if (s_usbmsc_picker_open) {
+        switch (ev->keycode) {
+        case KB_KEY_UP:
+            if (s_usbmsc_picker_sel > 0) s_usbmsc_picker_sel--;
+            update_usbmsc_picker_highlight();
+            break;
+        case KB_KEY_DOWN:
+            if (s_usbmsc_picker_sel < 2) s_usbmsc_picker_sel++;
+            update_usbmsc_picker_highlight();
+            break;
+        case KB_KEY_ENTER:
+            s_usbmsc_pending_mode = (s_usbmsc_picker_sel == 1) ? USB_MSC_MODE_READ_ONLY
+                                   : (s_usbmsc_picker_sel == 2) ? USB_MSC_MODE_READ_WRITE
+                                   : USB_MSC_MODE_OFF;
+            close_usbmsc_picker();
+            break;
+        case KB_KEY_ESCAPE:
+            close_usbmsc_picker();
+            break;
+        default:
+            break;
+        }
+        return;
+    }
+#endif
+
+    switch (ev->keycode) {
+    case KB_KEY_UP:
+        if (s_menu_sel > 0) s_menu_sel--;
+        update_menu_highlight();
+        break;
+    case KB_KEY_DOWN:
+        if (s_menu_sel < MENU_ITEM_COUNT - 1) s_menu_sel++;
+        update_menu_highlight();
+        break;
+    case KB_KEY_ENTER:
+        menu_activate_item(s_menu_sel);
+        break;
+    case KB_KEY_ESCAPE:
+    case KB_KEY_F1:
+        close_menu();
+        break;
+    default:
+        /* Letter accelerators (drawn bold in the menu). K only moves
+         * the highlight to the keyboard row, where Enter cycles the
+         * layout; the others activate their row. */
+        if (ev->modifier & (KB_MOD_LCTRL | KB_MOD_RCTRL | KB_MOD_LALT |
+                            KB_MOD_RALT | KB_MOD_LGUI | KB_MOD_RGUI))
+            break;
+        {
+            char ch = kb_layout_shortcut_char(ev->keycode);
+            for (const menu_hotkey_t &h : s_menu_hotkeys) {
+                if (ch != h.key) continue;
+                s_menu_sel = h.idx;
+                update_menu_highlight();
+                if (h.idx != MENU_IDX_KB_LAYOUT) menu_activate_item(h.idx);
+                break;
+            }
+        }
+        break;
+    }
+}
+
+/* ---- Help screen ---- */
+
+/* Append one "key  description" row to the help text. The description
+ * is word-wrapped by hand to the text width (cols characters) with a
+ * hanging indent at keycol, so it stays in its column; a key too long
+ * for the key column gets a line of its own. */
+static void help_row(std::string &out, int cols, int keycol,
+                     const char *key, const char *desc)
+{
+    int klen = (int)strlen(key);
+    out += key;
+    if (klen >= keycol) {
+        out += '\n';
+        out.append(keycol, ' ');
+    } else {
+        out.append(keycol - klen, ' ');
+    }
+    int dw = cols - keycol;
+    if (dw < 8) dw = 8;
+    int col = 0;
+    const char *p = desc;
+    while (*p) {
+        const char *w = p;
+        while (*w && *w != ' ') w++;
+        int wl = (int)(w - p);
+        if (col > 0 && col + 1 + wl > dw) {
+            out += '\n';
+            out.append(keycol, ' ');
+            col = 0;
+        } else if (col > 0) {
+            out += ' ';
+            col++;
+        }
+        out.append(p, wl);
+        col += wl;
+        while (*w == ' ') w++;
+        p = w;
+    }
+    out += '\n';
+}
+
+static void help_heading(std::string &out, const char *title)
+{
+    if (!out.empty()) out += '\n';
+    out += title;
+    out += '\n';
+    out.append(strlen(title), '-');
+    out += '\n';
+}
+
+/* Shortcuts that work both in the editor and in the file browser. */
+static void help_common_rows(std::string &out, int cols, int kc)
+{
+    help_row(out, cols, kc, "F1, Ctrl+M", "Menu");
+    help_row(out, cols, kc, "F10", "This help");
+    help_row(out, cols, kc, "Ctrl+1", "Single pane");
+    help_row(out, cols, kc, "Ctrl+2", "Split into two equal panes");
+    help_row(out, cols, kc, "Ctrl+3", "Split with a wide first pane; again to make it narrow");
+    help_row(out, cols, kc, "Ctrl+G", "Git sync");
+    help_row(out, cols, kc, "Ctrl+W", "WiFi connect / disconnect");
+    help_row(out, cols, kc, "Ctrl+P", "Sleep");
+#if defined(CONFIG_DRAFTLING_DISPLAY_HAS_BACKLIGHT) && !defined(CONFIG_DRAFTLING_DISPLAY_BACKLIGHT_BINARY)
+    help_row(out, cols, kc, "Ctrl+B", "Backlight brightness");
+#endif
+#if defined(CONFIG_DRAFTLING_DISPLAY_EPD)
+    help_row(out, cols, kc, "Ctrl+R", "Full screen refresh (clears ghosting)");
+#endif
+    help_row(out, cols, kc, "Ctrl+Q", "Same as Esc, for keyboards without one");
+}
+
+static void build_help_text(std::string &out, help_origin_t origin, int cols)
+{
+    int kc = cols / 3;
+    if (kc < 11) kc = 11;
+    if (kc > 16) kc = 16;
+
+    if (origin == HELP_FROM_EDITOR) {
+        help_heading(out, "Editor");
+        help_row(out, cols, kc, "Esc", "Back to the file browser (asks to save changes)");
+        help_row(out, cols, kc, "Ctrl+S", "Save / save as");
+        help_row(out, cols, kc, "Ctrl+O", "Open another file");
+        help_row(out, cols, kc, "Ctrl+N", "New file");
+        help_row(out, cols, kc, "Ctrl+F", "Find");
+        help_row(out, cols, kc, "Ctrl+H", "Find and replace (Tab: switch field, Ctrl+Enter: replace)");
+        help_row(out, cols, kc, "Shift+arrows", "Select text");
+        help_row(out, cols, kc, "Ctrl+A", "Select all");
+        help_row(out, cols, kc, "Ctrl+C / X / V", "Copy / cut / paste");
+        help_row(out, cols, kc, "Ctrl+Left/Right", "Previous / next word");
+        help_row(out, cols, kc, "Home / End", "Start / end of line");
+        help_row(out, cols, kc, "Ctrl+Home/End", "Start / end of document");
+        help_row(out, cols, kc, "PgUp / PgDn", "Page up / down");
+        help_row(out, cols, kc, "Ctrl+Up/Down", "Page up / down, same as PgUp / PgDn");
+        help_row(out, cols, kc, "Ctrl+Tab", "Switch pane (when split)");
+        help_row(out, cols, kc, "Ctrl+L", "Next keyboard layout (also Win+Space)");
+        help_common_rows(out, cols, kc);
+
+        pane_bind_focus();
+        const editor_format_t *fmt = editor_format_active();
+        help_heading(out, fmt->help_title);
+        for (const fmt_help_row_t *r = fmt->help; r->syntax; r++)
+            help_row(out, cols, kc, r->syntax, r->meaning);
+    } else {
+        help_heading(out, "File browser");
+        help_row(out, cols, kc, "Up / Down", "Select a file");
+        help_row(out, cols, kc, "Enter", "Open the file or folder");
+        if (origin == HELP_FROM_INPANE)
+            help_row(out, cols, kc, "Esc", "Back to the editor");
+        help_row(out, cols, kc, "N, Ctrl+N", "New file: Markdown, Fountain or plain text");
+        help_row(out, cols, kc, "F2, Alt+R", "Rename the file");
+        help_row(out, cols, kc, "Del, Alt+D", "Delete the file (only once it is pushed with Git sync)");
+        if (origin == HELP_FROM_INPANE)
+            help_row(out, cols, kc, "Ctrl+Tab", "Switch to the other pane");
+        help_common_rows(out, cols, kc);
+    }
+}
+
+/* Text width of the help page in characters: the body width minus its
+ * 4 px side padding and room for the scrollbar, over the monospace
+ * cell. */
+static int help_cols(void)
+{
+    int cols = (SCR_W - 16) / char_width_for_font(FONT_14);
+    return cols < 20 ? 20 : cols;
+}
+
+/* Decimal size ("31.9 GB", "512 MB"), as SD cards are labelled. */
+static void format_size(char *buf, size_t len, uint64_t bytes)
+{
+    uint64_t mb = bytes / 1000000ULL;
+    if (mb >= 1000) {
+        uint64_t tenths = (bytes + 50000000ULL) / 100000000ULL;
+        snprintf(buf, len, "%u.%u GB", (unsigned)(tenths / 10),
+                 (unsigned)(tenths % 10));
+    } else {
+        snprintf(buf, len, "%u MB", (unsigned)mb);
+    }
+}
+
+/* Binary size ("512 KB", "8 MB", "1.5 MB"), as memory is measured. */
+static void format_mem(char *buf, size_t len, uint64_t bytes)
+{
+    if (bytes >= (1ULL << 20)) {
+        unsigned tenths = (unsigned)((bytes * 10 + (1ULL << 19)) >> 20);
+        if (tenths % 10) snprintf(buf, len, "%u.%u MB", tenths / 10, tenths % 10);
+        else             snprintf(buf, len, "%u MB", tenths / 10);
+    } else {
+        snprintf(buf, len, "%u KB", (unsigned)(bytes >> 10));
+    }
+}
+
+/* "<free> free of <total>" row for a heap with the given caps. */
+static void hwinfo_heap_row(std::string &out, int cols, int kc,
+                            const char *label, uint32_t caps)
+{
+    char tot[16], fr[16], buf[48];
+    format_mem(tot, sizeof(tot), heap_caps_get_total_size(caps));
+    format_mem(fr, sizeof(fr), heap_caps_get_free_size(caps));
+    snprintf(buf, sizeof(buf), "%s free of %s", fr, tot);
+    help_row(out, cols, kc, label, buf);
+}
+
+static void format_mac(char *buf, size_t len, const uint8_t *m)
+{
+    snprintf(buf, len, "%02X:%02X:%02X:%02X:%02X:%02X",
+             m[0], m[1], m[2], m[3], m[4], m[5]);
+}
+
+static void hwinfo_mac_row(std::string &out, int cols, int kc,
+                           const char *label, esp_mac_type_t type)
+{
+    uint8_t m[6];
+    if (esp_read_mac(m, type) != ESP_OK) return;
+    char buf[24];
+    format_mac(buf, sizeof(buf), m);
+    help_row(out, cols, kc, label, buf);
+}
+
+static void build_hwinfo_text(std::string &out, int cols)
+{
+    const int kc = 15;
+    char buf[96];
+
+    help_heading(out, "Board");
+    help_row(out, cols, kc, "Model", s_board_name ? s_board_name : "unknown");
+    esp_chip_info_t chip;
+    esp_chip_info(&chip);
+    snprintf(buf, sizeof(buf), "%s rev %d.%d, %d core%s", CONFIG_IDF_TARGET,
+             chip.revision / 100, chip.revision % 100, chip.cores,
+             chip.cores == 1 ? "" : "s");
+    help_row(out, cols, kc, "Chip", buf);
+
+    help_heading(out, "Memory");
+    hwinfo_heap_row(out, cols, kc, "RAM", MALLOC_CAP_INTERNAL);
+    size_t psram = esp_psram_is_initialized() ? esp_psram_get_size() : 0;
+    if (psram) {
+        format_mem(buf, sizeof(buf), psram);
+        help_row(out, cols, kc, "PSRAM", buf);
+        hwinfo_heap_row(out, cols, kc, "PSRAM heap", MALLOC_CAP_SPIRAM);
+    } else {
+        help_row(out, cols, kc, "PSRAM", "none");
+    }
+    uint32_t flash = 0;
+    if (esp_flash_get_physical_size(esp_flash_default_chip, &flash) == ESP_OK ||
+        esp_flash_get_size(esp_flash_default_chip, &flash) == ESP_OK) {
+        format_mem(buf, sizeof(buf), flash);
+        help_row(out, cols, kc, "Flash", buf);
+    }
+
+    help_heading(out, "Screen");
+    help_row(out, cols, kc, "Controller", display_controller_name());
+#if defined(CONFIG_DRAFTLING_TOUCHSCREEN)
+#if defined(CONFIG_DRAFTLING_DISPLAY_MIPI_DSI)
+    const char *touch = "GT911 / ST7123";
+#elif defined(CONFIG_DRAFTLING_TOUCH_GT911)
+    const char *touch = "GT911";
+#elif defined(CONFIG_DRAFTLING_TOUCH_FT6336U)
+    const char *touch = "FT6336-compatible";
+#elif defined(CONFIG_DRAFTLING_TOUCH_AXS5106L)
+    const char *touch = "AXS5106L";
+#elif defined(CONFIG_DRAFTLING_TOUCH_ST77922)
+    const char *touch = "ST77922 (built-in)";
+#else
+    const char *touch = "yes";
+#endif
+    help_row(out, cols, kc, "Touch", touch);
+#else
+    help_row(out, cols, kc, "Touch", "none");
+#endif
+    snprintf(buf, sizeof(buf), "%d x %d", CONFIG_DRAFTLING_DISPLAY_WIDTH,
+             CONFIG_DRAFTLING_DISPLAY_HEIGHT);
+    help_row(out, cols, kc, "Resolution", buf);
+    snprintf(buf, sizeof(buf), "%d x %d", (int)SCR_W, (int)SCR_H);
+    help_row(out, cols, kc, "Text area", buf);
+
+    help_heading(out, "SD card");
+    sdmmc_card_t *card = sd_card_get_handle();
+    if (!card) {
+        help_row(out, cols, kc, "Status", "not inserted");
+    } else {
+        uint64_t cap = (uint64_t)card->csd.capacity * card->csd.sector_size;
+        const char *type;
+        if (card->is_mmc)                        type = "MMC";
+        else if (card->is_sdio)                  type = "SDIO";
+        else if (!(card->ocr & SD_OCR_SDHC_CAP)) type = "SDSC";
+        else if (cap > (32ULL << 30))            type = "SDXC";
+        else                                     type = "SDHC";
+        char name[sizeof(card->cid.name) + 1];
+        memcpy(name, card->cid.name, sizeof(card->cid.name));
+        name[sizeof(card->cid.name)] = '\0';
+        if (name[0]) snprintf(buf, sizeof(buf), "%s (%s)", type, name);
+        else         snprintf(buf, sizeof(buf), "%s", type);
+        help_row(out, cols, kc, "Type", buf);
+        format_size(buf, sizeof(buf), cap);
+        help_row(out, cols, kc, "Size", buf);
+        uint64_t fs_total = 0, fs_free = 0;
+        if (sd_card_get_fs_space(&fs_total, &fs_free) == ESP_OK) {
+            char tot[24], fr[24];
+            format_size(tot, sizeof(tot), fs_total);
+            format_size(fr, sizeof(fr), fs_free);
+            snprintf(buf, sizeof(buf), "%s of %s", fr, tot);
+            help_row(out, cols, kc, "Free", buf);
+        }
+#if defined(CONFIG_DRAFTLING_SD_SDMMC)
+        const char *bus = "SDMMC 1-bit";
+#else
+        const char *bus = "SPI";
+#endif
+        snprintf(buf, sizeof(buf), "%s, %d MHz", bus, card->real_freq_khz / 1000);
+        help_row(out, cols, kc, "Interface", buf);
+    }
+
+    help_heading(out, "Keyboard");
+    bool any_kbd = false;
+    if (ble_keyboard_is_connected()) {
+        const char *n = ble_keyboard_get_device_name();
+        snprintf(buf, sizeof(buf), "%s", (n && n[0]) ? n : "connected");
+        help_row(out, cols, kc, "Bluetooth", buf);
+        uint8_t kb_mac[6];
+        if (ble_keyboard_get_device_addr(kb_mac)) {
+            format_mac(buf, sizeof(buf), kb_mac);
+            help_row(out, cols, kc, "Keyboard MAC", buf);
+        }
+        any_kbd = true;
+    }
+#if defined(CONFIG_DRAFTLING_HAS_USB_HOST)
+    if (usb_kbd_is_connected()) {
+        help_row(out, cols, kc, "USB", "HID keyboard");
+        any_kbd = true;
+    }
+#endif
+#if defined(CONFIG_DRAFTLING_HAS_TAB5_KBD)
+    if (tab5_kbd_is_present()) {
+        help_row(out, cols, kc, "Built-in", "Tab5 keyboard");
+        any_kbd = true;
+    }
+#endif
+    if (!any_kbd) help_row(out, cols, kc, "Status", "none connected");
+
+    help_heading(out, "MAC address");
+#if SOC_WIFI_SUPPORTED || SOC_BT_SUPPORTED
+#if SOC_WIFI_SUPPORTED
+    hwinfo_mac_row(out, cols, kc, "WiFi", ESP_MAC_WIFI_STA);
+#endif
+#if SOC_BT_SUPPORTED
+    hwinfo_mac_row(out, cols, kc, "Bluetooth", ESP_MAC_BT);
+#endif
+#else
+    hwinfo_mac_row(out, cols, kc, "Base", ESP_MAC_BASE);
+#endif
+}
+
+/* Show s_scr_help with the given header and body text. */
+static void show_help_page(help_origin_t origin, const char *hdr,
+                           const std::string &text)
+{
+    if (origin == HELP_FROM_INPANE) close_inpane_browser();
+    s_help_origin = origin;
+    s_help_open = true;
+
+    lv_label_set_text(s_lbl_help_hdr, hdr);
+    lv_label_set_text(s_help_lbl, text.c_str());
+    lv_obj_scroll_to_y(s_help_cont, 0, LV_ANIM_OFF);
+
+#if defined(CONFIG_DRAFTLING_DISPLAY_EPD)
+    /* Same missing-repaint issue as show_menu(). */
+    display_clear(0xFF);
+    lv_obj_invalidate(s_scr_help);
+#endif
+    lv_scr_load(s_scr_help);
+}
+
+static void show_help(help_origin_t origin)
+{
+    if (!s_scr_help) return;
+    std::string text;
+    build_help_text(text, origin, help_cols());
+    show_help_page(origin,
+                   "Help - Up/Down/PgUp/PgDn to scroll, Esc or Enter to close",
+                   text);
+}
+
+static void show_hwinfo(help_origin_t origin)
+{
+    if (!s_scr_help) return;
+    std::string text;
+    build_hwinfo_text(text, help_cols());
+    show_help_page(origin,
+                   "Hardware information - Esc or Enter to close", text);
+}
+
+static void close_help(void)
+{
+    s_help_open = false;
+    switch (s_help_origin) {
+    case HELP_FROM_EDITOR:
+        editor_ui_show_editor();
+        break;
+    case HELP_FROM_INPANE:
+        editor_ui_show_editor();
+        show_inpane_browser();
+        break;
+    default:
+        editor_ui_show_file_browser();
+        break;
+    }
+}
+
+static void handle_help_key(const kb_event_t *ev)
+{
+    int32_t line = lv_font_get_line_height(FONT_14);
+    int32_t page = LIST_PANEL_H - line;
+    if (page < line) page = line;
+
+    /* Ctrl+Up / Ctrl+Down page, as in the editor. */
+    bool ctrl = (ev->modifier & (KB_MOD_LCTRL | KB_MOD_RCTRL)) != 0;
+    if (ctrl && ev->keycode == KB_KEY_UP) {
+        lv_obj_scroll_by_bounded(s_help_cont, 0, page, LV_ANIM_OFF);
+        return;
+    }
+    if (ctrl && ev->keycode == KB_KEY_DOWN) {
+        lv_obj_scroll_by_bounded(s_help_cont, 0, -page, LV_ANIM_OFF);
+        return;
+    }
+
+    switch (ev->keycode) {
+    case KB_KEY_UP:
+        lv_obj_scroll_by_bounded(s_help_cont, 0, line, LV_ANIM_OFF);
+        break;
+    case KB_KEY_DOWN:
+        lv_obj_scroll_by_bounded(s_help_cont, 0, -line, LV_ANIM_OFF);
+        break;
+    case KB_KEY_PAGEUP:
+        lv_obj_scroll_by_bounded(s_help_cont, 0, page, LV_ANIM_OFF);
+        break;
+    case KB_KEY_PAGEDOWN:
+    case KB_KEY_SPACE:
+        lv_obj_scroll_by_bounded(s_help_cont, 0, -page, LV_ANIM_OFF);
+        break;
+    case KB_KEY_HOME:
+        lv_obj_scroll_to_y(s_help_cont, 0, LV_ANIM_OFF);
+        break;
+    case KB_KEY_END:
+        lv_obj_scroll_by_bounded(s_help_cont, 0, -LV_COORD_MAX / 2, LV_ANIM_OFF);
+        break;
+    case KB_KEY_ENTER:
+    case KB_KEY_ESCAPE:
+    case KB_KEY_F10:
+        close_help();
+        break;
+    default:
+        break;
+    }
+}
+
+#if defined(CONFIG_DRAFTLING_TOUCHSCREEN)
+/* A tap on the help page closes it; a drag scrolls it (LVGL does not
+ * report a click at the end of a scroll). */
+static void help_touch_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_help_open) close_help();
+}
+#endif
+
+/* ---- Save-prompt overlay ---- */
+
+/* Compute a default filename for a new (untitled) document, with the
+ * extension of its format (".md", ".fountain" or ".txt"). The draft
+ * numbers are shared by all extensions, so a new screenplay after
+ * draft_001.md becomes draft_002.fountain, not draft_001.fountain.
+ * Returns the bare filename (no directory prefix). */
+static bool generate_default_name(char *buf, size_t buf_size)
+{
+    static const char *const exts[] = { "md", "fountain", "txt" };
+    const char *mp = sd_card_get_mount_point();
+    if (!mp) return false;
+    const char *ext = editor_format_ext(editor_get_format());
+    char path[256];
+    for (int seq = 1; seq <= MAX_DRAFT_SEQ; seq++) {
+        bool taken = false;
+        for (const char *e : exts) {
+            snprintf(path, sizeof(path), "%s/draft_%03d.%s", mp, seq, e);
+            if (sd_card_file_exists(path)) taken = true;
+        }
+        if (!taken) {
+            snprintf(buf, buf_size, "draft_%03d.%s", seq, ext);
+            return true;
+        }
+    }
+    return false;
+}
+
+static void refresh_save_prompt(void)
+{
+    if (!s_save_panel) return;
+    lv_label_set_text(s_save_name_lbl, s_save_buf);
+
+    /* Position the thin cursor bar after the character at s_save_pos.
+     * We measure the pixel width of the text up to the cursor position
+     * using the monospace character width. */
+    int cw = char_width_for_font(FONT_11);
+    /* Count UTF-8 characters up to s_save_pos bytes */
+    int chars = 0;
+    for (int i = 0; i < s_save_pos; i++) {
+        if ((s_save_buf[i] & 0xC0) != 0x80) chars++;
+    }
+    int cx = chars * cw;
+    lv_obj_set_pos(s_save_cur, cx, overlay_row_y());
+    lv_obj_remove_flag(s_save_cur, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void show_save_prompt(void)
+{
+    /* Pre-fill with existing filename (bare name, no directory) */
+    const char *path = editor_get_file_path();
+    if (path) {
+        const char *slash = strrchr(path, '/');
+        const char *name = slash ? slash + 1 : path;
+        strncpy(s_save_buf, name, sizeof(s_save_buf) - 1);
+        s_save_buf[sizeof(s_save_buf) - 1] = '\0';
+    } else {
+        if (!generate_default_name(s_save_buf, sizeof(s_save_buf))) {
+            editor_ui_set_status("Save failed: too many drafts");
+            return;
+        }
+    }
+    s_save_pos = (int)strlen(s_save_buf);
+    s_save_open = true;
+    s_save_is_rename = false;
+    lv_label_set_text(s_save_hdr_lbl, "Save as (Enter/Esc):");
+    lv_obj_set_parent(s_save_panel, s_scr);
+    lv_obj_remove_flag(s_save_panel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_save_panel);
+    refresh_save_prompt();
+}
+
+/* F2 / Alt+R in the file browser: ask for a new name for the selected file. */
+static void show_rename_prompt(void)
+{
+    if (!s_save_panel || !s_browser_list) return;
+    lv_obj_t *btn = lv_obj_get_child(s_browser_list, s_browser_sel);
+    if (!btn) return;
+    int idx = (int)(intptr_t)lv_obj_get_user_data(btn);
+    if (idx < 0 || idx >= s_browser_count) return;
+    if (s_browser_entries[idx].is_dir) {
+        editor_ui_set_status("Only files can be renamed");
+        return;
+    }
+    const char *name = s_browser_entries[idx].name;
+    snprintf(s_rename_src, sizeof(s_rename_src), "%s/%s",
+             sd_card_get_mount_point(), name);
+    strncpy(s_save_buf, name, sizeof(s_save_buf) - 1);
+    s_save_buf[sizeof(s_save_buf) - 1] = '\0';
+    s_save_pos = (int)strlen(s_save_buf);
+    s_save_open = true;
+    s_save_is_rename = true;
+    lv_label_set_text(s_save_hdr_lbl, "Rename to (Enter/Esc):");
+    lv_obj_set_parent(s_save_panel, lv_scr_act());
+    lv_obj_remove_flag(s_save_panel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_save_panel);
+    refresh_save_prompt();
+}
+
+static void close_save_prompt(void)
+{
+    s_save_open = false;
+    lv_obj_add_flag(s_save_panel, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void rename_prompt_confirm(void)
+{
+    const char *old_name = strrchr(s_rename_src, '/');
+    old_name = old_name ? old_name + 1 : s_rename_src;
+    if (strcmp(s_save_buf, old_name) == 0) {
+        close_save_prompt();
+        restore_default_status();
+        return;
+    }
+    if (!editor_path_format(s_save_buf, NULL)) {
+        /* Any other extension would hide the file from the browser. */
+        editor_ui_set_status("Name must end in .md, .fountain or .txt");
+        return;
+    }
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", sd_card_get_mount_point(), s_save_buf);
+    esp_err_t err = editor_rename_file(s_rename_src, path);
+    if (err == ESP_ERR_INVALID_STATE) {
+        editor_ui_set_status("Rename failed: name already exists");
+        return;
+    }
+    close_save_prompt();
+    if (err != ESP_OK) {
+        editor_ui_set_status("Rename failed!");
+        return;
+    }
+    refresh_file_list(s_save_buf);
+    char msg[80];
+    snprintf(msg, sizeof(msg), "Renamed to %.40s", s_save_buf);
+    editor_ui_set_status(msg);
+}
+
+static void save_prompt_confirm(void)
+{
+    if (s_save_buf[0] == '\0') {
+        /* Empty name -- ignore */
+        return;
+    }
+    if (s_save_is_rename) {
+        rename_prompt_confirm();
+        return;
+    }
+    const char *mp = sd_card_get_mount_point();
+    if (!mp) {
+        close_save_prompt();
+        editor_ui_set_status("Save failed: SD card not ready");
+        return;
+    }
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", mp, s_save_buf);
+    esp_err_t err = editor_save_file_as(path);
+    close_save_prompt();
+    if (err == ESP_OK) {
+        char msg[80];
+        snprintf(msg, sizeof(msg), "Saved as %.40s", s_save_buf);
+        editor_ui_set_status(msg);
+    } else {
+        editor_ui_set_status("Save failed!");
+    }
+    editor_ui_refresh();
+}
+
+static void handle_save_prompt_key(const kb_event_t *ev)
+{
+    switch (ev->keycode) {
+    case KB_KEY_ENTER:
+        save_prompt_confirm();
+        return;
+    case KB_KEY_ESCAPE:
+        close_save_prompt();
+        if (s_save_is_rename)
+            restore_default_status();
+        else
+            editor_ui_set_status(
+                "F1:Menu Ctrl+S:Save Ctrl+L:Layout Ctrl+G:Git Esc:Files");
+        return;
+    case KB_KEY_LEFT:
+        if (s_save_pos > 0) {
+            /* Move back one UTF-8 character */
+            do { s_save_pos--; }
+            while (s_save_pos > 0 &&
+                   (s_save_buf[s_save_pos] & 0xC0) == 0x80);
+        }
+        break;
+    case KB_KEY_RIGHT:
+        if (s_save_pos < (int)strlen(s_save_buf)) {
+            /* Move forward one UTF-8 character */
+            s_save_pos++;
+            while (s_save_pos < (int)strlen(s_save_buf) &&
+                   (s_save_buf[s_save_pos] & 0xC0) == 0x80)
+                s_save_pos++;
+        }
+        break;
+    case KB_KEY_HOME:
+        s_save_pos = 0;
+        break;
+    case KB_KEY_END:
+        s_save_pos = (int)strlen(s_save_buf);
+        break;
+    case KB_KEY_BACKSPACE:
+        if (s_save_pos > 0) {
+            /* Delete the previous UTF-8 character */
+            int prev = s_save_pos - 1;
+            while (prev > 0 && (s_save_buf[prev] & 0xC0) == 0x80)
+                prev--;
+            int len = (int)strlen(s_save_buf);
+            memmove(s_save_buf + prev, s_save_buf + s_save_pos,
+                    (size_t)(len - s_save_pos + 1));
+            s_save_pos = prev;
+        }
+        break;
+    case KB_KEY_DELETE: {
+        int len = (int)strlen(s_save_buf);
+        if (s_save_pos < len) {
+            /* Find end of current UTF-8 character */
+            int next = s_save_pos + 1;
+            while (next < len && (s_save_buf[next] & 0xC0) == 0x80)
+                next++;
+            memmove(s_save_buf + s_save_pos, s_save_buf + next,
+                    (size_t)(len - next + 1));
+        }
+        break;
+    }
+    default: {
+        /* Insert typed character (use layout translation) */
+        bool ctrl = (ev->modifier & (KB_MOD_LCTRL | KB_MOD_RCTRL)) != 0;
+        if (ctrl) break; /* ignore ctrl combos in filename */
+        const char *text = kb_layout_translate(ev->keycode, ev->modifier);
+        if (text && text[0]) {
+            size_t tlen = strlen(text);
+            size_t cur_len = strlen(s_save_buf);
+            /* Reject path separators and control chars */
+            if (text[0] == '/' || text[0] == '\\' || text[0] < 0x20) break;
+            if (cur_len + tlen < sizeof(s_save_buf) - 1) {
+                memmove(s_save_buf + s_save_pos + tlen,
+                        s_save_buf + s_save_pos,
+                        cur_len - (size_t)s_save_pos + 1);
+                memcpy(s_save_buf + s_save_pos, text, tlen);
+                s_save_pos += (int)tlen;
+            }
+        }
+        break;
+    }
+    }
+    refresh_save_prompt();
+}
+
+/* ---- New-document format picker logic ---- */
+
+static void refresh_newfmt_prompt(void)
+{
+    if (!s_newfmt_panel) return;
+    for (int i = 0; i < NEWFMT_COUNT; i++) {
+        if (!s_newfmt_opt_lbl[i]) continue;
+        bool sel = (i == s_newfmt_sel);
+        lv_obj_set_style_bg_color(s_newfmt_opt_lbl[i],
+                                  sel ? theme_fg() : theme_bg(), 0);
+        lv_obj_set_style_bg_opa(s_newfmt_opt_lbl[i], LV_OPA_COVER, 0);
+        lv_obj_set_style_text_color(s_newfmt_opt_lbl[i],
+                                    sel ? theme_bg() : theme_fg(), 0);
+    }
+}
+
+static void show_newfmt_prompt(newdoc_target_t target)
+{
+    if (!s_newfmt_panel) return;
+    s_newfmt_target = target;
+    s_newfmt_open = true;
+    s_newfmt_sel = 0;
+    lv_obj_set_parent(s_newfmt_panel, lv_scr_act());
+    lv_obj_remove_flag(s_newfmt_panel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_newfmt_panel);
+    refresh_newfmt_prompt();
+}
+
+static void close_newfmt_prompt(void)
+{
+    s_newfmt_open = false;
+    if (s_newfmt_panel) lv_obj_add_flag(s_newfmt_panel, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* Start a new untitled document in the picked format where the picker
+ * was raised from. */
+static void newfmt_prompt_activate(void)
+{
+    editor_doc_format_t f = NEWFMT_FORMATS[s_newfmt_sel];
+    newdoc_target_t target = s_newfmt_target;
+    close_newfmt_prompt();
+
+    switch (target) {
+    case NEWDOC_BROWSER:
+        editor_new_file();
+        editor_set_format(f);
+        editor_ui_show_editor();
+        break;
+    case NEWDOC_INPANE:
+        /* A new document in the focused pane (not a global replace --
+         * that is the single-pane behavior). */
+        if (!open_into_pane(s_focus, NULL)) {
+            editor_ui_set_status("New failed");
+            return;
+        }
+        editor_set_format(f);
+        s_open_target_pane = s_focus;
+        close_inpane_browser();
+        ensure_cursor_visible();
+        editor_ui_show_editor();
+        break;
+    case NEWDOC_EDITOR:
+        /* In single-pane mode this is the historical "replace current
+         * doc" behavior; while split it only affects the focused pane. */
+        pane_bind_focus();
+        if (s_pane_count <= 1) {
+            editor_new_file();
+            s_panes[0].doc = editor_get_active();
+            s_panes[0].has_saved_view = false;   /* adopt the new doc's view */
+        } else {
+            open_into_pane(s_focus, NULL);
+        }
+        editor_set_format(f);
+        ensure_cursor_visible();
+        editor_ui_refresh();
+        break;
+    }
+}
+
+static void handle_newfmt_prompt_key(const kb_event_t *ev)
+{
+    switch (ev->keycode) {
+    case KB_KEY_UP:
+        s_newfmt_sel = (s_newfmt_sel + NEWFMT_COUNT - 1) % NEWFMT_COUNT;
+        refresh_newfmt_prompt();
+        return;
+    case KB_KEY_DOWN:
+        s_newfmt_sel = (s_newfmt_sel + 1) % NEWFMT_COUNT;
+        refresh_newfmt_prompt();
+        return;
+    case KB_KEY_ENTER:
+        newfmt_prompt_activate();
+        return;
+    case KB_KEY_ESCAPE:
+        close_newfmt_prompt();
+        return;
+    default:
+        break;
+    }
+    /* M / F / T pick a format directly. */
+    char ch = kb_layout_shortcut_char(ev->keycode);
+    int pick = (ch == 'm') ? 0 : (ch == 'f') ? 1 : (ch == 't') ? 2 : -1;
+    if (pick >= 0) {
+        s_newfmt_sel = pick;
+        newfmt_prompt_activate();
+    }
+}
+
+/* ---- Delete-file confirmation logic ---- */
+
+static void refresh_delete_prompt(void)
+{
+    if (!s_del_panel) return;
+    for (int i = 0; i < DELCONF_COUNT; i++) {
+        if (!s_del_opt_lbl[i]) continue;
+        bool sel = (i == s_del_sel);
+        lv_obj_set_style_bg_color(s_del_opt_lbl[i], sel ? theme_fg() : theme_bg(), 0);
+        lv_obj_set_style_bg_opa(s_del_opt_lbl[i], LV_OPA_COVER, 0);
+        lv_obj_set_style_text_color(s_del_opt_lbl[i], sel ? theme_bg() : theme_fg(), 0);
+    }
+}
+
+static void close_delete_prompt(void)
+{
+    s_del_open = false;
+    if (s_del_panel) lv_obj_add_flag(s_del_panel, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* Del / Alt+D in the file browser: confirm deleting the selected file,
+ * provided Git sync already holds its current content. */
+static void show_delete_prompt(void)
+{
+    if (!s_del_panel || !s_browser_list) return;
+    lv_obj_t *btn = lv_obj_get_child(s_browser_list, s_browser_sel);
+    if (!btn) return;
+    int idx = (int)(intptr_t)lv_obj_get_user_data(btn);
+    if (idx < 0 || idx >= s_browser_count) return;
+    if (s_browser_entries[idx].is_dir) {
+        editor_ui_set_status("Only files can be deleted");
+        return;
+    }
+    const char *name = s_browser_entries[idx].name;
+
+    switch (git_sync_file_status(name)) {
+    case GIT_SYNC_FILE_PUSHED:
+        break;
+    case GIT_SYNC_FILE_NOT_CONFIGURED:
+        editor_ui_set_status("Delete needs Git sync (git.cfg)");
+        return;
+    case GIT_SYNC_FILE_BUSY:
+        editor_ui_set_status("Delete: wait for Git sync to finish");
+        return;
+    case GIT_SYNC_FILE_NOT_PUSHED:
+        editor_ui_set_status("Not on the Git server yet -- sync first (Ctrl+G)");
+        return;
+    case GIT_SYNC_FILE_MODIFIED:
+        editor_ui_set_status("Changed since last push -- sync first (Ctrl+G)");
+        return;
+    default:
+        editor_ui_set_status("Delete: cannot check Git status");
+        return;
+    }
+
+    snprintf(s_del_path, sizeof(s_del_path), "%s/%s", sd_card_get_mount_point(), name);
+    /* Remember the neighbouring row so the highlight stays in place. */
+    s_del_next_name[0] = '\0';
+    int rows = (int)lv_obj_get_child_count(s_browser_list);
+    int next = (s_browser_sel + 1 < rows) ? s_browser_sel + 1 : s_browser_sel - 1;
+    lv_obj_t *nbtn = (next >= 0) ? lv_obj_get_child(s_browser_list, next) : NULL;
+    if (nbtn) {
+        int nidx = (int)(intptr_t)lv_obj_get_user_data(nbtn);
+        if (nidx >= 0 && nidx < s_browser_count) {
+            strncpy(s_del_next_name, s_browser_entries[nidx].name, sizeof(s_del_next_name) - 1);
+            s_del_next_name[sizeof(s_del_next_name) - 1] = '\0';
+        }
+    }
+
+    char hdr[96];
+    snprintf(hdr, sizeof(hdr), "Delete %.40s? (kept in Git history)", name);
+    lv_label_set_text(s_del_hdr_lbl, hdr);
+    s_del_open = true;
+    s_del_sel = DELCONF_CANCEL;
+    lv_obj_set_parent(s_del_panel, lv_scr_act());
+    lv_obj_remove_flag(s_del_panel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_del_panel);
+    refresh_delete_prompt();
+}
+
+static void delete_prompt_activate(void)
+{
+    close_delete_prompt();
+    if (s_del_sel != DELCONF_DELETE) {
+        restore_default_status();
+        return;
+    }
+    const char *slash = strrchr(s_del_path, '/');
+    const char *name = slash ? slash + 1 : s_del_path;
+    char msg[80];
+    esp_err_t err = editor_delete_file(s_del_path);
+    if (err == ESP_ERR_INVALID_STATE) {
+        editor_ui_set_status("File is open in a pane -- close it first");
+        return;
+    }
+    if (err != ESP_OK) {
+        editor_ui_set_status("Delete failed!");
+        return;
+    }
+    snprintf(msg, sizeof(msg), "Deleted %.40s", name);
+    refresh_file_list(s_del_next_name[0] ? s_del_next_name : NULL);
+    editor_ui_set_status(msg);
+}
+
+static void handle_delete_prompt_key(const kb_event_t *ev)
+{
+    switch (ev->keycode) {
+    case KB_KEY_UP:
+    case KB_KEY_DOWN:
+        s_del_sel = (s_del_sel == DELCONF_DELETE) ? DELCONF_CANCEL : DELCONF_DELETE;
+        refresh_delete_prompt();
+        return;
+    case KB_KEY_ENTER:
+        delete_prompt_activate();
+        return;
+    case KB_KEY_ESCAPE:
+        s_del_sel = DELCONF_CANCEL;
+        delete_prompt_activate();
+        return;
+    default:
+        return;
+    }
+}
+
+/* ---- Exit / sleep prompt overlay ----
+ * Asks whether to save, proceed without saving, or cancel when the user
+ * tries to leave the editor (Esc -> browser, Ctrl+P -> sleep) with
+ * unsaved changes. */
+
+static void refresh_exit_prompt(void)
+{
+    if (!s_exit_panel) return;
+    for (int i = 0; i < EXIT_OPT_COUNT; i++) {
+        if (!s_exit_opt_lbl[i]) continue;
+        bool sel = (i == s_exit_sel);
+        /* Invert colors on the selected option so the highlight is
+         * visible on the 1-bpp reflective / e-paper panels. */
+        lv_obj_set_style_bg_color(s_exit_opt_lbl[i],
+                                  sel ? theme_fg() : theme_bg(), 0);
+        lv_obj_set_style_bg_opa(s_exit_opt_lbl[i], LV_OPA_COVER, 0);
+        lv_obj_set_style_text_color(s_exit_opt_lbl[i],
+                                    sel ? theme_bg() : theme_fg(), 0);
+    }
+}
+
+static void close_exit_prompt(void)
+{
+    s_exit_open = false;
+    if (s_exit_panel) lv_obj_add_flag(s_exit_panel, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* Point the overlay's rows at `purpose`, relabel them, and show it. */
+static void show_leave_prompt(exit_purpose_t purpose)
+{
+    if (!s_exit_panel) return;
+    s_exit_purpose = purpose;
+    const char *const *labels =
+        (purpose == EXIT_PURPOSE_SLEEP) ? SLEEP_OPT_LABELS : EXIT_OPT_LABELS;
+    for (int i = 0; i < EXIT_OPT_COUNT; i++) {
+        if (s_exit_opt_lbl[i]) lv_label_set_text(s_exit_opt_lbl[i], labels[i]);
+    }
+    if (s_exit_hdr_lbl) {
+        lv_label_set_text(s_exit_hdr_lbl,
+                          (purpose == EXIT_PURPOSE_SLEEP)
+                              ? "Unsaved changes -- sleep anyway?"
+                              : "Unsaved changes (Up/Down + Enter):");
+    }
+    s_exit_open = true;
+    s_exit_sel  = EXIT_OPT_SAVE;
+    lv_obj_remove_flag(s_exit_panel, LV_OBJ_FLAG_HIDDEN);
+    refresh_exit_prompt();
+}
+
+static void show_exit_prompt(void)  { show_leave_prompt(EXIT_PURPOSE_BROWSER); }
+static void show_sleep_prompt(void) { show_leave_prompt(EXIT_PURPOSE_SLEEP); }
+
+/* Finish a leave-prompt action once the document is no longer dirty
+ * (saved, or reloaded from disk by the discard path). */
+static void leave_prompt_proceed(exit_purpose_t purpose)
+{
+    if (purpose == EXIT_PURPOSE_SLEEP) {
+        standby_enter_sleep();
+        /* Only reached on CONFIG_DRAFTLING_STANDBY_DISPLAY_OFF boards --
+         * a real deep sleep never returns. The discard path may have
+         * reloaded the document from disk while the display was off, so
+         * wipe every pane's render cache and repaint from scratch. */
+        invalidate_all_render_caches();
+        editor_ui_refresh();
+    } else {
+        editor_ui_show_file_browser();
+    }
+}
+
+static void exit_prompt_activate(void)
+{
+    exit_purpose_t purpose = s_exit_purpose;
+
+    switch (s_exit_sel) {
+    case EXIT_OPT_SAVE:
+        close_exit_prompt();
+        if (editor_get_file_path()) {
+            /* Known filename -- save in place, then leave. */
+            if (editor_save_file() == ESP_OK) {
+                leave_prompt_proceed(purpose);
+            } else {
+                editor_ui_set_status("Save failed!");
+            }
+        } else {
+            /* Untitled document -- ask for a filename first. The user
+             * stays in the editor; once saved, repeating the action
+             * (Esc / Ctrl+P) goes straight through. */
+            show_save_prompt();
+        }
+        return;
+    case EXIT_OPT_DISCARD:
+        close_exit_prompt();
+        if (purpose == EXIT_PURPOSE_SLEEP) {
+            /* Really drop the edits: reload every modified document from
+             * disk so the standby pre-sleep auto-save has nothing to
+             * write. (The Esc/browser path keeps the in-memory edits --
+             * the document is still open, just not visible.) */
+            editor_discard_all_changes();
+        }
+        leave_prompt_proceed(purpose);
+        return;
+    case EXIT_OPT_CANCEL:
+    default:
+        close_exit_prompt();
+        editor_ui_set_status(
+            "F1:Menu Ctrl+S:Save Ctrl+L:Layout Ctrl+G:Git Esc:Files");
+        return;
+    }
+}
+
+#if defined(CONFIG_DRAFTLING_TOUCHSCREEN)
+/* A tap on an option row chooses it, like Up/Down + Enter. */
+static void exit_opt_touch_cb(lv_event_t *e)
+{
+    if (!s_exit_open) return;
+    s_exit_sel = (int)(intptr_t)lv_event_get_user_data(e);
+    refresh_exit_prompt();
+    exit_prompt_activate();
+}
+#endif
+
+static void handle_exit_prompt_key(const kb_event_t *ev)
+{
+    switch (ev->keycode) {
+    case KB_KEY_UP:
+        s_exit_sel = (s_exit_sel + EXIT_OPT_COUNT - 1) % EXIT_OPT_COUNT;
+        refresh_exit_prompt();
+        return;
+    case KB_KEY_DOWN:
+        s_exit_sel = (s_exit_sel + 1) % EXIT_OPT_COUNT;
+        refresh_exit_prompt();
+        return;
+    case KB_KEY_ENTER:
+        exit_prompt_activate();
+        return;
+    case KB_KEY_ESCAPE:
+        /* Esc inside the dialog cancels and keeps editing. */
+        s_exit_sel = EXIT_OPT_CANCEL;
+        exit_prompt_activate();
+        return;
+    default:
+        break;
+    }
+}
+
+/* ---- Search / Replace overlay logic ---- */
+
+/* Render both fields and place the cursor bar in the active one. */
+static void refresh_search_prompt(void)
+{
+    if (!s_search_panel) return;
+    lv_label_set_text(s_search_find_lbl, s_search_buf);
+    if (s_search_replace_mode) {
+        lv_label_set_text(s_search_repl_lbl, s_replace_buf);
+    }
+
+    int cw = char_width_for_font(FONT_11);
+    const char *active_buf = (s_search_field == 0) ? s_search_buf : s_replace_buf;
+    int active_pos = (s_search_field == 0) ? s_search_pos : s_replace_pos;
+    int chars = 0;
+    for (int i = 0; i < active_pos; i++) {
+        if ((active_buf[i] & 0xC0) != 0x80) chars++;
+    }
+    /* Field text labels are positioned just past the "F:" / "R:"
+     * prefix inside the panel. */
+    int cx = search_field_x() + chars * cw;
+    /* Cursor sits at the right edge of the active field's text. */
+    int cy = (s_search_field == 0) ? search_find_row_y() : search_repl_row_y();
+    lv_obj_set_pos(s_search_cur, cx, cy);
+    lv_obj_remove_flag(s_search_cur, LV_OBJ_FLAG_HIDDEN);
+
+    /* Hide / show replace row based on the mode. */
+    if (s_search_replace_mode) {
+        lv_obj_remove_flag(s_search_repl_hdr, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(s_search_repl_lbl, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s_search_repl_hdr, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_search_repl_lbl, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    lv_label_set_text(s_search_hdr_lbl,
+                      s_search_replace_mode ? "Find / Replace:" : "Find:");
+    lv_label_set_text(s_search_help_lbl,
+                      s_search_replace_mode
+                          ? "Enter:Next Ctrl+Enter:Replace Tab:Field Esc:Close"
+                          : "Enter:Next  Esc:Close");
+}
+
+static void show_search_prompt(bool replace_mode)
+{
+    s_search_replace_mode = replace_mode;
+    s_search_open = true;
+    s_search_field = 0;
+    /* Keep the previous query buffers so re-opening the dialog
+     * remembers the user's last input. Clear stale match state
+     * so Replace cannot operate on a stale range. */
+    s_search_match_start = -1;
+    s_search_match_end = -1;
+    s_search_pos = (int)strlen(s_search_buf);
+    s_replace_pos = (int)strlen(s_replace_buf);
+    lv_obj_remove_flag(s_search_panel, LV_OBJ_FLAG_HIDDEN);
+    refresh_search_prompt();
+}
+
+static void close_search_prompt(void)
+{
+    s_search_open = false;
+    if (s_search_panel) lv_obj_add_flag(s_search_panel, LV_OBJ_FLAG_HIDDEN);
+    /* Drop any selection from the most recent match so the editor
+     * goes back to a normal cursor view. */
+    editor_clear_selection();
+    s_search_match_start = -1;
+    s_search_match_end = -1;
+    editor_ui_set_status(
+        "F1:Menu Ctrl+S:Save Ctrl+L:Layout Ctrl+G:Git Esc:Files");
+}
+
+/* Find the next occurrence of s_search_buf starting just after the
+ * current match (or from the cursor when there is none). On match,
+ * move the cursor and select the matched range so the user can see
+ * what was found. */
+static void search_find_next(void)
+{
+    if (s_search_buf[0] == '\0') return;
+    size_t from;
+    if (s_search_match_start >= 0) {
+        /* Advance past the previous match so consecutive Enter
+         * presses cycle through results. */
+        from = (size_t)s_search_match_start + 1;
+    } else {
+        from = editor_get_cursor();
+    }
+    int pos = editor_find(s_search_buf, from);
+    if (pos < 0 && from > 0) {
+        /* Wrap around to the start of the document. */
+        pos = editor_find(s_search_buf, 0);
+        if (pos >= 0) editor_ui_set_status("Search: wrapped to top");
+    }
+    if (pos < 0) {
+        s_search_match_start = -1;
+        s_search_match_end = -1;
+        editor_ui_set_status("Search: not found");
+        return;
+    }
+    size_t mlen = strlen(s_search_buf);
+    s_search_match_start = pos;
+    s_search_match_end = pos + (int)mlen;
+    /* Position the cursor at the end of the match and anchor a
+     * selection back to the start so the editor highlights the
+     * matched text. */
+    editor_clear_selection();
+    editor_set_cursor((size_t)s_search_match_start);
+    editor_set_selection_anchor();
+    editor_set_cursor((size_t)s_search_match_end);
+    ensure_cursor_visible();
+    editor_ui_refresh();
+    /* Re-show the dialog (the refresh above repaints the editor
+     * underneath). */
+    if (s_search_panel) lv_obj_move_foreground(s_search_panel);
+    refresh_search_prompt();
+}
+
+static void search_replace_current(void)
+{
+    if (!s_search_replace_mode) return;
+    if (s_append_only) {
+        editor_ui_set_status("Append-only: replace disabled");
+        return;
+    }
+    if (s_search_match_start < 0) {
+        /* No active match -- treat the first Ctrl+Enter as Find Next. */
+        search_find_next();
+        return;
+    }
+    esp_err_t err = editor_replace_range((size_t)s_search_match_start,
+                                         (size_t)s_search_match_end,
+                                         s_replace_buf);
+    if (err != ESP_OK) {
+        editor_ui_set_status("Replace failed: buffer full");
+        return;
+    }
+    /* Position the cursor right after the replacement and look
+     * for the next match from there. */
+    size_t after = (size_t)s_search_match_start + strlen(s_replace_buf);
+    editor_clear_selection();
+    editor_set_cursor(after);
+    /* Reset match state so search_find_next() searches forward from
+     * the cursor (we just consumed the previous match). */
+    s_search_match_start = -1;
+    s_search_match_end = -1;
+    ensure_cursor_visible();
+    editor_ui_refresh();
+    if (s_search_panel) lv_obj_move_foreground(s_search_panel);
+    /* Auto-advance to the next occurrence so the user can repeat
+     * Ctrl+Enter through the document. */
+    search_find_next();
+}
+
+/* Forward declaration for the editor_get_cursor helper used above
+ * is provided by editor.h, which is already included at the top. */
+
+static void handle_search_prompt_key(const kb_event_t *ev)
+{
+    bool ctrl  = (ev->modifier & (KB_MOD_LCTRL | KB_MOD_RCTRL)) != 0;
+
+    /* Pointer to the active field's buffer + length cursor */
+    char  *abuf = (s_search_field == 0) ? s_search_buf : s_replace_buf;
+    int   *apos = (s_search_field == 0) ? &s_search_pos : &s_replace_pos;
+    size_t bufsz = (s_search_field == 0) ? sizeof(s_search_buf) : sizeof(s_replace_buf);
+
+    switch (ev->keycode) {
+    case KB_KEY_ENTER:
+        if (ctrl && s_search_replace_mode) {
+            search_replace_current();
+        } else {
+            search_find_next();
+        }
+        return;
+    case KB_KEY_ESCAPE:
+        close_search_prompt();
+        editor_ui_refresh();
+        return;
+    case KB_KEY_TAB:
+        if (s_search_replace_mode) {
+            s_search_field = (s_search_field == 0) ? 1 : 0;
+        }
+        break;
+    case KB_KEY_LEFT:
+        if (*apos > 0) {
+            do { (*apos)--; }
+            while (*apos > 0 && (abuf[*apos] & 0xC0) == 0x80);
+        }
+        break;
+    case KB_KEY_RIGHT:
+        if (*apos < (int)strlen(abuf)) {
+            (*apos)++;
+            while (*apos < (int)strlen(abuf) &&
+                   (abuf[*apos] & 0xC0) == 0x80)
+                (*apos)++;
+        }
+        break;
+    case KB_KEY_HOME:
+        *apos = 0;
+        break;
+    case KB_KEY_END:
+        *apos = (int)strlen(abuf);
+        break;
+    case KB_KEY_BACKSPACE:
+        if (*apos > 0) {
+            int prev = *apos - 1;
+            while (prev > 0 && (abuf[prev] & 0xC0) == 0x80) prev--;
+            int len = (int)strlen(abuf);
+            memmove(abuf + prev, abuf + *apos,
+                    (size_t)(len - *apos + 1));
+            *apos = prev;
+            /* Editing the find query invalidates the previous match. */
+            if (s_search_field == 0) {
+                s_search_match_start = -1;
+                s_search_match_end = -1;
+            }
+        }
+        break;
+    case KB_KEY_DELETE: {
+        int len = (int)strlen(abuf);
+        if (*apos < len) {
+            int next = *apos + 1;
+            while (next < len && (abuf[next] & 0xC0) == 0x80) next++;
+            memmove(abuf + *apos, abuf + next,
+                    (size_t)(len - next + 1));
+            if (s_search_field == 0) {
+                s_search_match_start = -1;
+                s_search_match_end = -1;
+            }
+        }
+        break;
+    }
+    default: {
+        if (ctrl) break; /* swallow other ctrl combos */
+        const char *text = kb_layout_translate(ev->keycode, ev->modifier);
+        if (text && text[0]) {
+            /* Reject control characters so the buffers stay
+             * printable; embedded newlines are not supported in the
+             * search dialog. */
+            if ((unsigned char)text[0] < 0x20) break;
+            size_t tlen = strlen(text);
+            size_t cur_len = strlen(abuf);
+            if (cur_len + tlen < bufsz - 1) {
+                memmove(abuf + *apos + tlen,
+                        abuf + *apos,
+                        cur_len - (size_t)*apos + 1);
+                memcpy(abuf + *apos, text, tlen);
+                *apos += (int)tlen;
+                if (s_search_field == 0) {
+                    s_search_match_start = -1;
+                    s_search_match_end = -1;
+                }
+            }
+        }
+        break;
+    }
+    }
+    refresh_search_prompt();
+}
+
+/* ---- Keyboard handler (registered as BLE callback) ---- */
+
+#if defined(CONFIG_DRAFTLING_DISPLAY_EPD)
+/* Information captured before a key event is processed, used by
+ * try_partial_clip_for_typing() to decide whether the next e-paper
+ * refresh can be narrowed to just the area around the typed
+ * character. */
+struct typing_pre_state_t {
+    bool        valid;        /* false -> skip the fast path */
+    int         line;         /* cursor line before the edit */
+    int         col;          /* cursor column before the edit (UTF-8 chars) */
+    int         cur_x;        /* absolute screen x of cursor before */
+    int         cur_y;        /* absolute screen y of cursor before */
+    int         cur_h;        /* cursor height before */
+    bool        modified;     /* editor_is_modified() before */
+    int         line_chars;   /* UTF-8 char count of the line before */
+    int         char_w;       /* monospace cell width at body font */
+};
+
+/* Capture pre-edit state for the fast partial-clip path. Fills *out
+ * with valid=false when conditions disqualify the edit (selection
+ * active, line is not a plain paragraph, etc.); subsequent
+ * try_partial_clip_for_typing() calls then short-circuit. */
+static void capture_typing_pre_state(typing_pre_state_t *out)
+{
+    out->valid = false;
+    if (s_cursor == NULL) return;
+    if (lv_obj_has_flag(s_cursor, LV_OBJ_FLAG_HIDDEN)) return;
+    if (editor_selection_active()) return;
+
+    int line, col;
+    editor_get_cursor_pos(&line, &col);
+    (void)col;
+    int total = editor_get_line_count();
+    if (line < 0 || line >= total) return;
+
+    size_t ll = 0;
+    const char *lt = editor_get_line(line, &ll);
+    if (!lt) return;
+
+    /* Single-line classification (no surrounding code-fence context).
+     * We only fast-path lines whose visible glyphs are exactly the
+     * raw text -- i.e. plain paragraphs and empty lines. Any line
+     * inside a fenced code block, a heading/bullet/quote/etc. has a
+     * styled rendering whose pixel layout we can't safely predict
+     * here. So has a paragraph with inline spans: typing a closing
+     * "*" restyles characters left of the cursor, outside the clip
+     * (try_partial_clip_for_typing() re-checks the post-edit line).
+     * The document's format decides (Fountain never qualifies: a
+     * line's element depends on its neighbours). */
+    if (!editor_format_active()->line_is_plain(lt, ll)) return;
+
+    int chars = utf8_chars_in_bytes(lt, ll);
+
+    out->valid       = true;
+    out->line        = line;
+    out->col         = col;
+    out->cur_x       = s_rp->x + lv_obj_get_x(s_cursor);
+    out->cur_y       = s_rp->y + lv_obj_get_y(s_cursor);
+    out->cur_h       = lv_obj_get_height(s_cursor);
+    out->modified    = editor_is_modified();
+    out->line_chars  = chars;
+    out->char_w      = CHAR_W;
+}
+
+/* Compute and apply a one-shot panel-refresh clip rectangle for an
+ * edit that affects only one body line and the cursor.  Returns true
+ * if the clip was set, false if the post-edit state disqualifies the
+ * fast path (caller should leave the dirty bbox un-clipped, which
+ * yields today's full-line refresh behaviour). */
+static bool try_partial_clip_for_typing(const typing_pre_state_t *pre)
+{
+    if (!pre->valid) return false;
+    /* The fast path assumes only the focused pane's cursor line is
+     * dirty, so it clips the panel refresh to that one line. While
+     * split, a content edit also repaints the sibling pane (it may
+     * share the same document and show the edited line at a different
+     * position), dirtying pixels outside the clip. A clipped flush
+     * would consume the whole dirty bbox but drive only the cursor
+     * line, discarding the sibling pane's update and leaving stale
+     * "overwritten" text behind. Disable the clip while split so the
+     * full dirty bbox (covering both panes) is always refreshed. */
+    if (s_pane_count > 1) return false;
+    if (s_cursor == NULL) return false;
+    if (lv_obj_has_flag(s_cursor, LV_OBJ_FLAG_HIDDEN)) return false;
+    if (editor_selection_active()) return false;
+    if (editor_is_modified() != pre->modified) {
+        /* Modified-flag flip -> title-bar text changed -> the title
+         * strip is also dirty and must be refreshed alongside the
+         * line. Fall back to the full bbox. */
+        return false;
+    }
+
+    int line, col;
+    editor_get_cursor_pos(&line, &col);
+    (void)col;
+    if (line != pre->line) return false; /* edit crossed a line boundary */
+
+    int total = editor_get_line_count();
+    if (line < 0 || line >= total) return false;
+
+    size_t ll = 0;
+    const char *lt = editor_get_line(line, &ll);
+    if (!lt) return false;
+
+    if (!editor_format_active()->line_is_plain(lt, ll)) return false;
+
+    int post_chars = utf8_chars_in_bytes(lt, ll);
+    int char_w     = pre->char_w;
+    int pre_w      = pre->line_chars * char_w;
+    int post_w     = post_chars * char_w;
+    int max_w      = pre_w > post_w ? pre_w : post_w;
+    /* Bail if the line text wraps -- rendered_h would exceed line_h
+     * and the dirty area covers multiple visual rows. */
+    if (2 + max_w + 4 > s_rp->w) return false;
+
+    int post_cur_x = s_rp->x + lv_obj_get_x(s_cursor);
+    int post_cur_y = s_rp->y + lv_obj_get_y(s_cursor);
+    int post_cur_h = lv_obj_get_height(s_cursor);
+    /* Cursor moved to a different visual row -> the row geometry
+     * changed (wrap or scroll), refresh the whole dirty bbox. */
+    if (post_cur_y != pre->cur_y || post_cur_h != pre->cur_h) return false;
+
+    /* X-extent of the changed pixels: from the leftmost-touched
+     * column (min of pre/post cursor x) to the rightmost edge of the
+     * line content (max of pre/post text width), plus the cursor's
+     * own 2 px width on the right side. */
+    int x_min = pre->cur_x < post_cur_x ? pre->cur_x : post_cur_x;
+    int x_text_end = s_rp->x + 2 + max_w;
+    int x_cur_end  = (pre->cur_x > post_cur_x ? pre->cur_x : post_cur_x) + 2;
+    int x_max = x_text_end > x_cur_end ? x_text_end : x_cur_end;
+
+    /* Pad by a few pixels on each side so antialiased / overhanging
+     * glyph outlines (Greybeard is bitmapped, so this is mostly
+     * paranoia) and the cursor bar's own 2 px width are always
+     * included. */
+    x_min -= 4;
+    x_max += 4;
+    if (x_min < s_rp->x) x_min = s_rp->x;
+    if (x_max > s_rp->x + s_rp->w) x_max = s_rp->x + s_rp->w;
+    if (x_max <= x_min) return false;
+
+    /* x_min/cur_y/... are LVGL logical coordinates (pre-rotation);
+     * display_set_partial_clip() intersects against a dirty bounding
+     * box accumulated in physical panel coordinates, so map through
+     * the same transform flush_cb() applies to every pushed tile.
+     * Skipping this is invisible in the default landscape orientation
+     * (logical == physical there) but silently drops every partial
+     * refresh -- typing updates the off-screen framebuffer but never
+     * reaches the panel -- as soon as a rotation (portrait, or a
+     * non-zero base/flip rotation) is in effect. */
+    int px, py, pw, ph;
+    draftling_lvgl_port_map_to_physical(x_min, pre->cur_y,
+                                        x_max - x_min, pre->cur_h,
+                                        &px, &py, &pw, &ph);
+    display_set_partial_clip(px, py, pw, ph);
+    return true;
+}
+#endif /* CONFIG_DRAFTLING_DISPLAY_EPD */
+
+#if defined(CONFIG_DRAFTLING_DISPLAY_EPD)
+/* RAII guard that runs the partial-clip post-processing on every
+ * return path of handle_editor_key (including the F1 / Ctrl+? / Esc
+ * early returns). Without this, a typing event in one drain batch
+ * could leave a narrow clip set when a subsequent navigation event
+ * runs early-return -- the next flush would then refresh only the
+ * old typing region and clip away everything else. */
+struct ClipGuard {
+    typing_pre_state_t pre_state;
+    bool eligible;
+    ClipGuard() : eligible(false) {
+        capture_typing_pre_state(&pre_state);
+    }
+    ~ClipGuard() {
+        bool clipped = false;
+        if (eligible) clipped = try_partial_clip_for_typing(&pre_state);
+        if (!clipped) display_set_partial_clip(0, 0, 0, 0);
+    }
+};
+#endif /* CONFIG_DRAFTLING_DISPLAY_EPD */
+
+/* Return true when the line containing the cursor is rendered
+ * right-to-left.  We mirror LVGL's auto base-direction detection
+ * (CONFIG_LV_BIDI_BASE_DIR_DEF_AUTO): scan the raw line UTF-8 and
+ * return based on the first STRONG directional codepoint -- strong
+ * RTL (Hebrew, Arabic, Hebrew/Arabic presentation forms) makes the
+ * paragraph RTL; strong LTR (Latin, Greek, Cyrillic) makes it LTR;
+ * neutrals (punctuation, spaces, digits, markdown markers) are
+ * skipped.  Used to flip the Left / Right arrow keys on RTL lines
+ * so that the visual right arrow moves the cursor to the visual
+ * right (which is logically backward in an RTL paragraph). */
+static bool cursor_line_is_rtl(void)
+{
+    int line, col;
+    editor_get_cursor_pos(&line, &col);
+    (void)col;
+    size_t ll = 0;
+    const char *lt = editor_get_line(line, &ll);
+    if (!lt) return false;
+    return utf8_first_strong_dir(lt, ll) < 0;
+}
+
+/* ---- Split-screen control ----
+ *
+ * The editor shows one pane by default. The split always divides the
+ * display's long axis -- left/right in landscape, top/bottom in
+ * portrait (Settings -> Display orientation) -- and is driven entirely
+ * by three shortcuts:
+ *   Ctrl+1  single pane
+ *   Ctrl+2  two equal panes (first = 1/2)
+ *   Ctrl+3  two panes with the first = 2/3; pressing Ctrl+3 again
+ *           flips the first pane to 1/3 (and back).
+ * "First" is the left pane in landscape, the top pane in portrait.
+ * Enabling a split for the first time acquires a fresh, empty untitled
+ * document into pane 1; collapsing back to a single pane keeps pane 1's
+ * document open in the background so re-splitting restores it. Each
+ * pane independently selects a file (the file browser targets the
+ * focused pane, so each panel opens a file for itself); opening the
+ * same path in both panes shares one
+ * refcounted buffer so the two editors view / edit the same file. */
+static void save_split_to_nvs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_EDITOR, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, NVS_KEY_SPLIT, (uint8_t)s_split_mode);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+static void load_split_from_nvs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_EDITOR, NVS_READONLY, &h) == ESP_OK) {
+        uint8_t v = 0;
+        if (nvs_get_u8(h, NVS_KEY_SPLIT, &v) == ESP_OK &&
+            v <= (uint8_t)SPLIT_LEFT_1_3) {
+            s_split_mode = (split_mode_t)v;
+        }
+        nvs_close(h);
+    }
+}
+
+static void editor_ui_apply_split_mode(split_mode_t mode)
+{
+    bool want_split = (mode != SPLIT_NONE);
+
+    if (want_split && !s_panes[1].doc) {
+        editor_doc_t *d = editor_doc_acquire(NULL); /* empty untitled */
+        if (!d) {
+            editor_ui_set_status("Cannot split: no free document");
+            pane_bind_focus();
+            return;
+        }
+        s_panes[1].doc = d;
+        s_panes[1].has_saved_view = false;   /* adopt the new doc's view */
+    }
+
+    s_split_mode = mode;
+    s_pane_count = want_split ? 2 : 1;
+    if (!want_split) s_focus = 0;
+    if (s_focus >= s_pane_count) s_focus = s_pane_count - 1;
+
+    save_split_to_nvs();
+
+    layout_panes();
+    invalidate_all_render_caches();
+    pane_bind_focus();
+    ensure_cursor_visible();
+#if defined(CONFIG_DRAFTLING_DISPLAY_EPD)
+    /* Changing the split layout moves / hides the divider and one pane.
+     * On e-paper, force a clean full-screen repaint so the collapsed
+     * pane's old borders / divider and any partially-refreshed regions
+     * do not survive as ghosting (and a freshly-enabled pane is drawn in
+     * full). No-op until the editor screen is on screen (e.g. the boot
+     * restore below runs before the first lv_scr_load). */
+    if (s_editor_screen_active) epd_full_screen_repaint();
+#endif
+    editor_ui_refresh();
+}
+
+/* Ctrl+3: enter / cycle the asymmetric split. First press (from single
+ * or equal split) makes the first pane 2/3; a subsequent Ctrl+3 toggles
+ * the first pane between 2/3 and 1/3. (First pane = left in landscape,
+ * top in portrait.) */
+static void editor_ui_cycle_wide_split(void)
+{
+    split_mode_t next = (s_split_mode == SPLIT_LEFT_2_3)
+                            ? SPLIT_LEFT_1_3 : SPLIT_LEFT_2_3;
+    editor_ui_apply_split_mode(next);
+}
+
+/* Ctrl+Tab: move keyboard focus to the other pane (only meaningful
+ * while split). */
+static void editor_ui_focus_other_pane(void)
+{
+    if (s_pane_count < 2) return;
+    s_focus = (s_focus + 1) % s_pane_count;
+    pane_bind_focus();
+    ensure_cursor_visible();
+    editor_ui_refresh();
+}
+
+/* Open `path` (NULL / empty = a new untitled document) into pane
+ * `target` through the document pool. A path already open in the other
+ * pane shares the same refcounted buffer. Releases whatever document
+ * the target pane held previously. Returns the acquired document, or
+ * NULL on failure. On failure the engine is left with a valid active
+ * document; the target pane keeps its previous document when a slot was
+ * available, or is emptied if its previous document had to be released
+ * first to make room (pool-exhausted retry path). */
+static editor_doc_t *open_into_pane(int target, const char *path)
+{
+    if (target < 0 || target >= EDITOR_MAX_PANES) return NULL;
+    editor_doc_t *prev = s_panes[target].doc;
+    editor_doc_t *d = editor_doc_acquire(path);
+    if (!d && prev) {
+        /* The document pool is exhausted. With EDITOR_MAX_DOCS == 2 this
+         * happens whenever both panes already hold distinct documents
+         * and the user asks to open a third path into one of them: the
+         * acquire above needs a free slot before this pane's previous
+         * document is released. Release the target pane's previous
+         * document first to free its slot, then retry the acquire. The
+         * other pane's document is untouched. (If the requested path is
+         * already open in the other pane, the first acquire would have
+         * succeeded via the shared-buffer fast path and we never get
+         * here.) */
+        s_panes[target].doc = NULL;
+        editor_doc_release(prev);
+        prev = NULL;
+        d = editor_doc_acquire(path);
+        if (!d) {
+            /* Open still failed (e.g. file too large / read error).
+             * The target pane is now empty. editor_doc_acquire() already
+             * restored a valid active document (pick_any_active) on the
+             * open-failure path, so the engine is never left without
+             * one. */
+            return NULL;
+        }
+        s_panes[target].doc = d;
+        s_panes[target].has_saved_view = false;   /* adopt the new doc's view */
+        editor_set_active(d);
+        return d;
+    }
+    if (!d) {
+        if (prev) editor_set_active(prev);
+        return NULL;
+    }
+    if (d == prev) {
+        /* Re-acquired the document this pane already holds: acquire
+         * bumped its refcount, so drop the extra reference to keep the
+         * count balanced. The pane keeps its existing view. */
+        editor_doc_release(d);
+    } else if (prev) {
+        editor_doc_release(prev);
+    }
+    if (d != prev) s_panes[target].has_saved_view = false;  /* adopt new view */
+    s_panes[target].doc = d;
+    editor_set_active(d);
+    return d;
+}
+
+/* editor_doc_foreach callback: save a document's body if it has unsaved
+ * changes and a path. Used by the Ctrl+G "save before git sync" path so
+ * every open pane's edits reach disk before the sync task runs. */
+static void save_modified_doc_cb(editor_doc_t *doc, void *ctx)
+{
+    (void)ctx;
+    if (editor_doc_is_modified(doc) && editor_doc_get_path(doc)) {
+        editor_doc_save(doc);
+    }
+}
+
+static void handle_editor_key(const kb_event_t *ev)
+{
+    bool ctrl  = (ev->modifier & (KB_MOD_LCTRL | KB_MOD_RCTRL)) != 0;
+    bool shift = (ev->modifier & (KB_MOD_LSHIFT | KB_MOD_RSHIFT)) != 0;
+
+    /* All editing acts on the focused pane's document; make sure the
+     * engine's active doc and the widget aliases point at it. */
+    pane_bind_focus();
+
+    /* Set by the content-modifying key cases below. Pure cursor
+     * navigation leaves this false so the post-key refresh repaints
+     * only the focused pane (keeping the caret inside it); edits set it
+     * true to force a full refresh that also repaints a sibling pane
+     * sharing the same document. */
+    bool content_changed = false;
+
+#if defined(CONFIG_DRAFTLING_DISPLAY_EPD)
+    /* Snapshot before-edit state for the partial-refresh fast path,
+     * and ensure the clip is updated (set or cleared) on every
+     * return path. */
+    ClipGuard clip_guard;
+    bool &fast_path_eligible = clip_guard.eligible;
+#endif
+
+    /* Forget the "preferred column" used by visual Up/Down navigation
+     * the moment the user presses anything else -- otherwise typing,
+     * Home/End, etc. would leave a stale goal_x that the next Up/Down
+     * would snap back to. */
+    if (ev->keycode != KB_KEY_UP && ev->keycode != KB_KEY_DOWN) {
+        s_visual_goal_x = -1;
+    }
+
+    /* F1 opens the menu */
+    if (ev->keycode == KB_KEY_F1) {
+        show_menu();
+        return;
+    }
+    if (ev->keycode == KB_KEY_F10) {
+        show_help(HELP_FROM_EDITOR);
+        return;
+    }
+
+#if defined(CONFIG_DRAFTLING_HAS_USB_MSC)
+    /* Defense-in-depth, not the primary guard: commit_usb_msc_pending_mode()
+     * forces the file browser (not the editor) whenever SD-via-USB
+     * turns on, and handle_browser_key() then refuses to open/create a
+     * file while it stays on, so this screen should be unreachable for
+     * as long as the card belongs to a USB host. Refuse every key but
+     * F1 here too anyway, in case some other path (a future feature, a
+     * bug) ever lands on the editor screen while it is active -- the
+     * card must not be written to while a host may also be writing to
+     * it. */
+    if (usb_msc_get_mode() != USB_MSC_MODE_OFF) {
+        editor_ui_set_status("SD card via USB active -- disable it in F1 menu first");
+        return;
+    }
+#endif
+
+    /* Win+Space cycles the keyboard layout, mirroring Ctrl+L. HID
+     * keycode 0x2C is Space; the GUI ("Win"/"Cmd") modifier is
+     * KB_MOD_LGUI / KB_MOD_RGUI. */
+    if ((ev->modifier & (KB_MOD_LGUI | KB_MOD_RGUI)) &&
+        ev->keycode == KB_KEY_SPACE) {
+        kb_layout_next();
+        ensure_cursor_visible();
+        editor_ui_refresh();
+        return;
+    }
+
+    /* Ctrl shortcuts */
+    if (ctrl) {
+        /* kb_layout_shortcut_char() resolves the shortcut letter by the
+         * national layout for Latin layouts (so e.g. Ctrl+Z lands on
+         * the key printed Z on a German keyboard) and by the US
+         * physical key position for non-Latin layouts (Ukrainian,
+         * Hebrew, ...), which have no national Latin letter to remap
+         * to -- see kb_layout.h. */
+        char ch = kb_layout_shortcut_char(ev->keycode);
+
+        /* Ctrl+1 / Ctrl+2 / Ctrl+3 control the split layout. HID
+         * keycodes: 1 = 0x1E, 2 = 0x1F, 3 = 0x20. Handled by keycode
+         * (not layout translation) so they work in any layout. */
+        if (ev->keycode == 0x1E) {            /* Ctrl+1: single pane */
+            editor_ui_apply_split_mode(SPLIT_NONE);
+            return;
+        }
+        if (ev->keycode == 0x1F) {            /* Ctrl+2: equal split */
+            editor_ui_apply_split_mode(SPLIT_HALF);
+            return;
+        }
+        if (ev->keycode == 0x20) {            /* Ctrl+3: 2/3 <-> 1/3 */
+            editor_ui_cycle_wide_split();
+            return;
+        }
+        if (ev->keycode == KB_KEY_TAB) {      /* Ctrl+Tab: switch pane */
+            editor_ui_focus_other_pane();
+            return;
+        }
+        if (ev->keycode == KB_KEY_DOWN) {     /* Ctrl+Down: same as PgDn */
+            /* Keycode matches plain Down, which the goal_x reset above
+             * skips -- clear it here so a following bare Up/Down starts
+             * from the post-jump cursor column rather than a stale one. */
+            s_visual_goal_x = -1;
+            if (shift) editor_set_selection_anchor();
+            else editor_clear_selection();
+            editor_move_page_down(page_line_count());
+            ensure_cursor_visible();
+            if (s_pane_count > 1) refresh_focused_pane_and_title();
+            else                  editor_ui_refresh();
+            return;
+        }
+        if (ev->keycode == KB_KEY_UP) {       /* Ctrl+Up: same as PgUp */
+            s_visual_goal_x = -1;             /* see Ctrl+Down comment above */
+            if (shift) editor_set_selection_anchor();
+            else editor_clear_selection();
+            editor_move_page_up(page_line_count());
+            ensure_cursor_visible();
+            if (s_pane_count > 1) refresh_focused_pane_and_title();
+            else                  editor_ui_refresh();
+            return;
+        }
+
+        switch (ch) {
+        case 's':
+            show_save_prompt();
+            break;
+        case 'n':
+            /* New empty document in the focused pane, in the format
+             * picked from the overlay (see newfmt_prompt_activate()). */
+            show_newfmt_prompt(NEWDOC_EDITOR);
+            return;
+        case 'o':
+            /* Opening another file leaves the current document behind.
+             * If it has unsaved changes, prompt to save / discard /
+             * cancel first (same dialog as Esc, whose save and discard
+             * paths both proceed to the file browser); otherwise open
+             * the browser straight away. */
+            if (editor_is_modified()) {
+                show_exit_prompt();
+            } else {
+                editor_ui_show_file_browser();
+            }
+            return;
+        case 'c':
+            if (editor_copy())
+                editor_ui_set_status("Copied");
+            ensure_cursor_visible();
+            editor_ui_refresh();
+            return;
+        case 'x':
+            if (s_append_only) {
+                editor_ui_set_status("Append-only: deletion disabled");
+                return;
+            }
+            if (editor_cut())
+                editor_ui_set_status("Cut");
+            ensure_cursor_visible();
+            editor_ui_refresh();
+            return;
+        case 'v':
+            if (s_append_only && !cursor_at_doc_end()) {
+                editor_clear_selection();
+                editor_move_doc_end();
+            }
+            if (!editor_paste())
+                editor_ui_set_status("Buffer full -- paste truncated");
+            ensure_cursor_visible();
+            editor_ui_refresh();
+            return;
+        case 'a':
+            editor_select_all();
+            ensure_cursor_visible();
+            editor_ui_refresh();
+            return;
+        case 'f':
+            show_search_prompt(false);
+            return;
+        case 'h':
+            show_search_prompt(true);
+            return;
+        case 'g':
+            /* Auto-save every open document (both panes when split) so
+             * the sync task picks up the latest edits (it reads from
+             * disk). editor_doc_save() leaves the active doc untouched,
+             * but rebind focus defensively. */
+            editor_doc_foreach(save_modified_doc_cb, NULL);
+            pane_bind_focus();
+            if (git_sync_is_configured() && wifi_manager_is_connected()) {
+                if (git_sync_start(GIT_SYNC_BOTH) == ESP_OK) {
+                    editor_ui_set_status("Git: syncing...");
+                } else {
+                    char sbuf[128];
+                    const char *err = git_sync_get_last_error();
+                    snprintf(sbuf, sizeof(sbuf), "Git: %s",
+                             (err && err[0]) ? err : "failed to start sync");
+                    editor_ui_set_status(sbuf);
+                }
+            } else if (!wifi_manager_is_connected()) {
+                editor_ui_set_status("Git: connect WiFi first (F1)");
+            } else {
+                editor_ui_set_status("Git: not configured");
+            }
+            break;
+        case 'w':
+            if (!wifi_manager_is_connected()) {
+                editor_ui_set_status("WiFi: connecting...");
+                wifi_connect_async();
+            } else {
+                wifi_manager_disconnect();
+                editor_ui_set_status("WiFi: disconnecting...");
+            }
+            break;
+        case 'l':
+            /* Ctrl+L: cycle keyboard layout */
+            kb_layout_next();
+            break;
+        case 'm':
+            /* Ctrl+M: menu, equivalent to F1 */
+            show_menu();
+            return;
+        case 'p':
+            /* Ctrl+P: enter deep sleep. With unsaved changes in the
+             * active document, ask first (save / discard / cancel);
+             * otherwise sleep straight away. */
+            if (editor_is_modified()) {
+                show_sleep_prompt();
+            } else {
+                standby_enter_sleep();
+            }
+            return;
+#if defined(CONFIG_DRAFTLING_DISPLAY_HAS_BACKLIGHT) && !defined(CONFIG_DRAFTLING_DISPLAY_BACKLIGHT_BINARY)
+        case 'b': {
+            /* Ctrl+B: cycle to the next backlight / front-light
+             * brightness step (same cycle as F1 -> Settings ->
+             * Backlight). Applied immediately and persisted in NVS
+             * so the value survives reboot / deep sleep. */
+            int bi = find_backlight_option(s_backlight_pct);
+            bi = (bi + 1) % BACKLIGHT_OPTION_COUNT;
+            s_backlight_pct = BACKLIGHT_OPTIONS[bi];
+            save_backlight_to_nvs();
+            display_set_backlight(s_backlight_pct);
+            char sbuf[32];
+            snprintf(sbuf, sizeof(sbuf), "Backlight: %d%%", s_backlight_pct);
+            editor_ui_set_status(sbuf);
+            return;
+        }
+#endif
+#if defined(CONFIG_DRAFTLING_DISPLAY_EPD)
+        case 'r':
+            /* Ctrl+R: force a full e-paper refresh to clear ghosting
+             * and any stale "overwritten" pixels left behind by partial
+             * refreshes. Re-displaying the existing framebuffer is not
+             * enough -- the garbage lives in the framebuffer itself, so
+             * wipe it to the background colour and invalidate the active
+             * screen to make LVGL repaint every widget from scratch
+             * (display_clear() also flags the next flush as a full
+             * refresh). Mirrors the font-size-change path above. */
+#if defined(CONFIG_DRAFTLING_EPD_BLACK_BACKGROUND)
+            display_clear(0x00);
+#else
+            display_clear(0xFF);
+#endif
+            lv_obj_invalidate(lv_scr_act());
+            return;
+#endif
+        default: break;
+        }
+        /* Ctrl+arrow / Ctrl+Home / Ctrl+End for word/doc movement.
+         * On RTL paragraphs the Left / Right arrows are swapped so
+         * that the visual right arrow walks the cursor to the visual
+         * right (which is the logical previous word in an RTL line). */
+        int word_kc = ev->keycode;
+        if ((word_kc == KB_KEY_LEFT || word_kc == KB_KEY_RIGHT) &&
+            cursor_line_is_rtl()) {
+            word_kc = (word_kc == KB_KEY_LEFT) ? KB_KEY_RIGHT : KB_KEY_LEFT;
+        }
+        if (word_kc == KB_KEY_LEFT) {
+            if (shift) editor_set_selection_anchor();
+            else editor_clear_selection();
+            editor_move_word_left();
+        }
+        if (word_kc == KB_KEY_RIGHT) {
+            if (shift) editor_set_selection_anchor();
+            else editor_clear_selection();
+            editor_move_word_right();
+        }
+        if (ev->keycode == KB_KEY_HOME) {
+            if (shift) editor_set_selection_anchor();
+            else editor_clear_selection();
+            editor_move_doc_start();
+        }
+        if (ev->keycode == KB_KEY_END) {
+            if (shift) editor_set_selection_anchor();
+            else editor_clear_selection();
+            editor_move_doc_end();
+        }
+        ensure_cursor_visible();
+        /* Ctrl word / document moves are pure navigation: repaint only
+         * the focused pane while split so the caret stays in it. */
+        if (s_pane_count > 1) refresh_focused_pane_and_title();
+        else                  editor_ui_refresh();
+        return;
+    }
+
+    /* Special keys */
+    /* Flip Left / Right semantics on RTL paragraphs so the visual
+     * right arrow always advances the cursor to the visual right.
+     * In an RTL line that means moving logically backward, and vice
+     * versa. The other cases (Up / Down / Home / End / etc.) are
+     * unaffected because Home / End already map to logical line
+     * boundaries which coincide with the correct visual edges in
+     * either direction. */
+    int nav_kc = ev->keycode;
+    if ((nav_kc == KB_KEY_LEFT || nav_kc == KB_KEY_RIGHT) &&
+        cursor_line_is_rtl()) {
+        nav_kc = (nav_kc == KB_KEY_LEFT) ? KB_KEY_RIGHT : KB_KEY_LEFT;
+    }
+    switch (nav_kc) {
+    case KB_KEY_LEFT:
+        if (shift) { editor_set_selection_anchor(); editor_move_left(); }
+        else if (editor_selection_active()) {
+            size_t s, e; editor_get_selection_range(&s, &e);
+            editor_clear_selection(); editor_set_cursor(s);
+        } else { editor_move_left(); }
+        break;
+    case KB_KEY_RIGHT:
+        if (shift) { editor_set_selection_anchor(); editor_move_right(); }
+        else if (editor_selection_active()) {
+            size_t s, e; editor_get_selection_range(&s, &e);
+            editor_clear_selection(); editor_set_cursor(e);
+        } else { editor_move_right(); }
+        break;
+    case KB_KEY_UP:
+        if (shift) editor_set_selection_anchor();
+        else editor_clear_selection();
+        editor_ui_move_visual(-1);
+        break;
+    case KB_KEY_DOWN:
+        if (shift) editor_set_selection_anchor();
+        else editor_clear_selection();
+        editor_ui_move_visual(+1);
+        break;
+    case KB_KEY_HOME:
+        if (shift) editor_set_selection_anchor();
+        else editor_clear_selection();
+        editor_move_home();
+        break;
+    case KB_KEY_END:
+        if (shift) editor_set_selection_anchor();
+        else editor_clear_selection();
+        editor_move_end();
+        break;
+    case KB_KEY_PAGEUP:
+        if (shift) editor_set_selection_anchor();
+        else editor_clear_selection();
+        editor_move_page_up(page_line_count());
+        break;
+    case KB_KEY_PAGEDOWN:
+        if (shift) editor_set_selection_anchor();
+        else editor_clear_selection();
+        editor_move_page_down(page_line_count());
+        break;
+    case KB_KEY_BACKSPACE:
+        if (s_append_only) {
+            editor_ui_set_status("Append-only: deletion disabled");
+            break;
+        }
+        content_changed = true;
+        if (!editor_delete_selection()) {
+            editor_delete_back();
+#if defined(CONFIG_DRAFTLING_DISPLAY_EPD)
+            fast_path_eligible = true;
+#endif
+        }
+        break;
+    case KB_KEY_DELETE:
+        if (s_append_only) {
+            editor_ui_set_status("Append-only: deletion disabled");
+            break;
+        }
+        content_changed = true;
+        if (!editor_delete_selection()) {
+            editor_delete_forward();
+#if defined(CONFIG_DRAFTLING_DISPLAY_EPD)
+            fast_path_eligible = true;
+#endif
+        }
+        break;
+    case KB_KEY_ENTER:
+        content_changed = true;
+        if (editor_format_active()->handle_enter(shift)) break;
+        /* Newlines are the one insertion allowed anywhere while
+         * append-only editing is active, so no end-of-document jump
+         * is needed here -- but deletion is still disallowed, so a
+         * selection is cleared rather than replaced. */
+        if (s_append_only) editor_clear_selection();
+        else editor_delete_selection();
+        if (!editor_insert_newline())
+            editor_ui_set_status("Buffer full -- increase editor size in menuconfig");
+        break;
+    case KB_KEY_TAB:
+        content_changed = true;
+        if (editor_format_active()->handle_tab(s_append_only)) break;
+        if (s_append_only) {
+            editor_clear_selection();
+            if (!cursor_at_doc_end()) editor_move_doc_end();
+        } else {
+            editor_delete_selection();
+        }
+        if (!editor_insert_text("    ", 4))
+            editor_ui_set_status("Buffer full -- increase editor size in menuconfig");
+        break;
+    case KB_KEY_ESCAPE:
+        if (editor_is_modified()) {
+            /* Ask whether to save, discard, or keep editing. */
+            show_exit_prompt();
+            return;
+        }
+        /* No unsaved changes -- leave the editor immediately. */
+        editor_ui_show_file_browser();
+        return;
+    default: {
+        /* Use keyboard layout to translate keycode to UTF-8 */
+        const char *text = kb_layout_translate(ev->keycode, ev->modifier);
+        if (text) {
+            content_changed = true;
+            bool had_sel = editor_selection_active();
+            if (s_append_only) {
+                /* Regular character insertion is only allowed at the
+                 * very end of the document while append-only editing
+                 * is active. If the cursor is elsewhere, jump it to
+                 * the end (dropping any selection, since deletion is
+                 * disallowed) before inserting. */
+                editor_clear_selection();
+                if (!cursor_at_doc_end()) editor_move_doc_end();
+            } else {
+                editor_delete_selection();
+            }
+            if (!editor_insert_text(text, strlen(text)))
+                editor_ui_set_status("Buffer full -- increase editor size in menuconfig");
+#if defined(CONFIG_DRAFTLING_DISPLAY_EPD)
+            /* The fast-path clip only handles edits that started
+             * without a selection -- replacing a selection
+             * potentially repaints multiple lines. */
+            if (!had_sel) fast_path_eligible = true;
+#else
+            (void)had_sel;
+#endif
+        }
+        break;
+    }
+    }
+
+    ensure_cursor_visible();
+    if (content_changed || s_pane_count <= 1) {
+        /* Content edits (and single-pane mode) take the full refresh so
+         * a sibling pane sharing the same document repaints too. */
+        editor_ui_refresh();
+    } else {
+        /* Pure cursor navigation while split: repaint only the focused
+         * pane so the caret can never end up drawn in the other pane
+         * when the cursor reaches the beginning / end of the text. */
+        refresh_focused_pane_and_title();
+    }
+    /* Partial-refresh clip is set/cleared by ClipGuard's destructor
+     * on the M5Stack PaperS3 backend. */
+}
+
+/* Overlay a compact file selector on the focused pane (split mode).
+ * The overlay widgets live on s_scr as siblings of the pane containers;
+ * they are positioned over the focused pane's rectangle and raised to
+ * the foreground so they cover that pane's text while the other pane
+ * keeps rendering its document. */
+static void show_inpane_browser(void)
+{
+    if (!s_inpane_list || !s_inpane_hdr) return;
+
+    /* Track the live split geometry so the overlay matches the focused
+     * pane even after a Ctrl+2 / Ctrl+3 width change. */
+    recalc_pane_geometry();
+    int px = s_panes[s_focus].x;
+    int pw = s_panes[s_focus].w;
+    int py = s_panes[s_focus].y;
+    int ph = s_panes[s_focus].h;
+    int hdr_h = lv_font_get_line_height(FONT_11) + 2;
+    if (hdr_h > ph) hdr_h = 0;
+
+    lv_obj_set_pos(s_inpane_hdr, px + 2, py);
+    lv_obj_set_width(s_inpane_hdr, (pw > 4) ? pw - 4 : pw);
+    lv_obj_set_pos(s_inpane_list, px, py + hdr_h);
+    lv_obj_set_size(s_inpane_list, pw, ph - hdr_h);
+
+    /* Target the focused pane and operate the shared browser logic on
+     * the in-pane list. */
+    s_open_target_pane = s_focus;
+    s_browser_list = s_inpane_list;
+    s_browser_sel = 0;
+    s_browser_sel_prev = -1;
+    refresh_file_list();
+
+    lv_obj_remove_flag(s_inpane_hdr, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(s_inpane_list, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_inpane_hdr);
+    lv_obj_move_foreground(s_inpane_list);
+
+    /* Clear the covered pane's editor widgets so none of its text shows
+     * through. The overlay list only paints rows it has; any area below
+     * the last entry (and the caret / logo, which are raised above the
+     * list) would otherwise leave the previous document's lines visible
+     * behind the selector. Hide the focused pane's line labels, cursor
+     * and logo explicitly. */
+    {
+        pane_t *save = s_rp;
+        s_rp = &s_panes[s_focus];
+        for (int i = 0; i < MAX_LINE_LABELS; i++) {
+            if (s_line_labels[i]) lv_obj_add_flag(s_line_labels[i], LV_OBJ_FLAG_HIDDEN);
+        }
+        if (s_cursor)   lv_obj_add_flag(s_cursor, LV_OBJ_FLAG_HIDDEN);
+        if (s_img_logo) lv_obj_add_flag(s_img_logo, LV_OBJ_FLAG_HIDDEN);
+        s_cursor_on_screen = false;
+        s_rp = save;
+    }
+
+    s_inpane_browser_open = true;
+    /* The editor screen stays active (the other pane keeps rendering);
+     * keystrokes are rerouted by the s_inpane_browser_open check in
+     * process_key_event. */
+    editor_ui_set_status("Open into pane: Enter  N:new  F2:rename  Esc:cancel");
+}
+
+/* Dismiss the in-pane file selector and restore the full-screen list
+ * as the active browser list. Safe to call when no overlay is open.
+ * Does NOT repaint the editor; the caller decides whether to load a
+ * document and then refresh. */
+static void close_inpane_browser(void)
+{
+    if (!s_inpane_browser_open) return;
+    s_inpane_browser_open = false;
+    if (s_inpane_list) lv_obj_add_flag(s_inpane_list, LV_OBJ_FLAG_HIDDEN);
+    if (s_inpane_hdr)  lv_obj_add_flag(s_inpane_hdr, LV_OBJ_FLAG_HIDDEN);
+    s_browser_list = s_list_files;
+
+    /* The focused pane was skipped while the overlay covered it (and
+     * may now hold a freshly-opened, possibly shorter document). Hide
+     * every line label and wipe its render cache so the next
+     * editor_ui_refresh() repaints the pane from scratch with no
+     * leftover lines from the previously shown file. Hiding the
+     * widgets is required in addition to invalidating the cache: the
+     * refresh path only hides a stale label when prev_line_visible[]
+     * still marks it visible, and invalidate_render_cache() clears that
+     * flag -- so without an explicit hide here a shorter new file would
+     * leave the previous file's trailing lines on screen. */
+    pane_t *save = s_rp;
+    s_rp = &s_panes[s_focus];
+    for (int i = 0; i < MAX_LINE_LABELS; i++) {
+        if (s_line_labels[i]) lv_obj_add_flag(s_line_labels[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    invalidate_render_cache();
+    s_rp = save;
+}
+
+/* Open the file (or descend into the directory) selected by the
+ * given row index in the file browser. Shared between the Enter-key
+ * handler and the touchscreen tap-to-activate path. */
+static void browser_activate_item(int row)
+{
+#if defined(CONFIG_DRAFTLING_HAS_USB_MSC)
+    /* Touch-tap path for opening a file -- mirrors the keyboard guard
+     * in handle_browser_key() so a touchscreen board cannot open a
+     * file while the SD card belongs to a USB host either. */
+    if (usb_msc_get_mode() != USB_MSC_MODE_OFF) {
+        editor_ui_set_status("SD card via USB active -- disable it in F1 menu first");
+        return;
+    }
+#endif
+    lv_obj_t *btn = lv_obj_get_child(s_browser_list, row);
+    if (!btn) return;
+    int idx = (int)(intptr_t)lv_obj_get_user_data(btn);
+    if (idx < 0 || idx >= s_browser_count) return;
+    if (s_browser_entries[idx].is_dir) {
+        /* Directory navigation is not implemented yet. */
+        return;
+    }
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s",
+             sd_card_get_mount_point(), s_browser_entries[idx].name);
+
+    if (s_pane_count <= 1) {
+        editor_init();
+        esp_err_t oerr = editor_open_file(path);
+        if (oerr == ESP_ERR_NO_MEM) {
+            /* File too large for the editor buffer. Stay on the file
+             * browser and tell the user how big the limit is. The limit
+             * is sized at boot from available PSRAM (see editor_init),
+             * and is also surfaced read-only in F1 -> Settings. */
+            char msg[96];
+            snprintf(msg, sizeof(msg),
+                     "File too large (limit %u KB)",
+                     (unsigned)(editor_get_max_doc_size() / 1024));
+            editor_ui_set_status(msg);
+            return;
+        }
+        if (oerr != ESP_OK) {
+            editor_ui_set_status("Open failed");
+            return;
+        }
+        /* Keep pane 0's document handle current (editor_open_file may
+         * have acted on the active doc). */
+        s_panes[0].doc = editor_get_active();
+        s_panes[0].has_saved_view = false;   /* adopt the freshly opened view */
+    } else {
+        /* Split: load the file into the target (focused) pane through
+         * the document pool, sharing the buffer if the same path is
+         * already open in the other pane. */
+        int tp = (s_open_target_pane >= 0 && s_open_target_pane < s_pane_count)
+                     ? s_open_target_pane : s_focus;
+        editor_doc_t *d = open_into_pane(tp, path);
+        if (!d) {
+            editor_ui_set_status("Open failed");
+            return;
+        }
+        s_focus = tp;
+        pane_bind_focus();
+    }
+#if defined(CONFIG_DRAFTLING_DISPLAY_EPD)
+    /* Wipe the framebuffer before drawing the freshly-opened file
+     * so no pixels from the file browser (or any previously open
+     * document) survive in regions the new content does not cover.
+     * display_clear() also flags the next flush as a full refresh,
+     * clearing any accumulated e-paper ghosting. Done after the
+     * open succeeds so a failed open leaves the browser intact.
+     *
+     * In split mode the editor screen never changes (the file selector
+     * is an in-pane overlay on s_scr), so the upcoming lv_scr_load() in
+     * editor_ui_show_editor() is a no-op and would not repaint the
+     * *other* pane that display_clear() just blanked. Force a full
+     * screen repaint so both panes are redrawn. */
+    if (s_pane_count > 1) {
+        epd_full_screen_repaint();
+    } else {
+        display_clear(0xFF);
+    }
+#endif
+    /* editor_open_file restores the cursor / scroll line from the
+     * metadata sidecar; make sure the cursor is on screen before
+     * the first refresh in case the saved scroll line is out of date. */
+    ensure_cursor_visible();
+    /* If the in-pane (split) selector was driving this open, dismiss
+     * the overlay and restore the full-screen list as the active
+     * browser list before repainting the editor. No-op in single-pane
+     * mode. */
+    close_inpane_browser();
+    editor_ui_show_editor();
+}
+
+static void handle_browser_key(const kb_event_t *ev)
+{
+    bool ctrl = (ev->modifier & (KB_MOD_LCTRL | KB_MOD_RCTRL)) != 0;
+
+    /* F1 opens the menu from browser too */
+    if (ev->keycode == KB_KEY_F1) {
+        show_menu();
+        return;
+    }
+    if (ev->keycode == KB_KEY_F10) {
+        show_help(HELP_FROM_BROWSER);
+        return;
+    }
+
+#if defined(CONFIG_DRAFTLING_HAS_USB_MSC)
+    /* While the SD card is handed to a USB host, refuse anything that
+     * would touch it from the firmware side -- opening/creating a
+     * file, Git sync, split changes, forced sleep, and so on. Only
+     * F1 (to reach the menu and switch it back off) and plain
+     * navigation stay live; see commit_usb_msc_pending_mode(). */
+    if (usb_msc_get_mode() != USB_MSC_MODE_OFF &&
+        ev->keycode != KB_KEY_UP && ev->keycode != KB_KEY_DOWN) {
+        editor_ui_set_status("SD card via USB active -- disable it in F1 menu first");
+        return;
+    }
+#endif
+
+    /* Ctrl+G / Ctrl+W / Ctrl+M / Ctrl+P and the Ctrl+1/2/3 split
+     * shortcuts work from the file browser as well. See the editor's
+     * Ctrl-shortcut block for why kb_layout_shortcut_char() is used
+     * instead of a raw layout translation. */
+    if (ctrl) {
+        char ck = kb_layout_shortcut_char(ev->keycode);
+
+        /* Ctrl+1 / Ctrl+2 / Ctrl+3 control the split layout (HID
+         * keycodes 1 = 0x1E, 2 = 0x1F, 3 = 0x20). The panes are on the
+         * editor screen, so enabling a split here switches straight to
+         * the editor so the change is visible immediately (Ctrl+O in a
+         * pane then picks its file). Ctrl+1 with nothing to collapse
+         * just stays on the browser. */
+        if (ev->keycode == 0x1E) {            /* Ctrl+1: single pane */
+            /* The full-screen browser only shows in single-pane mode
+             * (a split editor shows the in-pane selector on Esc), so
+             * this just confirms the mode + persists it. */
+            editor_ui_apply_split_mode(SPLIT_NONE);
+            editor_ui_set_status("Split: single pane");
+            return;
+        }
+        if (ev->keycode == 0x1F) {            /* Ctrl+2: equal split */
+            editor_ui_apply_split_mode(SPLIT_HALF);
+            if (s_pane_count > 1) editor_ui_show_editor();
+            return;
+        }
+        if (ev->keycode == 0x20) {            /* Ctrl+3: 2/3 <-> 1/3 */
+            editor_ui_cycle_wide_split();
+            if (s_pane_count > 1) editor_ui_show_editor();
+            return;
+        }
+
+        if (ck == 'p') {
+            /* Ctrl+P: deep sleep. No editor screen to prompt on here;
+             * the standby pre-sleep hook auto-saves any open document. */
+            standby_enter_sleep();
+            return;
+        }
+        if (ck == 'g') {
+            if (git_sync_is_configured() && wifi_manager_is_connected()) {
+                if (git_sync_start(GIT_SYNC_BOTH) == ESP_OK) {
+                    editor_ui_set_status("Git: syncing...");
+                } else {
+                    char sbuf[128];
+                    const char *err = git_sync_get_last_error();
+                    snprintf(sbuf, sizeof(sbuf), "Git: %s",
+                             (err && err[0]) ? err : "failed to start sync");
+                    editor_ui_set_status(sbuf);
+                }
+            } else if (!wifi_manager_is_connected()) {
+                editor_ui_set_status("Git: connect WiFi first (F1)");
+            } else {
+                editor_ui_set_status("Git: not configured");
+            }
+            return;
+        }
+        if (ck == 'm') {
+            /* Ctrl+M: menu, equivalent to F1 */
+            show_menu();
+            return;
+        }
+        if (ck == 'w') {
+            if (!wifi_manager_is_connected()) {
+                editor_ui_set_status("WiFi: connecting...");
+                wifi_connect_async();
+            } else {
+                wifi_manager_disconnect();
+                editor_ui_set_status("WiFi: disconnecting...");
+            }
+            return;
+        }
+#if defined(CONFIG_DRAFTLING_DISPLAY_HAS_BACKLIGHT) && !defined(CONFIG_DRAFTLING_DISPLAY_BACKLIGHT_BINARY)
+        if (ck == 'b') {
+            /* Ctrl+B: cycle to the next backlight / front-light
+             * brightness step (same behaviour as in the editor). */
+            int bi = find_backlight_option(s_backlight_pct);
+            bi = (bi + 1) % BACKLIGHT_OPTION_COUNT;
+            s_backlight_pct = BACKLIGHT_OPTIONS[bi];
+            save_backlight_to_nvs();
+            display_set_backlight(s_backlight_pct);
+            char sbuf[32];
+            snprintf(sbuf, sizeof(sbuf), "Backlight: %d%%", s_backlight_pct);
+            editor_ui_set_status(sbuf);
+            return;
+        }
+#endif
+#if defined(CONFIG_DRAFTLING_DISPLAY_EPD)
+        if (ck == 'r') {
+            /* Ctrl+R: force a full e-paper refresh to clear ghosting
+             * and any stale "overwritten" pixels left behind by partial
+             * refreshes. Wipe the framebuffer to the background colour
+             * and invalidate the active screen so LVGL repaints every
+             * widget from scratch (display_clear() also flags the next
+             * flush as a full refresh). */
+#if defined(CONFIG_DRAFTLING_EPD_BLACK_BACKGROUND)
+            display_clear(0x00);
+#else
+            display_clear(0xFF);
+#endif
+            lv_obj_invalidate(lv_scr_act());
+            return;
+        }
+#endif
+    }
+
+    /* Resolve the "N: New file" accelerator the same way Ctrl
+     * shortcuts are resolved (see kb_layout_shortcut_char()), not via
+     * a raw layout translation -- otherwise the N key would produce a
+     * non-Latin character under Ukrainian/Hebrew and this shortcut
+     * would silently stop working. N and Ctrl+N both ask for the new
+     * document's format first. */
+    char ch = kb_layout_shortcut_char(ev->keycode);
+    bool alt = (ev->modifier & (KB_MOD_LALT | KB_MOD_RALT)) != 0;
+
+    if (ch == 'n' && !alt) {
+        show_newfmt_prompt(s_inpane_browser_open ? NEWDOC_INPANE
+                                                 : NEWDOC_BROWSER);
+        return;
+    }
+    if ((ev->keycode == KB_KEY_DELETE && !ctrl && !alt) || (ch == 'd' && alt && !ctrl)) {
+        /* Del / Alt+D: delete the selected file, only if it is already
+         * committed and pushed to the Git server (asks to confirm). */
+        show_delete_prompt();
+        return;
+    }
+    if (ev->keycode == KB_KEY_F2 || (ch == 'r' && alt && !ctrl)) {
+        /* F2 / Alt+R: rename the selected file (and its metadata
+         * sidecar). */
+        show_rename_prompt();
+        return;
+    }
+
+    uint32_t child_count = lv_obj_get_child_count(s_browser_list);
+    if (child_count == 0) return;
+
+    switch (ev->keycode) {
+    case KB_KEY_UP:
+        if (s_browser_sel > 0) s_browser_sel--;
+        /* Selecting a different file is one of the two conditions
+         * that clears a transient status message (e.g. the
+         * "File too large" error left over from a previous open
+         * attempt). Cancel the auto-clear timer too so the standard
+         * text we just restored is not overwritten 3 seconds later. */
+        cancel_status_clear_and_restore();
+        break;
+    case KB_KEY_DOWN:
+        if (s_browser_sel < (int)child_count - 1) s_browser_sel++;
+        cancel_status_clear_and_restore();
+        break;
+    case KB_KEY_ENTER: {
+        browser_activate_item(s_browser_sel);
+        return;
+    }
+    default:
+        break;
+    }
+
+    /* Highlight selected item -- restyle only the items whose state
+     * changed (previous and current selection) so the LVGL dirty
+     * region stays small enough for a partial e-paper refresh. */
+    update_list_highlight(s_browser_list, s_browser_sel, s_browser_sel_prev);
+    s_browser_sel_prev = s_browser_sel;
+}
+
+/* Key handler for the in-pane (split-mode) file selector. Esc cancels
+ * the pick (the pane keeps its current document); F1 cancels and opens
+ * the menu; N creates a new untitled document in the focused pane;
+ * every other key (Up/Down/Enter, Ctrl+G/W/B) is delegated to the
+ * shared browser handler, which now operates on the in-pane list and
+ * loads the picked file into the focused pane via browser_activate_item
+ * (split branch) -> open_into_pane(). */
+static void handle_inpane_browser_key(const kb_event_t *ev)
+{
+    bool ctrl = (ev->modifier & (KB_MOD_LCTRL | KB_MOD_RCTRL)) != 0;
+
+    if (ev->keycode == KB_KEY_ESCAPE) {
+        close_inpane_browser();
+        editor_ui_show_editor();
+        return;
+    }
+    if (ev->keycode == KB_KEY_F1) {
+        close_inpane_browser();
+        show_menu();
+        return;
+    }
+    if (ev->keycode == KB_KEY_F10) {
+        show_help(HELP_FROM_INPANE);
+        return;
+    }
+
+#if defined(CONFIG_DRAFTLING_HAS_USB_MSC)
+    /* Defense-in-depth, not the primary guard: split mode cannot be
+     * entered while SD-via-USB is on (commit_usb_msc_pending_mode()
+     * collapses it, and handle_browser_key() blocks Ctrl+2/3 from
+     * re-entering it), so this overlay should be unreachable in that
+     * state to begin with. See handle_editor_key()'s matching guard. */
+    if (usb_msc_get_mode() != USB_MSC_MODE_OFF) {
+        editor_ui_set_status("SD card via USB active -- disable it in F1 menu first");
+        return;
+    }
+#endif
+
+    if (ctrl && ev->keycode == KB_KEY_TAB) {
+        /* Ctrl+Tab leaves the in-pane file selector and moves keyboard
+         * focus to the other (editor) pane. Close the overlay first so
+         * the pane it covered repaints as an editor, then switch focus
+         * and return to editing. */
+        close_inpane_browser();
+        editor_ui_focus_other_pane();
+        editor_ui_show_editor();
+        return;
+    }
+
+    /* Ctrl+1 / Ctrl+2 / Ctrl+3 change the split layout. This overlay
+     * lives on the split editor screen, so close it and re-apply the
+     * layout (editor_ui_apply_split_mode() repaints and returns key
+     * routing to handle_editor_key). Ctrl+1 in particular is how the
+     * user collapses a split they entered by mistake, and it must work
+     * from here -- a split editor shows this overlay, not the
+     * full-screen browser, on Esc. */
+    if (ctrl && (ev->keycode == 0x1E || ev->keycode == 0x1F ||
+                 ev->keycode == 0x20)) {
+        close_inpane_browser();
+        if      (ev->keycode == 0x1E) editor_ui_apply_split_mode(SPLIT_NONE);
+        else if (ev->keycode == 0x1F) editor_ui_apply_split_mode(SPLIT_HALF);
+        else                          editor_ui_cycle_wide_split();
+        return;
+    }
+
+    handle_browser_key(ev);
+}
+
+/* Process a single key event (must be called with LVGL lock held). */
+static void process_key_event(const kb_event_t *ev)
+{
+    /* Normalize Keypad Enter to regular Enter so all handlers
+     * only need to check for KB_KEY_ENTER. */
+    kb_event_t norm = *ev;
+    if (norm.keycode == KB_KEY_KP_ENTER) {
+        norm.keycode = KB_KEY_ENTER;
+    }
+
+    /* Ctrl+Q is a substitute for Escape on keyboards that have no
+     * dedicated ESC key (e.g. some compact BLE keyboards). Translate
+     * it into a synthetic Escape event so every screen handler that
+     * already keys off KB_KEY_ESCAPE picks it up unchanged. The letter
+     * is resolved like the other Ctrl shortcuts (see
+     * kb_layout_shortcut_char()), so on AZERTY it is the key printed Q
+     * and Ctrl+A there still selects all. */
+    {
+        bool ctrl = (norm.modifier & (KB_MOD_LCTRL | KB_MOD_RCTRL)) != 0;
+        if (ctrl && kb_layout_shortcut_char(norm.keycode) == 'q') {
+            norm.keycode  = KB_KEY_ESCAPE;
+            norm.modifier = 0;
+            norm.character = 0;
+        }
+    }
+
+    const kb_event_t *e = &norm;
+
+    if (s_msg_open) {
+        /* Modal over whatever screen it was raised on. */
+        handle_msg_popup_key(e);
+    } else if (s_save_open) {
+        handle_save_prompt_key(e);
+    } else if (s_newfmt_open) {
+        handle_newfmt_prompt_key(e);
+    } else if (s_del_open) {
+        handle_delete_prompt_key(e);
+    } else if (s_exit_open) {
+        handle_exit_prompt_key(e);
+    } else if (s_search_open) {
+        handle_search_prompt_key(e);
+    } else if (s_settings_open) {
+        handle_settings_key(e);
+    } else if (s_wifi_pw_open) {
+        /* Raised from within the WiFi scan picker (s_menu_open is
+         * still true underneath), so it must take priority over
+         * handle_menu_key. */
+        handle_wifi_pw_prompt_key(e);
+    } else if (s_dbx_open) {
+        /* Raised from the F1 menu, like the WiFi password prompt. */
+        handle_dbx_prompt_key(e);
+    } else if (s_help_open) {
+        handle_help_key(e);
+    } else if (s_menu_open) {
+        handle_menu_key(e);
+    } else if (s_inpane_browser_open) {
+        /* Split-mode in-pane file selector overlays the editor screen
+         * (s_editor_screen_active stays true), so it must be checked
+         * before handle_editor_key. */
+        handle_inpane_browser_key(e);
+    } else if (s_editor_screen_active) {
+        handle_editor_key(e);
+    } else {
+        handle_browser_key(e);
+    }
+}
+
+/* Forward declaration -- defined later in the BLE callback section. */
+static void apply_pending_connect_state(void);
+static void apply_pending_ble_status_text(void);
+
+/* LVGL timer callback: drains the key-event queue in a batch.
+ * This runs inside lv_timer_handler() which already holds the LVGL
+ * mutex, so we must NOT call draftling_lvgl_port_lock() here. */
+#if defined(CONFIG_DRAFTLING_HAS_USB_MSC)
+/* usb_msc's idle auto-off (see usb_msc.h / CONFIG_DRAFTLING_USB_MSC_IDLE_TIMEOUT_SEC)
+ * fires from an esp_timer callback with no way to safely touch LVGL,
+ * so key_drain_cb polls for it here instead -- the same reason
+ * apply_pending_connect_state() exists for BLE connect/disconnect.
+ * User-driven mode changes (commit_usb_msc_pending_mode(), called
+ * from close_usbmsc_picker()) already refresh the UI themselves; this
+ * only reacts to a change nobody in the LVGL task caused. */
+static usb_msc_mode_t s_last_polled_usb_msc_mode = USB_MSC_MODE_OFF;
+
+static void poll_usb_msc_auto_off(void)
+{
+    usb_msc_mode_t mode = usb_msc_get_mode();
+    if (mode == s_last_polled_usb_msc_mode) return;
+    bool auto_reverted = (s_last_polled_usb_msc_mode != USB_MSC_MODE_OFF &&
+                          mode == USB_MSC_MODE_OFF);
+    s_last_polled_usb_msc_mode = mode;
+    if (!auto_reverted) return;
+
+    /* The picker (if open) and the F1 menu row both show the staged
+     * s_usbmsc_pending_mode, not usb_msc_get_mode() directly -- drop
+     * the now-stale staged choice along with the real one so neither
+     * offers to "change" into a mode that is already active. */
+    s_usbmsc_pending_mode = USB_MSC_MODE_OFF;
+    s_usbmsc_picker_open = false;
+
+    editor_ui_set_status("SD card via USB: disabled (no host connected)");
+    /* Pick up whatever a host may have changed on the card, and drop
+     * the now-stale "via USB" hint from the menu if it is open. */
+    if (!s_editor_screen_active) refresh_file_list();
+    if (s_menu_open) refresh_menu_items();
+}
+#endif
+
+static void apply_pending_passkey(void);
+static void apply_pending_sleep_request(void);
+
+static void key_drain_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    kb_event_t ev;
+
+    /* Drain any pending BLE connect/disconnect transition first.
+     * The BLE host task only sets the flag (it cannot safely take
+     * the LVGL mutex - on the e-paper boards display_flush() can
+     * hold the mutex for several seconds during a panel refresh,
+     * which would time out the BLE callback and leave the user
+     * stuck on the "Reconnecting..." prompt screen even after
+     * the keyboard has connected). See apply_pending_connect_state().
+     * Progress text first, so a connect / disconnect arriving in the
+     * same tick has the last word on the prompt label. */
+    apply_pending_ble_status_text();
+    apply_pending_connect_state();
+    apply_pending_passkey();
+    apply_pending_sleep_request();
+#if defined(CONFIG_DRAFTLING_HAS_USB_MSC)
+    poll_usb_msc_auto_off();
+#endif
+
+    int drained = 0;
+    while (xQueueReceive(s_key_queue, &ev, 0) == pdTRUE) {
+        process_key_event(&ev);
+        drained++;
+    }
+
+#if defined(CONFIG_DRAFTLING_DISPLAY_EPD)
+    /* ClipGuard (see handle_editor_key()) sets a one-shot partial-
+     * refresh clip sized for a SINGLE keystroke's changed pixels, in
+     * its destructor. When keystrokes queue up faster than this timer
+     * can drain them -- e.g. while the previous tick's flush_cb() /
+     * display_flush() call was blocked for hundreds of ms driving an
+     * EPD partial refresh, which is easily longer than a fast typist's
+     * inter-key interval -- the loop above processes more than one key
+     * per tick, and each key's ClipGuard destructor overwrites the clip
+     * in turn: only the LAST key's tiny window survives to the flush
+     * that follows. The dirty bounding box has correctly accumulated
+     * every key's pixels by then, but the stale narrow clip discards
+     * everything outside that last window, and the backend's
+     * clear_dirty() then drops that region for good -- the earlier
+     * keystrokes' glyphs never reach the panel, showing up as
+     * persistent blank gaps under fast typing. Falling back to the
+     * full accumulated dirty bbox whenever more than one key was
+     * drained this tick keeps the narrow per-key fast path for the
+     * common (unhurried) case while staying correct in bursts. */
+    if (drained > 1) {
+        display_set_partial_clip(0, 0, 0, 0);
+    }
+#endif
+}
+
+/* BLE callback: enqueue the event and return immediately.
+ * This function runs on the HID host task and must not touch LVGL. */
+extern "C" void editor_ui_handle_key(const void *event)
+{
+    const kb_event_t *ev = (const kb_event_t *)event;
+
+    if (ev->pressed) {
+        /* Reset standby inactivity timer on key-down */
+        standby_reset_timer();
+
+        /* Start key-repeat tracking */
+        s_repeat_ev     = *ev;
+        s_repeat_held   = true;
+        s_repeat_start  = xTaskGetTickCount();
+        s_repeat_firing = false;
+
+        if (s_key_queue) {
+            xQueueSend(s_key_queue, ev, 0);
+        }
+    } else {
+        /* Key released -- cancel repeat for the released key */
+        if (s_repeat_held && ev->keycode == s_repeat_ev.keycode) {
+            s_repeat_held  = false;
+            s_repeat_firing = false;
+        }
+    }
+}
+
+/* ---- Key repeat timer ---- */
+
+/* Called periodically by an LVGL timer.  If a key is held longer than
+ * KEY_REPEAT_DELAY_MS, inject the stored key event at the repeat rate. */
+static void key_repeat_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    if (!s_repeat_held) return;
+
+    uint32_t now = xTaskGetTickCount();
+    uint32_t elapsed = (now - s_repeat_start) * portTICK_PERIOD_MS;
+
+    /* See KEY_REPEAT_MAX_MS's comment: treat an implausibly long hold
+     * as a missed key-up rather than genuine input, and stop
+     * repeating instead of re-injecting this key forever. */
+    if (elapsed >= KEY_REPEAT_MAX_MS) {
+        s_repeat_held   = false;
+        s_repeat_firing = false;
+        return;
+    }
+
+    if (!s_repeat_firing) {
+        if (elapsed >= KEY_REPEAT_DELAY_MS) {
+            s_repeat_firing = true;
+            /* Inject the first repeat event */
+            process_key_event(&s_repeat_ev);
+        }
+    } else {
+        /* Already past the initial delay -- inject at the repeat rate.
+         * The timer fires every KEY_REPEAT_RATE_MS so one event per
+         * invocation is sufficient. */
+        process_key_event(&s_repeat_ev);
+    }
+}
+
+/* ---- Passkey display callback ---- */
+
+/* Latest passkey event from the BLE host task, applied by the LVGL
+ * task in key_drain_cb() (like s_pending_conn_state below). The BLE
+ * task must not wait for the LVGL mutex: an e-paper refresh can hold
+ * it longer than any sensible timeout, and a dropped passkey left the
+ * user with no code to type, so pairing failed. */
+static portMUX_TYPE s_passkey_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t     s_passkey_pending = 0;
+static bool         s_passkey_has_pending = false;
+
+static void passkey_display_cb(uint32_t passkey)
+{
+    taskENTER_CRITICAL(&s_passkey_mux);
+    s_passkey_pending = passkey;
+    s_passkey_has_pending = true;
+    taskEXIT_CRITICAL(&s_passkey_mux);
+}
+
+/* Run on the LVGL task (from key_drain_cb), mutex already held. */
+/* Set by editor_ui_request_sleep() (button poller task), handled in
+ * the UI task by apply_pending_sleep_request(). */
+static volatile bool s_sleep_requested = false;
+
+extern "C" void editor_ui_request_sleep(void)
+{
+    standby_reset_timer();
+    s_sleep_requested = true;
+}
+
+/* A Power-button sleep request, treated like Ctrl+P / "Sleep now":
+ * with unsaved changes in the editor, ask first. The prompt can only
+ * be raised from the editor itself (or over the F1 menu, which is
+ * closed first, as "Sleep now" does); while another dialog is open the
+ * press only explains why nothing happened, and while an operation is
+ * running (busy pop-up, e.g. formatting the card) it is ignored. */
+static void apply_pending_sleep_request(void)
+{
+    if (!s_sleep_requested) return;
+    s_sleep_requested = false;
+
+    if (s_msg_open && s_msg_busy) return;
+    if (!s_editor_screen_active || !editor_is_modified()) {
+        standby_enter_sleep();
+        return;
+    }
+    if (s_exit_open) return;    /* already asking */
+    /* Only the plain menu list is closed; a picker shown inside the
+     * menu counts as an open dialog. */
+    bool menu_picker = s_wifi_scan_picker_open || s_fmt_step != FMT_STEP_NONE;
+#if defined(CONFIG_DRAFTLING_HAS_USB_MSC)
+    menu_picker = menu_picker || s_usbmsc_picker_open;
+#endif
+    if (s_menu_open && !s_settings_open && !s_wifi_pw_open &&
+        !s_dbx_open && !s_help_open && !menu_picker) {
+        close_menu();
+    }
+    if (s_msg_open || s_save_open || s_newfmt_open || s_del_open ||
+        s_search_open || s_settings_open || s_wifi_pw_open || s_dbx_open ||
+        s_help_open || s_menu_open || s_inpane_browser_open) {
+        if (!s_msg_open) {
+            show_msg_popup("Unsaved changes",
+                           "Close this dialog, then press Power again "
+                           "to save or discard the changes.", false);
+        }
+        return;
+    }
+    show_sleep_prompt();
+}
+
+static void apply_pending_passkey(void)
+{
+    taskENTER_CRITICAL(&s_passkey_mux);
+    bool has = s_passkey_has_pending;
+    uint32_t passkey = s_passkey_pending;
+    s_passkey_has_pending = false;
+    taskEXIT_CRITICAL(&s_passkey_mux);
+    if (!has || !s_passkey_panel) return;
+
+    if (passkey == BLE_PASSKEY_DISMISS) {
+        lv_obj_add_flag(s_passkey_panel, LV_OBJ_FLAG_HIDDEN);
+        /* The dismiss is typically followed almost immediately by a
+         * connect-state transition (BLE auth complete -> HIDH open
+         * -> ble_connect_status_cb), which queues a second screen
+         * change. On the epdiy backend, two large GL16 partials
+         * issued back-to-back right after the BLE stack hammered
+         * the bus can wedge the `epd_prep` feeders and trip the
+         * task watchdog. Latch the next flush to a single GC16
+         * full refresh so both redraws coalesce. */
+        display_request_full_refresh();
+    } else {
+        /* Pairing normally runs while the BLE prompt screen (or the
+         * file browser) is shown, so move the overlay onto whichever
+         * screen is active, like the other pop-ups. */
+        char buf[96];
+        snprintf(buf, sizeof(buf),
+                 "Keyboard pairing code:\n%06lu\n"
+                 "Type it on the keyboard, then press Enter",
+                 (unsigned long)passkey);
+        lv_label_set_text(s_passkey_label, buf);
+        lv_obj_set_parent(s_passkey_panel, lv_scr_act());
+        lv_obj_center(s_passkey_panel);
+        lv_obj_move_foreground(s_passkey_panel);
+        lv_obj_remove_flag(s_passkey_panel, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+/* ---- BLE connection status callback ---- */
+
+/* Pending connect/disconnect state set by the BLE host task and
+ * consumed by the LVGL task. Values: -1 = no pending change,
+ * 0 = pending disconnect, 1 = pending connect. Declared volatile
+ * since it crosses task boundaries; we accept the tiny race where
+ * a back-to-back connect/disconnect could overwrite each other --
+ * the consumer always observes the latest state, which matches
+ * what `ble_keyboard_is_connected()` would report. */
+static volatile int8_t s_pending_conn_state = -1;
+
+/* Latest BLE progress message waiting for the LVGL task (see
+ * ble_status_text_cb()); intermediate ones are superseded. */
+static portMUX_TYPE s_ble_status_mux = portMUX_INITIALIZER_UNLOCKED;
+static char         s_ble_status_pending[128];
+static bool         s_ble_status_has_pending = false;
+
+/* Run on the LVGL task (from key_drain_cb), mutex already held. */
+static void apply_pending_ble_status_text(void)
+{
+    char text[sizeof(s_ble_status_pending)];
+    taskENTER_CRITICAL(&s_ble_status_mux);
+    bool has = s_ble_status_has_pending;
+    if (has) {
+        memcpy(text, s_ble_status_pending, sizeof(text));
+        s_ble_status_has_pending = false;
+    }
+    taskEXIT_CRITICAL(&s_ble_status_mux);
+    if (!has || !s_ble_prompt_lbl) return;
+    /* Only update when the BLE prompt screen is active */
+    if (lv_scr_act() == s_scr_ble_prompt) {
+        lv_label_set_text(s_ble_prompt_lbl, text);
+    }
+}
+
+/* Run on the LVGL task (from key_drain_cb). At this point the LVGL
+ * mutex is already held by the LVGL task, so we must NOT call
+ * draftling_lvgl_port_lock() here. */
+static void apply_pending_connect_state(void)
+{
+    int8_t pending = s_pending_conn_state;
+    if (pending < 0) return;
+    s_pending_conn_state = -1;
+
+    bool connected = (pending != 0);
+
+    /* Connect/disconnect changes the BLE prompt label and often
+     * swaps the active screen (prompt <-> editor / file browser),
+     * which on the epdiy backend would otherwise issue back-to-back
+     * GL16 partials in close succession with the post-auth passkey
+     * dismiss above. Coalesce all of these into a single GC16 full
+     * refresh -- the user is already seeing a connection-state
+     * change, the flash is acceptable, and it avoids wedging
+     * epdiy's `epd_prep` feeders. */
+    display_request_full_refresh();
+
+    if (connected) {
+        /* Flush any stale key events that accumulated while
+         * the keyboard was disconnected / reconnecting. */
+        if (s_key_queue) {
+            xQueueReset(s_key_queue);
+        }
+
+        /* Keyboard just connected -- if we are on the BLE prompt screen,
+         * return to whatever the user was doing before disconnect. */
+        if (lv_scr_act() == s_scr_ble_prompt) {
+            /* Drop any stale touch indev state (in-progress press,
+             * wait-until-release, act_obj pinned to the prompt's
+             * Off button) before swapping screens, so the editor
+             * does not inherit a sticky press that would absorb
+             * the first tap. */
+            lv_indev_reset(NULL, NULL);
+            if (s_editor_screen_active) {
+                /* Restore the editor -- file contents are still in
+                 * the gap buffer; no need to close/reopen. */
+                lv_scr_load(s_scr);
+#if defined(CONFIG_DRAFTLING_DISPLAY_EPD)
+                /* On e-paper, refresh_active_pane()'s per-line cache
+                 * (s_prev_line_text[] etc) still holds whatever text
+                 * was last rendered before the BLE prompt screen took
+                 * over -- since the document did not change while
+                 * disconnected, that cache still matches, so
+                 * editor_ui_refresh() alone would skip re-calling
+                 * lv_label_set_text() for every line ("can_skip"),
+                 * leaving the panel blank until something else forces
+                 * a real redraw. Matches the same class of bug
+                 * epd_full_screen_repaint() already exists to fix for
+                 * the split-pane and font-change transitions -- use
+                 * it here too rather than the bare
+                 * display_request_full_refresh() above, which only
+                 * flags the next flush as full and does not touch
+                 * this cache. */
+                epd_full_screen_repaint();
+#endif
+                editor_ui_refresh();
+            } else {
+                editor_ui_show_file_browser();
+            }
+        }
+        if (s_ble_prompt_lbl) {
+            lv_label_set_text(s_ble_prompt_lbl,
+                "Keyboard connected!");
+        }
+    } else {
+        /* A BLE disconnect arrived, but if another local keyboard is
+         * still usable (the Tab5 attachable keyboard, or a USB
+         * keyboard) the user is NOT actually keyboard-less -- on the
+         * Tab5 the BLE host fires this callback simply because it gets
+         * disabled at boot once a wired keyboard is detected. Do not
+         * yank the user onto the "Keyboard disconnected /
+         * Reconnecting..." prompt screen in that case; leave the
+         * editor / file browser as-is. */
+        bool other_kbd = false;
+#if defined(CONFIG_DRAFTLING_HAS_TAB5_KBD)
+        if (tab5_kbd_is_present()) other_kbd = true;
+#endif
+#if defined(CONFIG_DRAFTLING_HAS_USB_HOST)
+        if (usb_kbd_is_connected()) other_kbd = true;
+#endif
+        if (other_kbd) {
+            return;
+        }
+
+        /* Keyboard disconnected -- close any open overlays so the
+         * UI is in a clean state when we reconnect.  Do NOT call
+         * editor_close_file() -- preserve the user's work. */
+        s_menu_open = false;
+        s_help_open = false;
+        s_settings_open = false;
+        s_restart_confirm_open = false;
+#if defined(CONFIG_DRAFTLING_DISPLAY_COLOR)
+        s_theme_picker_open = false;
+#endif
+        s_layouts_picker_open = false;
+        s_save_open = false;
+        if (s_save_panel) lv_obj_add_flag(s_save_panel, LV_OBJ_FLAG_HIDDEN);
+        close_newfmt_prompt();
+        close_delete_prompt();
+        s_exit_open = false;
+        if (s_exit_panel) lv_obj_add_flag(s_exit_panel, LV_OBJ_FLAG_HIDDEN);
+        s_search_open = false;
+        if (s_search_panel) lv_obj_add_flag(s_search_panel, LV_OBJ_FLAG_HIDDEN);
+        /* Cancel any in-progress key repeat so stale keys do not
+         * keep firing after reconnection. */
+        s_repeat_held = false;
+        s_repeat_firing = false;
+        if (s_ble_prompt_lbl) {
+            lv_label_set_text(s_ble_prompt_lbl,
+                "Keyboard disconnected.\nReconnecting...");
+        }
+        /* Drop any stale touch indev state (in-progress press /
+         * gesture wait-until-release / act_obj pinned to a
+         * now-hidden editor widget) before swapping screens.
+         * Without this, a stray touch frame around the
+         * disconnect can leave the LVGL indev with
+         * wait_until_release set, which silently absorbs taps
+         * on the BLE prompt's "Off" button. */
+        lv_indev_reset(NULL, NULL);
+#if defined(CONFIG_DRAFTLING_DISPLAY_EPD)
+        /* Same missing-repaint bug as show_menu()/show_settings() --
+         * see show_menu()'s comment. */
+        display_clear(0xFF);
+        lv_obj_invalidate(s_scr_ble_prompt);
+#endif
+        lv_scr_load(s_scr_ble_prompt);
+    }
+}
+
+/* Runs in the BLE/Bluedroid host task. We deliberately do NOT take
+ * the LVGL mutex here: on the e-paper boards, display_flush() can
+ * hold the mutex for several seconds during a panel refresh, which
+ * would exceed any reasonable callback-side timeout and leave the
+ * user stuck on the "Reconnecting..." prompt screen even after the
+ * keyboard is connected. Instead, set a flag that the LVGL task
+ * (key_drain_cb) drains on its next tick, where the mutex is
+ * already held. */
+static void ble_connect_status_cb(bool connected)
+{
+    ESP_LOGI("EditorUI", "BLE connect status: %s",
+             connected ? "CONNECTED" : "DISCONNECTED");
+    s_pending_conn_state = connected ? 1 : 0;
+}
+
+/* BLE status text callback -- hand the BLE prompt label a connection
+ * progress message from the BLE keyboard component. Runs in the
+ * BLE/Bluedroid host task, so like ble_connect_status_cb() it only
+ * stores the text: waiting for the LVGL mutex here either stalls the
+ * BLE host for the length of an e-paper refresh or, with a short
+ * timeout, silently drops the message and leaves a stale one on
+ * screen. apply_pending_ble_status_text() shows the latest one. */
+static void ble_status_text_cb(const char *text)
+{
+    if (!text) return;
+    taskENTER_CRITICAL(&s_ble_status_mux);
+    snprintf(s_ble_status_pending, sizeof(s_ble_status_pending), "%s", text);
+    s_ble_status_has_pending = true;
+    taskEXIT_CRITICAL(&s_ble_status_mux);
+}
+
+/* ---- WiFi connect task ----
+ * wifi_manager_connect() blocks for up to 30 seconds while waiting for
+ * the connection.  Running it on a separate task keeps the LVGL render
+ * loop responsive so the user sees status updates in real time. */
+static void wifi_connect_task(void *arg)
+{
+    (void)arg;
+    esp_err_t ret = wifi_manager_connect();
+    if (ret == ESP_ERR_NOT_FOUND || ret == ESP_ERR_INVALID_STATE) {
+        /* No credentials, or another connect/scan is running -- the
+         * wifi_state callback will not fire, so update the status bar
+         * directly. */
+        if (draftling_lvgl_port_lock(200)) {
+            editor_ui_set_status(ret == ESP_ERR_NOT_FOUND
+                                     ? "WiFi: no credentials found"
+                                     : "WiFi: busy, try again");
+            dbx_wifi_done(false, ret == ESP_ERR_NOT_FOUND
+                ? "No WiFi network is configured. Use F1 -> "
+                  "\"WiFi: New connection...\" first."
+                : "WiFi is busy, try again.");
+            draftling_lvgl_port_unlock();
+        }
+    }
+    vTaskDelete(NULL);
+}
+
+/* Start WiFi connection on a background task. */
+static void wifi_connect_async(void)
+{
+    BaseType_t rc = xTaskCreatePinnedToCore(wifi_connect_task, "wifi_conn",
+                                            4 * 1024, NULL, 3, NULL, 0);
+    if (rc != pdPASS) {
+        editor_ui_set_status("WiFi: failed to start task");
+        dbx_wifi_done(false, "Failed to start the WiFi task.");
+    }
+}
+
+/* ---- WiFi scan task ----
+ * wifi_manager_scan() blocks for a few seconds; run it off the LVGL
+ * task like wifi_connect_task() above. */
+static void wifi_scan_task(void *arg)
+{
+    (void)arg;
+    wifi_scan_result_t results[WIFI_SCAN_MAX_RESULTS];
+    int count = 0;
+    esp_err_t ret = wifi_manager_scan(results, WIFI_SCAN_MAX_RESULTS, &count);
+
+    if (draftling_lvgl_port_lock(200)) {
+        /* Only touch the UI if the picker is still what's on screen --
+         * the user may have backed out (Esc) while the scan was in
+         * flight. */
+        if (s_wifi_scan_picker_open) {
+            s_wifi_scan_in_progress = false;
+            s_wifi_scan_count = (ret == ESP_OK) ? count : 0;
+            if (ret == ESP_OK && count > 0) {
+                memcpy(s_wifi_scan_results, results, sizeof(results[0]) * (size_t)count);
+            }
+            s_wifi_scan_picker_sel = 0;
+            refresh_wifi_scan_picker_items();
+            if (ret != ESP_OK) {
+                editor_ui_set_status("WiFi: scan failed");
+            }
+        }
+        draftling_lvgl_port_unlock();
+    }
+    vTaskDelete(NULL);
+}
+
+/* Start (or restart) a scan on a background task -- see
+ * start_wifi_scan() in the picker block above. */
+static void wifi_scan_async(void)
+{
+    BaseType_t rc = xTaskCreatePinnedToCore(wifi_scan_task, "wifi_scan",
+                                            4 * 1024, NULL, 3, NULL, 0);
+    if (rc != pdPASS) {
+        s_wifi_scan_in_progress = false;
+        editor_ui_set_status("WiFi: failed to start scan task");
+        if (s_wifi_scan_picker_open) refresh_wifi_scan_picker_items();
+    }
+}
+
+/* ---- WiFi connect-to-picked-network task ----
+ * Mirrors wifi_connect_task() above, but connects to the SSID/password
+ * the user picked in the scan picker instead of reading wifi.cfg/NVS,
+ * and persists them to /sdcard/wifi.cfg on success (in the same format
+ * wifi_manager_connect() reads back) so Ctrl+W and the next boot's
+ * auto-reconnect pick up the new network too. */
+typedef struct {
+    char ssid[33];
+    char password[65];
+} wifi_connect_args_t;
+
+static void wifi_connect_picked_task(void *arg)
+{
+    wifi_connect_args_t *args = (wifi_connect_args_t *)arg;
+    esp_err_t ret = wifi_manager_connect_to(args->ssid, args->password, true);
+    if (ret == ESP_OK) {
+        wifi_manager_save_to_file(args->ssid, args->password);
+    } else if (ret == ESP_ERR_INVALID_STATE) {
+        if (draftling_lvgl_port_lock(200)) {
+            editor_ui_set_status("WiFi: busy, try again");
+            draftling_lvgl_port_unlock();
+        }
+    }
+    free(args);
+    vTaskDelete(NULL);
+}
+
+static void wifi_connect_picked_async(const char *ssid, const char *password)
+{
+    wifi_connect_args_t *args = (wifi_connect_args_t *)malloc(sizeof(wifi_connect_args_t));
+    if (!args) {
+        editor_ui_set_status("WiFi: out of memory");
+        return;
+    }
+    strncpy(args->ssid, ssid, sizeof(args->ssid) - 1);
+    args->ssid[sizeof(args->ssid) - 1] = '\0';
+    strncpy(args->password, password, sizeof(args->password) - 1);
+    args->password[sizeof(args->password) - 1] = '\0';
+
+    BaseType_t rc = xTaskCreatePinnedToCore(wifi_connect_picked_task, "wifi_conn2",
+                                            4 * 1024, args, 3, NULL, 0);
+    if (rc != pdPASS) {
+        free(args);
+        editor_ui_set_status("WiFi: failed to start task");
+    }
+}
+
+/* ---- Draftbox connect task ----
+ * git_sync_draftbox_connect() makes an HTTPS request (TLS handshake
+ * included), so it runs off the LVGL task like the WiFi tasks above.
+ * The result -- success or the reason for failure -- goes to the
+ * status bar. */
+typedef struct {
+    char site[128];
+    char otp[10];
+} draftbox_connect_args_t;
+
+static void draftbox_connect_task(void *arg)
+{
+    draftbox_connect_args_t *args = (draftbox_connect_args_t *)arg;
+    char msg[128];
+    esp_err_t ret = git_sync_draftbox_connect(args->site, args->otp, msg, sizeof(msg));
+    memset(args, 0, sizeof(*args));
+    free(args);
+
+    char text[256];
+    if (ret == ESP_OK) {
+        if (msg[0] >= 'a' && msg[0] <= 'z') msg[0] = (char)(msg[0] - 'a' + 'A');
+        snprintf(text, sizeof(text),
+                 "%s.\nThe repository URL and token are saved in git.cfg.", msg);
+    } else {
+        snprintf(text, sizeof(text),
+                 "Could not connect: %s.\ngit.cfg was not changed.", msg);
+    }
+    /* Wait for the lock without a timeout: the pop-up ignores keys
+     * until this result replaces its "Connecting..." text. */
+    draftling_lvgl_port_lock(-1);
+    show_msg_popup("Draftbox", text, false);
+    /* "Git Sync (not configured)" may have just become configured. */
+    if (ret == ESP_OK && s_menu_open) refresh_menu_items();
+    draftling_lvgl_port_unlock();
+    vTaskDelete(NULL);
+}
+
+static void draftbox_connect_async(const char *site, const char *otp)
+{
+    draftbox_connect_args_t *args =
+        (draftbox_connect_args_t *)calloc(1, sizeof(draftbox_connect_args_t));
+    if (!args) {
+        show_msg_popup("Draftbox", "Could not connect: out of memory.", false);
+        return;
+    }
+    strlcpy(args->site, site, sizeof(args->site));
+    strlcpy(args->otp, otp, sizeof(args->otp));
+
+    /* esp_http_client + mbedTLS handshake need more stack than the
+     * WiFi tasks. */
+    BaseType_t rc = xTaskCreatePinnedToCore(draftbox_connect_task, "draftbox",
+                                            8 * 1024, args, 3, NULL, 0);
+    if (rc != pdPASS) {
+        memset(args, 0, sizeof(*args));
+        free(args);
+        show_msg_popup("Draftbox", "Could not connect: failed to start task.", false);
+    }
+}
+
+/* ---- WiFi state callback ----
+ * Called from the WiFi manager (event handler context) when the
+ * connection state changes.  Must take the LVGL lock before touching
+ * any UI objects. */
+static void wifi_state_cb(wifi_state_t state)
+{
+    /* Generous timeout: an e-paper full refresh can hold the LVGL lock
+     * for over a second, and a dropped CONNECTING / ERROR update would
+     * leave the user with no idea what the device is doing. */
+    if (!draftling_lvgl_port_lock(2000)) return;
+
+    /* While a Git sync is running, do not overwrite the on-screen
+     * progress messages with WiFi state notifications -- the user
+     * would otherwise see "WiFi: SSID (IP)" flicker in between
+     * "Git: Pulling i/N" messages. Query the authoritative git_sync
+     * state (set synchronously inside git_sync_start before the sync
+     * task spawns) instead of a UI-side flag, so events that arrive
+     * before the first GIT_SYNC_IN_PROGRESS callback are also
+     * suppressed. The WiFi icon is still refreshed below so the
+     * title bar stays accurate. */
+    if (git_sync_get_state() != GIT_SYNC_IN_PROGRESS) {
+        switch (state) {
+        case WIFI_STATE_CONNECTED:
+        {
+            char buf[80];
+            snprintf(buf, sizeof(buf), "WiFi: connected to %s (%s)",
+                     wifi_manager_get_ssid(), wifi_manager_get_ip());
+            editor_ui_set_status(buf);
+            break;
+        }
+        case WIFI_STATE_CONNECTING:
+        {
+            /* Mirror the underlying "WiFi: connecting to <SSID>" log
+             * message in the on-screen status bar so users see which
+             * SSID we are negotiating with. */
+            char buf[80];
+            const char *ssid = wifi_manager_get_ssid();
+            if (ssid && ssid[0]) {
+                snprintf(buf, sizeof(buf), "WiFi: connecting to %s...", ssid);
+            } else {
+                snprintf(buf, sizeof(buf), "WiFi: connecting...");
+            }
+            /* No auto-clear: an attempt can take up to 30 s, and the
+             * message must stay until CONNECTED / ERROR replaces it. */
+            set_status_with_timeout(buf, 0);
+            break;
+        }
+        case WIFI_STATE_ERROR:
+        {
+            char buf[80];
+            const char *ssid = wifi_manager_get_ssid();
+            bool auth = wifi_manager_last_failure_was_auth();
+            if (ssid && ssid[0]) {
+                snprintf(buf, sizeof(buf), auth ? "WiFi: wrong password for %s"
+                                                : "WiFi: failed to connect to %s", ssid);
+            } else if (auth) {
+                snprintf(buf, sizeof(buf), "WiFi: wrong password");
+            } else {
+                snprintf(buf, sizeof(buf), "WiFi: connection failed");
+            }
+            set_status_with_timeout(buf, 5000);
+            break;
+        }
+        case WIFI_STATE_DISCONNECTED:
+            editor_ui_set_status("WiFi: disconnected");
+            break;
+        default:
+            break;
+        }
+    }
+
+    /* A Draftbox prompt waiting for this connection (independent of the
+     * Git-sync status suppression above). DISCONNECTED is not a failure
+     * here: a new attempt drops the old association first. */
+    if (state == WIFI_STATE_CONNECTED) {
+        dbx_wifi_done(true, NULL);
+    } else if (state == WIFI_STATE_ERROR) {
+        char reason[96];
+        const char *ssid = wifi_manager_get_ssid();
+        bool auth = wifi_manager_last_failure_was_auth();
+        snprintf(reason, sizeof(reason), "%s%s%s.",
+                 auth ? "Wrong password" : "Connection failed",
+                 (ssid && ssid[0]) ? " for " : "",
+                 (ssid && ssid[0]) ? ssid : "");
+        dbx_wifi_done(false, reason);
+    }
+
+    update_wifi_icons();
+    draftling_lvgl_port_unlock();
+}
+
+/* ---- Git sync callback ----
+ * Called from the git_sync task when the sync state changes.
+ * Must take the LVGL lock before touching any UI objects. */
+static void git_sync_cb(git_sync_state_t state, const char *message)
+{
+    /* A dropped progress message is harmless (the next one replaces
+     * it), but the final SUCCESS / ERROR must never be dropped: the
+     * progress messages have no auto-clear, so the last one would stay
+     * on screen forever. On a slow e-paper panel (Seeed reTerminal
+     * E1001: ~450 ms partial refresh) the flush of "Committing local
+     * changes..." still holds the lock when a no-op sync finishes, so
+     * wait for it unconditionally. This runs on the sync task (or with
+     * the recursive lock already held), so blocking is safe. */
+    bool final = (state == GIT_SYNC_SUCCESS || state == GIT_SYNC_ERROR);
+    if (!draftling_lvgl_port_lock(final ? -1 : 200)) return;
+
+    switch (state) {
+    case GIT_SYNC_IN_PROGRESS:
+    {
+        char buf[80];
+        snprintf(buf, sizeof(buf), "Git: %s",
+                 message ? message : "syncing...");
+        /* No auto-clear timeout: per-file progress messages must stay
+         * visible until the next progress callback overwrites them or
+         * the sync finishes. Otherwise the 3 s timer would revert the
+         * status to the default hint mid-sync (e.g. between two slow
+         * uploads), which looks like the sync stopped. The terminal
+         * SUCCESS / ERROR branches install a 10 s timer so the final
+         * summary still auto-clears. */
+        set_status_with_timeout(buf, 0);
+        break;
+    }
+    case GIT_SYNC_SUCCESS:
+    {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "Git: %s",
+                 message ? message : "sync complete");
+        /* If a file is currently open in the editor, reload it from disk
+         * so the user sees any changes that were pulled from the remote. */
+        if (s_editor_screen_active && editor_get_file_path()) {
+            const char *path = editor_get_file_path();
+            esp_err_t rerr = editor_open_file(path);
+            if (rerr == ESP_ERR_NO_MEM) {
+                char msg[96];
+                snprintf(msg, sizeof(msg),
+                         "Reload failed: file too large (limit %u KB)",
+                         (unsigned)(editor_get_max_doc_size() / 1024));
+                editor_ui_set_status(msg);
+            }
+            editor_ui_refresh();
+        }
+        /* If the file browser is the active screen (sync was triggered
+         * from there), rebuild its file list so newly pulled files
+         * appear and deleted ones disappear. */
+        if (lv_scr_act() == s_scr_browser) {
+            refresh_file_list();
+        }
+        /* Show the final summary for 10 s -- long enough for the user
+         * to read it without lingering forever. Set last so the reload
+         * path above (which may call editor_ui_set_status on error)
+         * does not race with the longer timeout. */
+        set_status_with_timeout(buf, 10000);
+        break;
+    }
+    case GIT_SYNC_ERROR:
+    {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "Git: %s",
+                 message ? message : "error");
+        set_status_with_timeout(buf, 10000);
+        break;
+    }
+    default:
+        break;
+    }
+
+    draftling_lvgl_port_unlock();
+}
+
+/* ---- Initialization ---- */
+
+/* Build (or rebuild) every LVGL screen, overlay and timer that
+ * displays the current theme. Called from editor_ui_init() at boot
+ * and again from rebuild_screens_for_theme() after a theme change.
+ *
+ * Pre-condition: init_styles() has already been called so theme_fg()
+ * / theme_bg() reflect the desired palette, and any previously-built
+ * screens / overlays / timers have been deleted with their pointers
+ * NULLed. */
+static void build_screens(void)
+{
+    /* ---- Editor screen ---- */
+    s_scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(s_scr, theme_bg(), 0);
+
+    /* Title bar */
+    s_lbl_title = lv_label_create(s_scr);
+    lv_obj_set_pos(s_lbl_title, 2, 0);
+    lv_obj_set_width(s_lbl_title, TITLE_W);
+    lv_obj_set_style_text_font(s_lbl_title, FONT_11, 0);
+    lv_obj_set_style_text_color(s_lbl_title, theme_fg(), 0);
+    /* One line only: update_title_bar() shortens long file names, and
+     * clipping keeps anything it misjudges from wrapping over the
+     * header rule. */
+    lv_label_set_long_mode(s_lbl_title, LV_LABEL_LONG_CLIP);
+    lv_label_set_text(s_lbl_title, "Draftling");
+
+    /* Header separator line */
+    lv_obj_t *hline = lv_obj_create(s_scr);
+    lv_obj_set_size(hline, SCR_W, 1);
+    lv_obj_set_pos(hline, 0, HEADER_H - 1);
+    lv_obj_set_style_bg_color(hline, theme_fg(), 0);
+    lv_obj_set_style_bg_opa(hline, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(hline, 0, 0);
+    lv_obj_set_style_radius(hline, 0, 0);
+    lv_obj_set_style_pad_all(hline, 0, 0);
+
+    /* Editor content area -- one container per pane. Both panes are
+     * created up-front; layout_panes() positions/sizes them and hides
+     * the second one while the editor is in single-pane mode. Each
+     * pane's per-document widgets (logo, selection overlays, cursor)
+     * are created into its own container by binding the pane first. */
+    for (int p = 0; p < EDITOR_MAX_PANES; p++) {
+        pane_bind(p);
+
+        s_cont_edit = lv_obj_create(s_scr);
+        lv_obj_set_pos(s_cont_edit, 0, EDITOR_Y);
+        lv_obj_set_size(s_cont_edit, SCR_W, EDITOR_H);
+        lv_obj_set_style_bg_opa(s_cont_edit, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(s_cont_edit, 0, 0);
+        lv_obj_set_style_pad_all(s_cont_edit, 0, 0);
+        lv_obj_set_style_radius(s_cont_edit, 0, 0);
+        lv_obj_remove_flag(s_cont_edit, LV_OBJ_FLAG_SCROLLABLE);
+
+#if defined(CONFIG_DRAFTLING_TOUCHSCREEN)
+        /* Route LVGL pointer events (tap, double-tap, drag-to-scroll,
+         * swipe gesture) on the editor area to editor_touch_event_cb.
+         * The container is CLICKABLE so it receives press / pressing /
+         * released / clicked / gesture events from the indev. Using
+         * LV_EVENT_ALL is simpler than registering each subtype and
+         * lets editor_touch_event_cb filter by code. The pane index is
+         * stored in user_data so the callback can focus the tapped
+         * pane. */
+        lv_obj_add_flag(s_cont_edit, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(s_cont_edit, editor_touch_event_cb,
+                            LV_EVENT_ALL, (void *)(intptr_t)p);
+#endif
+
+        /* "draftling" text label shown when no file is open */
+        s_img_logo = lv_label_create(s_cont_edit);
+        lv_obj_set_width(s_img_logo, SCR_W);
+        lv_obj_set_style_text_font(s_img_logo, FONT_18, 0);
+        lv_obj_set_style_text_color(s_img_logo, lv_color_make(0x80, 0x80, 0x80), 0);
+        lv_obj_set_style_text_align(s_img_logo, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_text(s_img_logo, "draftling");
+        lv_obj_set_pos(s_img_logo, 0,
+                       (EDITOR_H - lv_font_get_line_height(FONT_18)) / 2);
+        lv_obj_add_flag(s_img_logo, LV_OBJ_FLAG_HIDDEN);
+
+        /* Cursor (thin vertical bar) */
+        s_cursor = lv_obj_create(s_cont_edit);
+        lv_obj_set_size(s_cursor, 2, LINE_H);
+        lv_obj_set_style_bg_color(s_cursor, theme_fg(), 0);
+        lv_obj_set_style_bg_opa(s_cursor, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(s_cursor, 0, 0);
+        lv_obj_set_style_radius(s_cursor, 0, 0);
+        lv_obj_set_style_pad_all(s_cursor, 0, 0);
+    }
+    pane_bind_focus();
+
+    /* Divider drawn between the two panes when split -- vertical in
+     * landscape, horizontal in portrait. layout_panes() sizes and
+     * positions it for the current orientation; these are just
+     * placeholder values. */
+    s_pane_divider = lv_obj_create(s_scr);
+    lv_obj_set_size(s_pane_divider, 1, EDITOR_H);
+    lv_obj_set_pos(s_pane_divider, SCR_W / 2, EDITOR_Y);
+    lv_obj_set_style_bg_color(s_pane_divider, theme_fg(), 0);
+    lv_obj_set_style_bg_opa(s_pane_divider, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_pane_divider, 0, 0);
+    lv_obj_set_style_radius(s_pane_divider, 0, 0);
+    lv_obj_set_style_pad_all(s_pane_divider, 0, 0);
+    lv_obj_add_flag(s_pane_divider, LV_OBJ_FLAG_HIDDEN);
+
+    /* Apply the current split geometry (positions/sizes both panes and
+     * the divider; hides pane 1 + the divider in single-pane mode). */
+    layout_panes();
+
+    /* Status bar */
+    lv_obj_t *sline = lv_obj_create(s_scr);
+    lv_obj_set_size(sline, SCR_W, 1);
+    lv_obj_set_pos(sline, 0, SCR_H - STATUS_H);
+    lv_obj_set_style_bg_color(sline, theme_fg(), 0);
+    lv_obj_set_style_bg_opa(sline, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(sline, 0, 0);
+    lv_obj_set_style_radius(sline, 0, 0);
+    lv_obj_set_style_pad_all(sline, 0, 0);
+
+    s_lbl_status = lv_label_create(s_scr);
+    lv_obj_set_pos(s_lbl_status, 2, SCR_H - STATUS_H + 2);
+    /* Width is constrained below (see status_avail_width()) so the
+     * label never reaches the battery / wifi icon on the right and
+     * never wraps to a second line (which would extend past SCR_H
+     * and trigger LVGL's screen scrollbar on narrow color LCDs). */
+    lv_label_set_long_mode(s_lbl_status, LV_LABEL_LONG_CLIP);
+    lv_obj_set_width(s_lbl_status, status_avail_width());
+    lv_obj_set_style_text_font(s_lbl_status, FONT_11, 0);
+    lv_obj_set_style_text_color(s_lbl_status, theme_fg(), 0);
+    lv_label_set_text(s_lbl_status, EDITOR_DEFAULT_STATUS);
+    update_status_visibility();
+
+#if defined(CONFIG_DRAFTLING_HAS_BATTERY)
+    /* Device battery label (right-aligned in editor status bar) */
+    s_lbl_dev_batt = lv_label_create(s_scr);
+    lv_obj_set_style_text_font(s_lbl_dev_batt, FONT_11, 0);
+    lv_obj_set_style_text_color(s_lbl_dev_batt, theme_fg(), 0);
+    lv_obj_set_style_text_align(s_lbl_dev_batt, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_pos(s_lbl_dev_batt, SCR_W - 80, SCR_H - STATUS_H + 2);
+    lv_obj_set_width(s_lbl_dev_batt, 78);
+    lv_label_set_text(s_lbl_dev_batt, "");
+#define WIFI_ICON_RIGHT_OFFSET 95   /* leave room for battery on its left */
+#else
+#define WIFI_ICON_RIGHT_OFFSET 15
+#endif
+
+    /* WiFi connectivity icon (right corner of editor status bar).
+     * Source image and vertical centering (which varies with icon
+     * height) are picked by update_wifi_icons(), called once both
+     * status bars exist; only the fixed horizontal position is set
+     * here. */
+    s_img_wifi = lv_image_create(s_scr);
+    lv_obj_set_x(s_img_wifi, SCR_W - WIFI_ICON_RIGHT_OFFSET);
+    lv_obj_add_flag(s_img_wifi, LV_OBJ_FLAG_HIDDEN);
+#undef WIFI_ICON_RIGHT_OFFSET
+
+    /* Cursor blink timer.
+     *
+     * On e-paper backends a 500 ms blink causes a full panel refresh
+     * twice per second, which is both visually distracting and bad
+     * for the panel. Keep the cursor solid (always visible) on EPD
+     * targets; only the reflective LCD blinks. */
+#if defined(CONFIG_DRAFTLING_DISPLAY_EPD)
+    s_cursor_visible = true;
+    if (s_cursor) lv_obj_remove_flag(s_cursor, LV_OBJ_FLAG_HIDDEN);
+#else
+    s_blink_timer = lv_timer_create(cursor_blink_cb, 500, NULL);
+#endif
+
+    /* ---- File browser screen ---- */
+    s_scr_browser = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(s_scr_browser, theme_bg(), 0);
+
+    lv_obj_t *br_title = lv_label_create(s_scr_browser);
+    lv_obj_set_pos(br_title, 2, 0);
+    lv_obj_set_style_text_font(br_title, FONT_11, 0);
+    lv_obj_set_style_text_color(br_title, theme_fg(), 0);
+    lv_label_set_text(br_title, "File Browser - Up/Down, Enter to open, N for new");
+
+    s_list_files = lv_list_create(s_scr_browser);
+    lv_obj_set_pos(s_list_files, 0, HEADER_H);
+    lv_obj_set_size(s_list_files, SCR_W, LIST_PANEL_H - STATUS_H);
+    lv_obj_set_style_border_width(s_list_files, 0, 0);
+    lv_obj_set_style_radius(s_list_files, 0, 0);
+    lv_obj_set_style_pad_all(s_list_files, 0, 0);
+    lv_obj_set_style_text_font(s_list_files, FONT_14, 0);
+    /* lv_list defaults to LVGL theme background (white). Force it to
+     * the editor theme background so the list panel matches the
+     * surrounding screen when CONFIG_DRAFTLING_EPD_BLACK_BACKGROUND
+     * is enabled (otherwise the list paints a white rectangle on top
+     * of the black screen and white-on-white text is invisible). */
+    lv_obj_set_style_bg_color(s_list_files, theme_bg(), 0);
+
+    /* The shared browser logic operates on s_browser_list; in the
+     * default (single-pane) case that is the full-screen list. */
+    s_browser_list = s_list_files;
+
+    /* In-pane file selector overlay (split mode). Parented to the main
+     * editor screen as siblings of the pane containers so they can be
+     * positioned over the focused pane and raised to the foreground;
+     * created hidden and positioned on demand by show_inpane_browser(). */
+    s_inpane_hdr = lv_label_create(s_scr);
+    lv_obj_set_style_text_font(s_inpane_hdr, FONT_11, 0);
+    lv_obj_set_style_text_color(s_inpane_hdr, theme_fg(), 0);
+    lv_obj_set_style_bg_color(s_inpane_hdr, theme_bg(), 0);
+    lv_obj_set_style_bg_opa(s_inpane_hdr, LV_OPA_COVER, 0);
+    lv_label_set_text(s_inpane_hdr, "Open into pane");
+    lv_obj_add_flag(s_inpane_hdr, LV_OBJ_FLAG_HIDDEN);
+
+    s_inpane_list = lv_list_create(s_scr);
+    lv_obj_set_style_border_width(s_inpane_list, 0, 0);
+    lv_obj_set_style_radius(s_inpane_list, 0, 0);
+    lv_obj_set_style_pad_all(s_inpane_list, 0, 0);
+    lv_obj_set_style_text_font(s_inpane_list, FONT_14, 0);
+    lv_obj_set_style_bg_color(s_inpane_list, theme_bg(), 0);
+    lv_obj_set_style_bg_opa(s_inpane_list, LV_OPA_COVER, 0);
+    lv_obj_add_flag(s_inpane_list, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_t *br_sline = lv_obj_create(s_scr_browser);
+    lv_obj_set_size(br_sline, SCR_W, 1);
+    lv_obj_set_pos(br_sline, 0, SCR_H - STATUS_H);
+    lv_obj_set_style_bg_color(br_sline, theme_fg(), 0);
+    lv_obj_set_style_bg_opa(br_sline, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(br_sline, 0, 0);
+    lv_obj_set_style_radius(br_sline, 0, 0);
+    lv_obj_set_style_pad_all(br_sline, 0, 0);
+
+    s_lbl_br_status = lv_label_create(s_scr_browser);
+    lv_obj_set_pos(s_lbl_br_status, 2, SCR_H - STATUS_H + 2);
+    lv_obj_set_width(s_lbl_br_status, SCR_W - 4);
+    lv_obj_set_style_text_font(s_lbl_br_status, FONT_11, 0);
+    lv_obj_set_style_text_color(s_lbl_br_status, theme_fg(), 0);
+    lv_label_set_text(s_lbl_br_status, "F1:Menu  N:New  F2:Rename");
+
+#if defined(CONFIG_DRAFTLING_HAS_BATTERY)
+    /* Device battery label (right-aligned in browser status bar) */
+    s_lbl_br_dev_batt = lv_label_create(s_scr_browser);
+    lv_obj_set_style_text_font(s_lbl_br_dev_batt, FONT_11, 0);
+    lv_obj_set_style_text_color(s_lbl_br_dev_batt, theme_fg(), 0);
+    lv_obj_set_style_text_align(s_lbl_br_dev_batt, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_pos(s_lbl_br_dev_batt, SCR_W - 80, SCR_H - STATUS_H + 2);
+    lv_obj_set_width(s_lbl_br_dev_batt, 78);
+    lv_label_set_text(s_lbl_br_dev_batt, "");
+
+#if !defined(DRAFTLING_BATT_PULL_MODE)
+    /* Battery poll timer. The first reading is painted at the end of
+     * build_screens(), once every battery label exists. The H752 has
+     * no periodic timer (see the declarations above); its updates
+     * ride redraw points. */
+    s_batt_timer = lv_timer_create(batt_timer_cb, BATT_POLL_MS, NULL);
+#endif
+#define WIFI_ICON_RIGHT_OFFSET 95
+#else
+#define WIFI_ICON_RIGHT_OFFSET 15
+#endif
+
+    /* WiFi connectivity icon (right corner of browser status bar).
+     * See the matching editor-screen icon above: update_wifi_icons()
+     * picks the source image and vertical position. */
+    s_img_br_wifi = lv_image_create(s_scr_browser);
+    lv_obj_set_x(s_img_br_wifi, SCR_W - WIFI_ICON_RIGHT_OFFSET);
+    lv_obj_add_flag(s_img_br_wifi, LV_OBJ_FLAG_HIDDEN);
+#undef WIFI_ICON_RIGHT_OFFSET
+
+    /* Reflect any pre-existing WiFi state (in case the manager
+     * fired its callback before the UI was ready). */
+    update_wifi_icons();
+
+    /* Register keyboard callback (BLE + USB feed the same handler;
+     * only one is wired at a time, chosen by main.cpp based on which
+     * keyboard was present at boot). */
+    ble_keyboard_set_callback((kb_event_callback_t)editor_ui_handle_key);
+#if defined(CONFIG_DRAFTLING_HAS_USB_HOST)
+    usb_kbd_set_callback((kb_event_callback_t)editor_ui_handle_key);
+#endif
+#if defined(CONFIG_DRAFTLING_HAS_TAB5_KBD)
+    /* Tab5 attachable keyboard feeds the same handler. It coexists
+     * with USB / BLE rather than replacing them: on the Tab5 the
+     * built-in keyboard and a USB keyboard are both accepted. */
+    tab5_kbd_set_callback((kb_event_callback_t)editor_ui_handle_key);
+#endif
+
+    /* ---- BLE connection prompt screen ---- */
+    s_scr_ble_prompt = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(s_scr_ble_prompt, theme_bg(), 0);
+    /* The default theme on lv_obj_create() puts a few pixels of
+     * padding and a SCROLLABLE flag on the screen. Both interfere
+     * with the absolutely-positioned children below: the padding
+     * shifts every lv_obj_set_pos() by ~12px (so the upper-right
+     * Off button drifts partly off the right edge of the screen
+     * and its visible portion no longer matches its hit area),
+     * and SCROLLABLE turns any small touch jitter into a scroll
+     * gesture that swallows the Off button's CLICKED event. Pin
+     * the screen to a 0-padding, non-scrollable surface so the
+     * children behave the same way they do on the editor /
+     * browser screens, where the same off-the-shelf positions
+     * have always worked. */
+    lv_obj_set_style_pad_all(s_scr_ble_prompt, 0, 0);
+    lv_obj_set_style_border_width(s_scr_ble_prompt, 0, 0);
+    lv_obj_set_scrollbar_mode(s_scr_ble_prompt, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_remove_flag(s_scr_ble_prompt, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* "draftling" title centered near the top */
+    {
+        lv_obj_t *title = lv_label_create(s_scr_ble_prompt);
+        lv_obj_set_width(title, SCR_W);
+        lv_obj_set_style_text_font(title, FONT_18, 0);
+        lv_obj_set_style_text_color(title, theme_fg(), 0);
+        lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_text(title, "draftling");
+        int fh = lv_font_get_line_height(FONT_18);
+        lv_obj_set_pos(title, 0, SCR_H / 4 - fh / 2);
+    }
+
+    /* Prompt label below center */
+    s_ble_prompt_lbl = lv_label_create(s_scr_ble_prompt);
+    lv_obj_set_width(s_ble_prompt_lbl, SCR_W - 20);
+    lv_obj_set_style_text_font(s_ble_prompt_lbl, FONT_14, 0);
+    lv_obj_set_style_text_color(s_ble_prompt_lbl, theme_fg(), 0);
+    lv_obj_set_style_text_align(s_ble_prompt_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_text(s_ble_prompt_lbl, "Initializing...");
+    lv_obj_set_pos(s_ble_prompt_lbl, 10, SCR_H / 2 + 10);
+
+    /* Bottom status-bar separator line (matches editor / browser
+     * screens), with a battery percentage label on the right when
+     * the board has a battery monitor. Lets the user see remaining
+     * charge while the firmware is still scanning for a BLE keyboard
+     * or after the keyboard has disconnected. */
+    {
+        lv_obj_t *ble_sline = lv_obj_create(s_scr_ble_prompt);
+        lv_obj_set_size(ble_sline, SCR_W, 1);
+        lv_obj_set_pos(ble_sline, 0, SCR_H - STATUS_H);
+        lv_obj_set_style_bg_color(ble_sline, theme_fg(), 0);
+        lv_obj_set_style_bg_opa(ble_sline, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(ble_sline, 0, 0);
+        lv_obj_set_style_radius(ble_sline, 0, 0);
+        lv_obj_set_style_pad_all(ble_sline, 0, 0);
+    }
+
+#if defined(CONFIG_DRAFTLING_HAS_BATTERY)
+    /* Device battery label (right-aligned in BLE prompt status bar).
+     * Painted with the first reading by battery_labels_repaint() at
+     * the end of build_screens(), then kept current by the battery
+     * poll timer. */
+    s_lbl_ble_dev_batt = lv_label_create(s_scr_ble_prompt);
+    lv_obj_set_style_text_font(s_lbl_ble_dev_batt, FONT_11, 0);
+    lv_obj_set_style_text_color(s_lbl_ble_dev_batt, theme_fg(), 0);
+    lv_obj_set_style_text_align(s_lbl_ble_dev_batt, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_pos(s_lbl_ble_dev_batt, SCR_W - 80, SCR_H - STATUS_H + 2);
+    lv_obj_set_width(s_lbl_ble_dev_batt, 78);
+    lv_label_set_text(s_lbl_ble_dev_batt, "");
+#endif
+
+#if defined(CONFIG_DRAFTLING_TOUCHSCREEN)
+    /* Power-off button in the upper-right corner. Tapping it sends
+     * the device into deep sleep immediately. Only useful on touch
+     * builds because there is no keyboard available yet on this
+     * screen (we are scanning for it). standby_enter_sleep() runs
+     * the registered pre-sleep callback (autosave + per-board
+     * peripheral teardown) before esp_deep_sleep_start(). */
+    /* Size both buttons from the FONT_11 metrics so the labels fit
+     * their frames on every font family. The Hack font used on HIDPI
+     * boards is roughly twice as wide/tall as Greybeard, so fixed
+     * pixel sizes designed for Greybeard clipped the "Forget KB"
+     * text out of its frame. */
+    const int ble_btn_cw = char_width_for_font(FONT_11);
+    const int ble_btn_lh = lv_font_get_line_height(FONT_11);
+    const int ble_btn_h  = ble_btn_lh + 6;
+    const int ble_off_w  = 3 * ble_btn_cw + 10;  /* "Off"       */
+    const int ble_fgt_w  = 9 * ble_btn_cw + 10;  /* "Forget KB" */
+    {
+        lv_obj_t *off_btn = lv_button_create(s_scr_ble_prompt);
+        lv_obj_set_size(off_btn, ble_off_w, ble_btn_h);
+        /* Anchor to the top-right corner with a small inset so the
+         * button stays fully on-screen and its hit area matches the
+         * pixels the user sees, independent of the parent screen's
+         * padding (which the default LVGL theme may bump non-zero
+         * on a future LVGL release). */
+        lv_obj_align(off_btn, LV_ALIGN_TOP_RIGHT, -4, 4);
+        lv_obj_set_style_bg_color(off_btn, theme_bg(), 0);
+        lv_obj_set_style_bg_opa(off_btn, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(off_btn, theme_fg(), 0);
+        lv_obj_set_style_border_width(off_btn, 1, 0);
+        lv_obj_set_style_border_opa(off_btn, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(off_btn, 4, 0);
+        lv_obj_set_style_pad_all(off_btn, 0, 0);
+        lv_obj_add_event_cb(off_btn, ble_prompt_off_btn_cb,
+                            LV_EVENT_CLICKED, NULL);
+
+        lv_obj_t *off_lbl = lv_label_create(off_btn);
+        lv_obj_set_style_text_font(off_lbl, FONT_11, 0);
+        lv_obj_set_style_text_color(off_lbl, theme_fg(), 0);
+        lv_label_set_text(off_lbl, "Off");
+        lv_obj_center(off_lbl);
+    }
+
+    /* "Forget KB" button to the left of the "Off" button. Clears all
+     * stored keyboard pairings and starts a fresh scan, allowing the
+     * user to pair a different keyboard without needing a physical
+     * keyboard to navigate the settings menu. */
+    {
+        lv_obj_t *fgt_btn = lv_button_create(s_scr_ble_prompt);
+        lv_obj_set_size(fgt_btn, ble_fgt_w, ble_btn_h);
+        /* Place to the left of the "Off" button: Off right edge is 4px
+         * from screen right; its left edge is (4 + ble_off_w) from
+         * right, plus a 4px gap, so the "Forget KB" button's right edge
+         * sits at (4 + ble_off_w + 4) from the right. */
+        lv_obj_align(fgt_btn, LV_ALIGN_TOP_RIGHT, -(ble_off_w + 8), 4);
+        lv_obj_set_style_bg_color(fgt_btn, theme_bg(), 0);
+        lv_obj_set_style_bg_opa(fgt_btn, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(fgt_btn, theme_fg(), 0);
+        lv_obj_set_style_border_width(fgt_btn, 1, 0);
+        lv_obj_set_style_border_opa(fgt_btn, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(fgt_btn, 4, 0);
+        lv_obj_set_style_pad_all(fgt_btn, 0, 0);
+        lv_obj_add_event_cb(fgt_btn, ble_prompt_forget_btn_cb,
+                            LV_EVENT_CLICKED, NULL);
+
+        lv_obj_t *fgt_lbl = lv_label_create(fgt_btn);
+        lv_obj_set_style_text_font(fgt_lbl, FONT_11, 0);
+        lv_obj_set_style_text_color(fgt_lbl, theme_fg(), 0);
+        lv_label_set_text(fgt_lbl, "Forget KB");
+        lv_obj_center(fgt_lbl);
+    }
+#endif
+
+    /* Register BLE status callbacks */
+    ble_keyboard_set_connect_callback(ble_connect_status_cb);
+    ble_keyboard_set_status_text_callback(ble_status_text_cb);
+#if defined(CONFIG_DRAFTLING_HAS_USB_HOST)
+    /* USB keyboard hot-plug shares the same connect-state plumbing
+     * so a USB hot-plug arriving after a BLE disconnect dismisses
+     * the "Keyboard disconnected / Reconnecting..." prompt screen
+     * and restores the editor or file browser. */
+    usb_kbd_set_connect_callback(ble_connect_status_cb);
+#endif
+
+    /* ---- Menu screen ---- */
+    s_scr_menu = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(s_scr_menu, theme_bg(), 0);
+
+    s_lbl_menu_hdr = lv_label_create(s_scr_menu);
+    lv_obj_set_pos(s_lbl_menu_hdr, 2, 0);
+    lv_obj_set_style_text_font(s_lbl_menu_hdr, FONT_11, 0);
+    lv_obj_set_style_text_color(s_lbl_menu_hdr, theme_fg(), 0);
+    lv_label_set_text(s_lbl_menu_hdr, MENU_HDR_TEXT);
+
+    s_menu_list = lv_list_create(s_scr_menu);
+    lv_obj_set_pos(s_menu_list, 0, HEADER_H);
+    lv_obj_set_size(s_menu_list, SCR_W, LIST_PANEL_H - STATUS_H);
+    lv_obj_set_style_border_width(s_menu_list, 0, 0);
+    lv_obj_set_style_radius(s_menu_list, 0, 0);
+    lv_obj_set_style_pad_all(s_menu_list, 0, 0);
+    lv_obj_set_style_text_font(s_menu_list, FONT_14, 0);
+    /* See note on s_list_files above: override the LVGL default white
+     * list background so the menu blends with the screen in
+     * CONFIG_DRAFTLING_EPD_BLACK_BACKGROUND mode. */
+    lv_obj_set_style_bg_color(s_menu_list, theme_bg(), 0);
+
+    /* Bottom row: firmware version, mirroring the file browser's
+     * bottom status label above. esp_app_get_description()->version
+     * is embedded in the app image from CMakeLists.txt's PROJECT_VER
+     * at build time. */
+    lv_obj_t *menu_version_lbl = lv_label_create(s_scr_menu);
+    lv_obj_set_pos(menu_version_lbl, 2, SCR_H - STATUS_H + 2);
+    lv_obj_set_width(menu_version_lbl, SCR_W - 4);
+    lv_obj_set_style_text_font(menu_version_lbl, FONT_11, 0);
+    lv_obj_set_style_text_color(menu_version_lbl, theme_fg(), 0);
+    {
+        char ver_buf[48];
+        snprintf(ver_buf, sizeof(ver_buf), "Draftling v%s",
+                 esp_app_get_description()->version);
+        lv_label_set_text(menu_version_lbl, ver_buf);
+    }
+
+    /* ---- Help screen (F10) ---- */
+    s_scr_help = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(s_scr_help, theme_bg(), 0);
+
+    s_lbl_help_hdr = lv_label_create(s_scr_help);
+    lv_obj_set_pos(s_lbl_help_hdr, 2, 0);
+    lv_obj_set_width(s_lbl_help_hdr, SCR_W - 4);
+    lv_label_set_long_mode(s_lbl_help_hdr, LV_LABEL_LONG_CLIP);
+    lv_obj_set_style_text_font(s_lbl_help_hdr, FONT_11, 0);
+    lv_obj_set_style_text_color(s_lbl_help_hdr, theme_fg(), 0);
+    lv_label_set_text(s_lbl_help_hdr,
+                      "Help - Up/Down/PgUp/PgDn to scroll, Esc or Enter to close");
+
+    s_help_cont = lv_obj_create(s_scr_help);
+    lv_obj_set_pos(s_help_cont, 0, HEADER_H);
+    lv_obj_set_size(s_help_cont, SCR_W, LIST_PANEL_H);
+    lv_obj_set_style_border_width(s_help_cont, 0, 0);
+    lv_obj_set_style_radius(s_help_cont, 0, 0);
+    lv_obj_set_style_pad_all(s_help_cont, 0, 0);
+    lv_obj_set_style_pad_left(s_help_cont, 4, 0);
+    lv_obj_set_style_pad_right(s_help_cont, 4, 0);
+    lv_obj_set_style_bg_color(s_help_cont, theme_bg(), 0);
+    lv_obj_set_scroll_dir(s_help_cont, LV_DIR_VER);
+#if defined(CONFIG_DRAFTLING_TOUCHSCREEN)
+    lv_obj_add_event_cb(s_help_cont, help_touch_cb, LV_EVENT_CLICKED, NULL);
+#endif
+
+    s_help_lbl = lv_label_create(s_help_cont);
+    lv_obj_set_width(s_help_lbl, LV_PCT(100));
+    lv_label_set_long_mode(s_help_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(s_help_lbl, FONT_14, 0);
+    lv_obj_set_style_text_color(s_help_lbl, theme_fg(), 0);
+
+    /* ---- WiFi password-entry overlay (shown on the menu screen) ----
+     * Structurally a copy of the save-as prompt below (header / value
+     * label / cursor bar), but parented to s_scr_menu since that is
+     * where the WiFi scan/connect flow lives, not the editor screen. */
+    {
+        int wpw_row_y   = overlay_row_y();
+        int wpw_line_h  = lv_font_get_line_height(FONT_11);
+        int wpw_panel_h = wpw_row_y + wpw_line_h + 2 * OVERLAY_PAD;
+        s_wifi_pw_panel = lv_obj_create(s_scr_menu);
+        lv_obj_set_size(s_wifi_pw_panel, SCR_W - 20, wpw_panel_h);
+        lv_obj_set_pos(s_wifi_pw_panel, 10, (SCR_H - wpw_panel_h) / 2);
+        lv_obj_set_style_bg_color(s_wifi_pw_panel, theme_bg(), 0);
+        lv_obj_set_style_bg_opa(s_wifi_pw_panel, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(s_wifi_pw_panel, theme_fg(), 0);
+        lv_obj_set_style_border_width(s_wifi_pw_panel, 2, 0);
+        lv_obj_set_style_radius(s_wifi_pw_panel, 4, 0);
+        lv_obj_set_style_pad_all(s_wifi_pw_panel, OVERLAY_PAD, 0);
+        lv_obj_remove_flag(s_wifi_pw_panel, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(s_wifi_pw_panel, LV_OBJ_FLAG_HIDDEN);
+
+        s_wifi_pw_hdr_lbl = lv_label_create(s_wifi_pw_panel);
+        lv_obj_set_style_text_font(s_wifi_pw_hdr_lbl, FONT_11, 0);
+        lv_obj_set_style_text_color(s_wifi_pw_hdr_lbl, theme_fg(), 0);
+        lv_label_set_long_mode(s_wifi_pw_hdr_lbl, LV_LABEL_LONG_CLIP);
+        lv_obj_set_width(s_wifi_pw_hdr_lbl, SCR_W - 20 - 12);
+        lv_label_set_text(s_wifi_pw_hdr_lbl, "Password (Enter/Esc):");
+        lv_obj_set_pos(s_wifi_pw_hdr_lbl, 0, 0);
+
+        s_wifi_pw_name_lbl = lv_label_create(s_wifi_pw_panel);
+        lv_obj_set_style_text_font(s_wifi_pw_name_lbl, FONT_11, 0);
+        lv_obj_set_style_text_color(s_wifi_pw_name_lbl, theme_fg(), 0);
+        lv_obj_set_width(s_wifi_pw_name_lbl, SCR_W - 20 - 12);
+        lv_label_set_text(s_wifi_pw_name_lbl, "");
+        lv_obj_set_pos(s_wifi_pw_name_lbl, 0, wpw_row_y);
+
+        s_wifi_pw_cur = lv_obj_create(s_wifi_pw_panel);
+        lv_obj_set_size(s_wifi_pw_cur, 2, wpw_line_h);
+        lv_obj_set_style_bg_color(s_wifi_pw_cur, theme_fg(), 0);
+        lv_obj_set_style_bg_opa(s_wifi_pw_cur, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(s_wifi_pw_cur, 0, 0);
+        lv_obj_set_style_radius(s_wifi_pw_cur, 0, 0);
+        lv_obj_set_style_pad_all(s_wifi_pw_cur, 0, 0);
+        lv_obj_add_flag(s_wifi_pw_cur, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    /* ---- Draftbox site / password overlay (menu screen) ----
+     * Same layout as the WiFi password overlay above. */
+    {
+        int dbx_row_y   = overlay_row_y();
+        int dbx_line_h  = lv_font_get_line_height(FONT_11);
+        int dbx_panel_h = dbx_row_y + dbx_line_h + 2 * OVERLAY_PAD;
+        s_dbx_panel = lv_obj_create(s_scr_menu);
+        lv_obj_set_size(s_dbx_panel, SCR_W - 20, dbx_panel_h);
+        lv_obj_set_pos(s_dbx_panel, 10, (SCR_H - dbx_panel_h) / 2);
+        lv_obj_set_style_bg_color(s_dbx_panel, theme_bg(), 0);
+        lv_obj_set_style_bg_opa(s_dbx_panel, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(s_dbx_panel, theme_fg(), 0);
+        lv_obj_set_style_border_width(s_dbx_panel, 2, 0);
+        lv_obj_set_style_radius(s_dbx_panel, 4, 0);
+        lv_obj_set_style_pad_all(s_dbx_panel, OVERLAY_PAD, 0);
+        lv_obj_remove_flag(s_dbx_panel, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(s_dbx_panel, LV_OBJ_FLAG_HIDDEN);
+
+        s_dbx_hdr_lbl = lv_label_create(s_dbx_panel);
+        lv_obj_set_style_text_font(s_dbx_hdr_lbl, FONT_11, 0);
+        lv_obj_set_style_text_color(s_dbx_hdr_lbl, theme_fg(), 0);
+        lv_label_set_long_mode(s_dbx_hdr_lbl, LV_LABEL_LONG_CLIP);
+        lv_obj_set_width(s_dbx_hdr_lbl, SCR_W - 20 - 12);
+        lv_label_set_text(s_dbx_hdr_lbl, "");
+        lv_obj_set_pos(s_dbx_hdr_lbl, 0, 0);
+
+        s_dbx_val_lbl = lv_label_create(s_dbx_panel);
+        lv_obj_set_style_text_font(s_dbx_val_lbl, FONT_11, 0);
+        lv_obj_set_style_text_color(s_dbx_val_lbl, theme_fg(), 0);
+        lv_obj_set_width(s_dbx_val_lbl, SCR_W - 20 - 12);
+        lv_label_set_text(s_dbx_val_lbl, "");
+        lv_obj_set_pos(s_dbx_val_lbl, 0, dbx_row_y);
+
+        s_dbx_cur = lv_obj_create(s_dbx_panel);
+        lv_obj_set_size(s_dbx_cur, 2, dbx_line_h);
+        lv_obj_set_style_bg_color(s_dbx_cur, theme_fg(), 0);
+        lv_obj_set_style_bg_opa(s_dbx_cur, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(s_dbx_cur, 0, 0);
+        lv_obj_set_style_radius(s_dbx_cur, 0, 0);
+        lv_obj_set_style_pad_all(s_dbx_cur, 0, 0);
+        lv_obj_add_flag(s_dbx_cur, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    /* ---- Settings screen ---- */
+    s_scr_settings = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(s_scr_settings, theme_bg(), 0);
+
+    lv_obj_t *set_hdr = lv_label_create(s_scr_settings);
+    lv_obj_set_pos(set_hdr, 2, 0);
+    lv_obj_set_style_text_font(set_hdr, FONT_11, 0);
+    lv_obj_set_style_text_color(set_hdr, theme_fg(), 0);
+    lv_label_set_text(set_hdr,
+                      "Settings - Up/Down, Arrows to change, Esc to go back");
+
+    s_settings_list = lv_list_create(s_scr_settings);
+    lv_obj_set_pos(s_settings_list, 0, HEADER_H);
+    lv_obj_set_size(s_settings_list, SCR_W, LIST_PANEL_H);
+    lv_obj_set_style_border_width(s_settings_list, 0, 0);
+    lv_obj_set_style_radius(s_settings_list, 0, 0);
+    lv_obj_set_style_pad_all(s_settings_list, 0, 0);
+    lv_obj_set_style_text_font(s_settings_list, FONT_14, 0);
+    /* See note on s_list_files above. */
+    lv_obj_set_style_bg_color(s_settings_list, theme_bg(), 0);
+
+    /* ---- Passkey overlay (moved onto the active screen when shown) ---- */
+    s_passkey_panel = lv_obj_create(s_scr);
+    lv_obj_set_size(s_passkey_panel, SCR_W - 20, LV_SIZE_CONTENT);
+    lv_obj_center(s_passkey_panel);
+    lv_obj_set_style_bg_color(s_passkey_panel, theme_bg(), 0);
+    lv_obj_set_style_bg_opa(s_passkey_panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(s_passkey_panel, theme_fg(), 0);
+    lv_obj_set_style_border_width(s_passkey_panel, 2, 0);
+    lv_obj_set_style_radius(s_passkey_panel, 4, 0);
+    lv_obj_set_style_pad_all(s_passkey_panel, 6, 0);
+    lv_obj_remove_flag(s_passkey_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_passkey_panel, LV_OBJ_FLAG_HIDDEN);
+
+    s_passkey_label = lv_label_create(s_passkey_panel);
+    lv_obj_set_style_text_font(s_passkey_label, FONT_16, 0);
+    lv_obj_set_style_text_color(s_passkey_label, theme_fg(), 0);
+    lv_obj_set_style_text_align(s_passkey_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(s_passkey_label, LV_PCT(100));
+    lv_label_set_text(s_passkey_label, "");
+
+    /* Register passkey display callback */
+    ble_keyboard_set_passkey_callback(passkey_display_cb);
+
+    /* ---- Save-prompt overlay (shown on the editor screen) ---- */
+    int save_row_y  = overlay_row_y();
+    int save_line_h = lv_font_get_line_height(FONT_11);
+    int save_panel_h = save_row_y + save_line_h + 2 * OVERLAY_PAD;
+    s_save_panel = lv_obj_create(s_scr);
+    lv_obj_set_size(s_save_panel, SCR_W - 20, save_panel_h);
+    lv_obj_set_pos(s_save_panel, 10, (SCR_H - save_panel_h) / 2);
+    lv_obj_set_style_bg_color(s_save_panel, theme_bg(), 0);
+    lv_obj_set_style_bg_opa(s_save_panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(s_save_panel, theme_fg(), 0);
+    lv_obj_set_style_border_width(s_save_panel, 2, 0);
+    lv_obj_set_style_radius(s_save_panel, 4, 0);
+    lv_obj_set_style_pad_all(s_save_panel, OVERLAY_PAD, 0);
+    lv_obj_remove_flag(s_save_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_save_panel, LV_OBJ_FLAG_HIDDEN);
+
+    s_save_hdr_lbl = lv_label_create(s_save_panel);
+    lv_obj_set_style_text_font(s_save_hdr_lbl, FONT_11, 0);
+    lv_obj_set_style_text_color(s_save_hdr_lbl, theme_fg(), 0);
+    lv_label_set_text(s_save_hdr_lbl, "Save as (Enter/Esc):");
+    lv_obj_set_pos(s_save_hdr_lbl, 0, 0);
+
+    s_save_name_lbl = lv_label_create(s_save_panel);
+    lv_obj_set_style_text_font(s_save_name_lbl, FONT_11, 0);
+    lv_obj_set_style_text_color(s_save_name_lbl, theme_fg(), 0);
+    lv_obj_set_width(s_save_name_lbl, SCR_W - 20 - 12);
+    lv_label_set_text(s_save_name_lbl, "");
+    lv_obj_set_pos(s_save_name_lbl, 0, save_row_y);
+
+    /* Thin cursor bar inside the save prompt name field. The name field
+     * is FONT_11, so the caret matches that line height (not the body
+     * font's LINE_H, which may differ from FONT_11). */
+    s_save_cur = lv_obj_create(s_save_panel);
+    lv_obj_set_size(s_save_cur, 2, save_line_h);
+    lv_obj_set_style_bg_color(s_save_cur, theme_fg(), 0);
+    lv_obj_set_style_bg_opa(s_save_cur, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_save_cur, 0, 0);
+    lv_obj_set_style_radius(s_save_cur, 0, 0);
+    lv_obj_set_style_pad_all(s_save_cur, 0, 0);
+    lv_obj_add_flag(s_save_cur, LV_OBJ_FLAG_HIDDEN);
+
+    /* ---- Exit (Esc) prompt overlay (shown on the editor screen) ----
+     * Header line plus three selectable option rows. */
+    {
+        int rows = EXIT_OPT_COUNT;
+        int exit_row_y = overlay_row_y();
+        int panel_h = exit_row_y + rows * (LINE_H + 2) + 2 * OVERLAY_PAD;
+        s_exit_panel = lv_obj_create(s_scr);
+        lv_obj_set_size(s_exit_panel, SCR_W - 20, panel_h);
+        lv_obj_set_pos(s_exit_panel, 10, (SCR_H - panel_h) / 2);
+        lv_obj_set_style_bg_color(s_exit_panel, theme_bg(), 0);
+        lv_obj_set_style_bg_opa(s_exit_panel, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(s_exit_panel, theme_fg(), 0);
+        lv_obj_set_style_border_width(s_exit_panel, 2, 0);
+        lv_obj_set_style_radius(s_exit_panel, 4, 0);
+        lv_obj_set_style_pad_all(s_exit_panel, 6, 0);
+        lv_obj_remove_flag(s_exit_panel, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(s_exit_panel, LV_OBJ_FLAG_HIDDEN);
+
+        s_exit_hdr_lbl = lv_label_create(s_exit_panel);
+        lv_obj_set_style_text_font(s_exit_hdr_lbl, FONT_11, 0);
+        lv_obj_set_style_text_color(s_exit_hdr_lbl, theme_fg(), 0);
+        lv_label_set_text(s_exit_hdr_lbl,
+                          "Unsaved changes (Up/Down + Enter):");
+        lv_obj_set_pos(s_exit_hdr_lbl, 0, 0);
+
+        for (int i = 0; i < EXIT_OPT_COUNT; i++) {
+            s_exit_opt_lbl[i] = lv_label_create(s_exit_panel);
+            lv_obj_set_style_text_font(s_exit_opt_lbl[i], FONT_11, 0);
+            lv_obj_set_style_text_color(s_exit_opt_lbl[i], theme_fg(), 0);
+            lv_obj_set_width(s_exit_opt_lbl[i], SCR_W - 20 - 12);
+            lv_obj_set_style_pad_hor(s_exit_opt_lbl[i], 2, 0);
+            lv_label_set_text(s_exit_opt_lbl[i], EXIT_OPT_LABELS[i]);
+            lv_obj_set_pos(s_exit_opt_lbl[i], 0, exit_row_y + i * (LINE_H + 2));
+#if defined(CONFIG_DRAFTLING_TOUCHSCREEN)
+            lv_obj_add_flag(s_exit_opt_lbl[i], LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(s_exit_opt_lbl[i], exit_opt_touch_cb,
+                                LV_EVENT_CLICKED, (void *)(intptr_t)i);
+#endif
+        }
+    }
+
+    /* ---- New-document format picker (moved onto the active screen
+     * when shown) ---- */
+    {
+        int row_y = overlay_row_y();
+        int panel_h = row_y + NEWFMT_COUNT * (LINE_H + 2) + 2 * OVERLAY_PAD;
+        s_newfmt_panel = lv_obj_create(s_scr);
+        lv_obj_set_size(s_newfmt_panel, SCR_W - 20, panel_h);
+        lv_obj_set_pos(s_newfmt_panel, 10, (SCR_H - panel_h) / 2);
+        lv_obj_set_style_bg_color(s_newfmt_panel, theme_bg(), 0);
+        lv_obj_set_style_bg_opa(s_newfmt_panel, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(s_newfmt_panel, theme_fg(), 0);
+        lv_obj_set_style_border_width(s_newfmt_panel, 2, 0);
+        lv_obj_set_style_radius(s_newfmt_panel, 4, 0);
+        lv_obj_set_style_pad_all(s_newfmt_panel, OVERLAY_PAD, 0);
+        lv_obj_remove_flag(s_newfmt_panel, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(s_newfmt_panel, LV_OBJ_FLAG_HIDDEN);
+
+        lv_obj_t *hdr = lv_label_create(s_newfmt_panel);
+        lv_obj_set_style_text_font(hdr, FONT_11, 0);
+        lv_obj_set_style_text_color(hdr, theme_fg(), 0);
+        lv_label_set_text(hdr, "New file format (Enter/Esc):");
+        lv_obj_set_pos(hdr, 0, 0);
+
+        for (int i = 0; i < NEWFMT_COUNT; i++) {
+            s_newfmt_opt_lbl[i] = lv_label_create(s_newfmt_panel);
+            lv_obj_set_style_text_font(s_newfmt_opt_lbl[i], FONT_11, 0);
+            lv_obj_set_style_text_color(s_newfmt_opt_lbl[i], theme_fg(), 0);
+            lv_obj_set_width(s_newfmt_opt_lbl[i], SCR_W - 20 - 12);
+            lv_obj_set_style_pad_hor(s_newfmt_opt_lbl[i], 2, 0);
+            lv_label_set_text(s_newfmt_opt_lbl[i], NEWFMT_LABELS[i]);
+            lv_obj_set_pos(s_newfmt_opt_lbl[i], 0, row_y + i * (LINE_H + 2));
+        }
+    }
+
+    /* ---- Message pop-up (moved onto the active screen when shown) ---- */
+    {
+        s_msg_panel = lv_obj_create(s_scr);
+        lv_obj_set_width(s_msg_panel, SCR_W - 20);
+        lv_obj_set_height(s_msg_panel, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(s_msg_panel, theme_bg(), 0);
+        lv_obj_set_style_bg_opa(s_msg_panel, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(s_msg_panel, theme_fg(), 0);
+        lv_obj_set_style_border_width(s_msg_panel, 2, 0);
+        lv_obj_set_style_radius(s_msg_panel, 4, 0);
+        lv_obj_set_style_pad_all(s_msg_panel, OVERLAY_PAD, 0);
+        lv_obj_set_style_pad_row(s_msg_panel, OVERLAY_PAD, 0);
+        lv_obj_set_flex_flow(s_msg_panel, LV_FLEX_FLOW_COLUMN);
+        lv_obj_remove_flag(s_msg_panel, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(s_msg_panel, LV_OBJ_FLAG_HIDDEN);
+#if defined(CONFIG_DRAFTLING_TOUCHSCREEN)
+        lv_obj_add_event_cb(s_msg_panel, msg_popup_touch_cb, LV_EVENT_CLICKED, NULL);
+#endif
+
+        s_msg_title_lbl = lv_label_create(s_msg_panel);
+        lv_obj_set_style_text_font(s_msg_title_lbl, FONT_14, 0);
+        lv_obj_set_style_text_color(s_msg_title_lbl, theme_fg(), 0);
+        lv_obj_set_width(s_msg_title_lbl, LV_PCT(100));
+        lv_label_set_text(s_msg_title_lbl, "");
+
+        s_msg_text_lbl = lv_label_create(s_msg_panel);
+        lv_obj_set_style_text_font(s_msg_text_lbl, FONT_14, 0);
+        lv_obj_set_style_text_color(s_msg_text_lbl, theme_fg(), 0);
+        lv_obj_set_width(s_msg_text_lbl, LV_PCT(100));
+        lv_label_set_long_mode(s_msg_text_lbl, LV_LABEL_LONG_WRAP);
+        lv_label_set_text(s_msg_text_lbl, "");
+
+        s_msg_hint_lbl = lv_label_create(s_msg_panel);
+        lv_obj_set_style_text_font(s_msg_hint_lbl, FONT_11, 0);
+        lv_obj_set_style_text_color(s_msg_hint_lbl, theme_fg(), 0);
+        lv_obj_set_width(s_msg_hint_lbl, LV_PCT(100));
+        lv_label_set_text(s_msg_hint_lbl, "Enter / Esc: close");
+    }
+
+    /* ---- Delete-file confirmation (moved onto the active screen when
+     * shown) ---- */
+    {
+        static const char *const labels[DELCONF_COUNT] = { "Delete", "Cancel" };
+        int row_y = overlay_row_y();
+        int panel_h = row_y + DELCONF_COUNT * (LINE_H + 2) + 2 * OVERLAY_PAD;
+        s_del_panel = lv_obj_create(s_scr);
+        lv_obj_set_size(s_del_panel, SCR_W - 20, panel_h);
+        lv_obj_set_pos(s_del_panel, 10, (SCR_H - panel_h) / 2);
+        lv_obj_set_style_bg_color(s_del_panel, theme_bg(), 0);
+        lv_obj_set_style_bg_opa(s_del_panel, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(s_del_panel, theme_fg(), 0);
+        lv_obj_set_style_border_width(s_del_panel, 2, 0);
+        lv_obj_set_style_radius(s_del_panel, 4, 0);
+        lv_obj_set_style_pad_all(s_del_panel, OVERLAY_PAD, 0);
+        lv_obj_remove_flag(s_del_panel, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(s_del_panel, LV_OBJ_FLAG_HIDDEN);
+
+        s_del_hdr_lbl = lv_label_create(s_del_panel);
+        lv_obj_set_style_text_font(s_del_hdr_lbl, FONT_11, 0);
+        lv_obj_set_style_text_color(s_del_hdr_lbl, theme_fg(), 0);
+        lv_obj_set_width(s_del_hdr_lbl, SCR_W - 20 - 12);
+        lv_label_set_long_mode(s_del_hdr_lbl, LV_LABEL_LONG_CLIP);
+        lv_label_set_text(s_del_hdr_lbl, "");
+        lv_obj_set_pos(s_del_hdr_lbl, 0, 0);
+
+        for (int i = 0; i < DELCONF_COUNT; i++) {
+            s_del_opt_lbl[i] = lv_label_create(s_del_panel);
+            lv_obj_set_style_text_font(s_del_opt_lbl[i], FONT_11, 0);
+            lv_obj_set_style_text_color(s_del_opt_lbl[i], theme_fg(), 0);
+            lv_obj_set_width(s_del_opt_lbl[i], SCR_W - 20 - 12);
+            lv_obj_set_style_pad_hor(s_del_opt_lbl[i], 2, 0);
+            lv_label_set_text(s_del_opt_lbl[i], labels[i]);
+            lv_obj_set_pos(s_del_opt_lbl[i], 0, row_y + i * (LINE_H + 2));
+        }
+    }
+
+    /* ---- Search / Replace overlay (shown on the editor screen) ---- */
+    int srch_find_y = search_find_row_y();
+    int srch_repl_y = search_repl_row_y();
+    int srch_help_y = srch_repl_y + overlay_row_pitch();
+    int srch_field_x = search_field_x();
+    int srch_line_h  = lv_font_get_line_height(FONT_11);
+    int srch_panel_h = srch_help_y + srch_line_h + 2 * OVERLAY_PAD;
+    s_search_panel = lv_obj_create(s_scr);
+    lv_obj_set_size(s_search_panel, SCR_W - 20, srch_panel_h);
+    lv_obj_set_pos(s_search_panel, 10, (SCR_H - srch_panel_h) / 2);
+    lv_obj_set_style_bg_color(s_search_panel, theme_bg(), 0);
+    lv_obj_set_style_bg_opa(s_search_panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(s_search_panel, theme_fg(), 0);
+    lv_obj_set_style_border_width(s_search_panel, 2, 0);
+    lv_obj_set_style_radius(s_search_panel, 4, 0);
+    lv_obj_set_style_pad_all(s_search_panel, OVERLAY_PAD, 0);
+    lv_obj_remove_flag(s_search_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_search_panel, LV_OBJ_FLAG_HIDDEN);
+
+    s_search_hdr_lbl = lv_label_create(s_search_panel);
+    lv_obj_set_style_text_font(s_search_hdr_lbl, FONT_11, 0);
+    lv_obj_set_style_text_color(s_search_hdr_lbl, theme_fg(), 0);
+    lv_label_set_text(s_search_hdr_lbl, "Find:");
+    lv_obj_set_pos(s_search_hdr_lbl, 0, 0);
+
+    /* Find row */
+    s_search_find_hdr = lv_label_create(s_search_panel);
+    lv_obj_set_style_text_font(s_search_find_hdr, FONT_11, 0);
+    lv_obj_set_style_text_color(s_search_find_hdr, theme_fg(), 0);
+    lv_label_set_text(s_search_find_hdr, "F:");
+    lv_obj_set_pos(s_search_find_hdr, 0, srch_find_y);
+
+    s_search_find_lbl = lv_label_create(s_search_panel);
+    lv_obj_set_style_text_font(s_search_find_lbl, FONT_11, 0);
+    lv_obj_set_style_text_color(s_search_find_lbl, theme_fg(), 0);
+    lv_obj_set_width(s_search_find_lbl, SCR_W - 20 - 12 - srch_field_x);
+    lv_label_set_text(s_search_find_lbl, "");
+    lv_obj_set_pos(s_search_find_lbl, srch_field_x, srch_find_y);
+
+    /* Replace row (only shown in replace mode) */
+    s_search_repl_hdr = lv_label_create(s_search_panel);
+    lv_obj_set_style_text_font(s_search_repl_hdr, FONT_11, 0);
+    lv_obj_set_style_text_color(s_search_repl_hdr, theme_fg(), 0);
+    lv_label_set_text(s_search_repl_hdr, "R:");
+    lv_obj_set_pos(s_search_repl_hdr, 0, srch_repl_y);
+    lv_obj_add_flag(s_search_repl_hdr, LV_OBJ_FLAG_HIDDEN);
+
+    s_search_repl_lbl = lv_label_create(s_search_panel);
+    lv_obj_set_style_text_font(s_search_repl_lbl, FONT_11, 0);
+    lv_obj_set_style_text_color(s_search_repl_lbl, theme_fg(), 0);
+    lv_obj_set_width(s_search_repl_lbl, SCR_W - 20 - 12 - srch_field_x);
+    lv_label_set_text(s_search_repl_lbl, "");
+    lv_obj_set_pos(s_search_repl_lbl, srch_field_x, srch_repl_y);
+    lv_obj_add_flag(s_search_repl_lbl, LV_OBJ_FLAG_HIDDEN);
+
+    /* Help line at the bottom of the panel */
+    s_search_help_lbl = lv_label_create(s_search_panel);
+    lv_obj_set_style_text_font(s_search_help_lbl, FONT_11, 0);
+    lv_obj_set_style_text_color(s_search_help_lbl, theme_fg(), 0);
+    lv_obj_set_width(s_search_help_lbl, SCR_W - 20 - 12);
+    lv_label_set_text(s_search_help_lbl, "Enter:Next  Esc:Close");
+    lv_obj_set_pos(s_search_help_lbl, 0, srch_help_y);
+
+    /* Cursor bar shared between the find / replace fields. The find /
+     * replace fields are FONT_11, so the caret matches that line
+     * height. The refresh function repositions it to whichever row
+     * owns focus. */
+    s_search_cur = lv_obj_create(s_search_panel);
+    lv_obj_set_size(s_search_cur, 2, srch_line_h);
+    lv_obj_set_style_bg_color(s_search_cur, theme_fg(), 0);
+    lv_obj_set_style_bg_opa(s_search_cur, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_search_cur, 0, 0);
+    lv_obj_set_style_radius(s_search_cur, 0, 0);
+    lv_obj_set_style_pad_all(s_search_cur, 0, 0);
+    lv_obj_add_flag(s_search_cur, LV_OBJ_FLAG_HIDDEN);
+
+    /* ---- Key repeat timer ---- */
+    s_repeat_timer = lv_timer_create(key_repeat_cb, KEY_REPEAT_RATE_MS, NULL);
+
+    /* Register WiFi and Git sync status callbacks */
+    wifi_manager_set_callback(wifi_state_cb);
+    git_sync_set_callback(git_sync_cb);
+
+    /* Every battery label exists now: show the current level on all of
+     * them, including the BLE prompt screen loaded below. */
+    battery_labels_repaint();
+
+    /* Start on BLE prompt screen (transitions to file browser on connect) */
+    lv_scr_load(s_scr_ble_prompt);
+}
+
+/* Tear down every screen, overlay and screen-bound timer that was
+ * created by build_screens() so the next build_screens() call can
+ * recreate them in a fresh theme. Runs on the LVGL task with the
+ * port lock held (caller is a key-event handler). Only used by the
+ * color-theme picker, which is gated on CONFIG_DRAFTLING_DISPLAY_COLOR. */
+#if defined(CONFIG_DRAFTLING_DISPLAY_COLOR)
+static void teardown_screens(void)
+{
+    /* Stop and forget the screen-bound timers first. */
+#if !defined(CONFIG_DRAFTLING_DISPLAY_EPD)
+    if (s_blink_timer)     { lv_timer_delete(s_blink_timer);     s_blink_timer     = NULL; }
+#endif
+#if defined(DRAFTLING_HAS_BATT_INDICATOR) && !defined(DRAFTLING_BATT_PULL_MODE)
+    if (s_batt_timer)      { lv_timer_delete(s_batt_timer);      s_batt_timer      = NULL; }
+#endif
+    if (s_repeat_timer)    { lv_timer_delete(s_repeat_timer);    s_repeat_timer    = NULL; }
+    if (s_status_clear_timer) {
+        lv_timer_delete(s_status_clear_timer);
+        s_status_clear_timer = NULL;
+    }
+
+    /* Delete every top-level screen we created. Children (status
+     * bars, line labels, the passkey / save / search overlays
+     * parented to s_scr, the wifi icons, etc.) are deleted
+     * automatically with their parent. */
+    if (s_scr_browser)    { lv_obj_delete(s_scr_browser);    s_scr_browser    = NULL; }
+    if (s_scr_menu)       { lv_obj_delete(s_scr_menu);       s_scr_menu       = NULL; }
+    if (s_scr_help)       { lv_obj_delete(s_scr_help);       s_scr_help       = NULL; }
+    if (s_scr_settings)   { lv_obj_delete(s_scr_settings);   s_scr_settings   = NULL; }
+    if (s_scr_ble_prompt) { lv_obj_delete(s_scr_ble_prompt); s_scr_ble_prompt = NULL; }
+    if (s_scr)            { lv_obj_delete(s_scr);            s_scr            = NULL; }
+
+    /* NULL every child-widget pointer so any stale reference
+     * crashes deterministically instead of touching freed memory.
+     * The per-pane widgets (container, cursor, logo, line label
+     * pool) are cleared for every pane. */
+    s_lbl_title = s_lbl_status = NULL;
+    s_img_wifi = s_img_br_wifi = NULL;
+    s_pane_divider = NULL;
+    {
+        pane_t *save_rp = s_rp;
+        for (int p = 0; p < EDITOR_MAX_PANES; p++) {
+            s_rp = &s_panes[p];
+            s_cont_edit = s_cursor = s_img_logo = NULL;
+            for (int i = 0; i < MAX_LINE_LABELS; i++) {
+                s_line_labels[i] = NULL;
+            }
+        }
+        s_rp = save_rp;
+    }
+    s_list_files = s_lbl_br_status = NULL;
+    s_inpane_list = s_inpane_hdr = NULL;
+    s_browser_list = NULL;
+    s_inpane_browser_open = false;
+#if defined(DRAFTLING_HAS_BATT_INDICATOR)
+    s_lbl_dev_batt = s_lbl_br_dev_batt = NULL;
+    s_lbl_ble_dev_batt = NULL;
+#endif
+    s_menu_list = s_lbl_menu_hdr = NULL;
+    s_lbl_help_hdr = s_help_cont = s_help_lbl = NULL;
+    s_settings_list = NULL;
+    s_ble_prompt_lbl = NULL;
+    s_passkey_panel = s_passkey_label = NULL;
+    s_save_panel = s_save_hdr_lbl = s_save_name_lbl = s_save_cur = NULL;
+    s_wifi_pw_panel = s_wifi_pw_hdr_lbl = s_wifi_pw_name_lbl = s_wifi_pw_cur = NULL;
+    s_dbx_panel = s_dbx_hdr_lbl = s_dbx_val_lbl = s_dbx_cur = NULL;
+    s_msg_panel = s_msg_title_lbl = s_msg_text_lbl = s_msg_hint_lbl = NULL;
+    s_exit_panel = s_exit_hdr_lbl = NULL;
+    s_exit_opt_lbl[0] = s_exit_opt_lbl[1] = s_exit_opt_lbl[2] = NULL;
+    s_newfmt_panel = NULL;
+    s_newfmt_opt_lbl[0] = s_newfmt_opt_lbl[1] = s_newfmt_opt_lbl[2] = NULL;
+    s_del_panel = s_del_hdr_lbl = NULL;
+    s_del_opt_lbl[0] = s_del_opt_lbl[1] = NULL;
+    s_search_panel = s_search_hdr_lbl = NULL;
+    s_search_find_hdr = s_search_find_lbl = NULL;
+    s_search_repl_hdr = s_search_repl_lbl = NULL;
+    s_search_cur = s_search_help_lbl = NULL;
+
+    /* Reset every "open" / transient flag so a fresh build starts
+     * from a clean state. The persistent document, NVS-backed font
+     * size / theme / backlight / standby timeout are NOT touched. */
+    s_menu_open               = false;
+    s_help_open               = false;
+    s_settings_open           = false;
+#if defined(CONFIG_DRAFTLING_DISPLAY_COLOR)
+    s_theme_picker_open       = false;
+#endif
+    s_layouts_picker_open     = false;
+    s_factory_reset_confirm   = false;
+    s_restart_needed         = false;
+    s_restart_confirm_open     = false;
+    s_save_open               = false;
+    s_wifi_scan_picker_open   = false;
+    s_wifi_scan_in_progress   = false;
+    s_wifi_pw_open            = false;
+    s_dbx_open                = false;
+    s_msg_open                = false;
+    s_msg_busy                = false;
+    s_exit_open               = false;
+    s_newfmt_open             = false;
+    s_del_open                = false;
+    s_search_open             = false;
+    s_search_replace_mode     = false;
+
+    /* The editor render cache references the deleted line labels;
+     * wipe every pane's cache so the next refresh re-creates fresh
+     * slots. */
+    invalidate_all_render_caches();
+}
+#endif /* CONFIG_DRAFTLING_DISPLAY_COLOR */
+
+/* Apply a freshly-selected color theme without rebooting. Recreates
+ * every LVGL screen and widget under the new palette and restores
+ * the screen the user was on. */
+#if defined(CONFIG_DRAFTLING_DISPLAY_COLOR)
+static void rebuild_screens_for_theme(void)
+{
+    /* Remember which screen the user is on so we can restore it. */
+    lv_obj_t *prev_active = lv_scr_act();
+    bool was_browser     = (prev_active == s_scr_browser);
+    bool was_menu        = (prev_active == s_scr_menu);
+    bool was_settings    = (prev_active == s_scr_settings);
+    bool was_ble_prompt  = (prev_active == s_scr_ble_prompt);
+    bool was_editor      = (prev_active == s_scr);
+    /* If lv_scr_act returned something we did not recognise (should
+     * not happen) fall back to the editor screen. */
+    if (!was_browser && !was_menu && !was_settings &&
+        !was_ble_prompt && !was_editor) {
+        was_editor = true;
+    }
+
+    teardown_screens();
+    init_styles();
+    build_screens();
+
+    /* Restore the previously-active screen and re-paint its content. */
+    if (was_browser) {
+        refresh_file_list();
+        lv_scr_load(s_scr_browser);
+    } else if (was_menu) {
+        show_menu();        /* refreshes items + loads s_scr_menu */
+    } else if (was_settings) {
+        show_settings();    /* refreshes items + loads s_scr_settings */
+    } else if (was_ble_prompt) {
+        lv_scr_load(s_scr_ble_prompt);
+    } else {
+        lv_scr_load(s_scr);
+        editor_ui_refresh();
+    }
+    update_title_bar();
+    update_wifi_icons();
+}
+#endif
+
+extern "C" void editor_ui_init(void)
+{
+    /* Chain optional font subsets (Cyrillic / Hebrew) into the base
+     * font's fallback slot before any text is rendered. High-density
+     * boards use the Hack family; all others use Greybeard. */
+#ifdef CONFIG_DRAFTLING_DISPLAY_HIDPI
+    hack_init();
+#else
+    greybeard_init();
+#endif
+
+    load_font_size_from_nvs();
+#if defined(CONFIG_DRAFTLING_DISPLAY_COLOR)
+    load_theme_from_nvs();
+#endif
+#if defined(CONFIG_DRAFTLING_DISPLAY_HAS_BACKLIGHT) && !defined(CONFIG_DRAFTLING_DISPLAY_BACKLIGHT_BINARY)
+    load_backlight_from_nvs();
+    display_set_backlight(s_backlight_pct);
+#endif
+    load_append_only_from_nvs();
+    load_active_layouts_from_nvs();
+    load_margins_from_nvs();
+    s_pending_portrait = display_orientation_get_pending_portrait();
+    s_pending_upside_down = display_flip_get_pending_upside_down();
+    init_styles();
+
+    /* Create key-event queue (must exist before BLE callback is set) */
+    s_key_queue = xQueueCreate(KEY_QUEUE_LEN, sizeof(kb_event_t));
+    assert(s_key_queue);
+
+    /* Editor init */
+    editor_init();
+
+    /* Bind the engine's primary document to pane 0 so the pane pool
+     * owns it from the start (split mode acquires a second document
+     * into pane 1 on demand). */
+    s_panes[0].doc = editor_get_active();
+
+    /* Key-event drain timer -- runs every 20 ms (50 Hz) to process
+     * queued keyboard events in a batch. This decouples BLE input
+     * from the LVGL render cycle so fast typing never drops keys.
+     * Created here (not in build_screens) so a theme rebuild does
+     * not destroy the timer that owns the rebuild's own call stack. */
+    s_key_drain_timer = lv_timer_create(key_drain_cb, KEY_DRAIN_PERIOD_MS, NULL);
+
+    build_screens();
+
+#if defined(CONFIG_DRAFTLING_DISPLAY_CAN_ROTATE)
+    /* Restore the persisted 180-degree display flip and apply it on
+     * top of the build-time base rotation now that the screens exist
+     * (the flip repaints the active screen in the new orientation). */
+    load_rotate180_from_nvs();
+    if (s_rotate180) {
+        draftling_lvgl_port_set_flip180(true);
+    }
+#endif
+
+#if defined(CONFIG_DRAFTLING_DISPLAY_CAN_INVERT)
+    /* Restore the persisted inverted-screen option and apply it now
+     * that the panel has been initialized (display_set_invert() sends
+     * a flush of the current framebuffer under the restored polarity). */
+    load_invert_from_nvs();
+    if (s_invert) {
+        display_set_invert(true);
+    }
+#endif
+
+    /* Restore the split layout persisted across reboot / deep sleep.
+     * The documents themselves are not auto-reopened (the boot flow
+     * shows the file browser), but the saved split mode is materialized
+     * so the editor screen comes up in the same layout the user left. */
+    load_split_from_nvs();
+    if (s_split_mode != SPLIT_NONE) {
+        split_mode_t m = s_split_mode;
+        s_split_mode = SPLIT_NONE;     /* force apply to run the enable path */
+        editor_ui_apply_split_mode(m);
+    }
+
+    ESP_LOGI(TAG, "Editor UI initialized");
+}

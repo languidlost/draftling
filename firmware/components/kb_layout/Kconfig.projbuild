@@ -1,0 +1,37 @@
+menu "DRAFTLING Keyboard Layouts"
+
+config KB_LAYOUT_ENABLE_US
+    bool "US-English (QWERTY)"
+    default y
+    help
+        Enable the US-English QWERTY keyboard layout.
+
+config KB_LAYOUT_ENABLE_UA
+    bool "Ukrainian (Cyrillic)"
+    default y
+    help
+        Enable the Ukrainian Cyrillic keyboard layout.
+
+config KB_LAYOUT_ENABLE_DE
+    bool "German (QWERTZ)"
+    default y
+    help
+        Enable the German QWERTZ keyboard layout with umlauts.
+
+config KB_LAYOUT_ENABLE_FR
+    bool "French (AZERTY)"
+    default y
+    help
+        Enable the French AZERTY keyboard layout with accents.
+
+config KB_LAYOUT_ENABLE_HE
+    bool "Hebrew (Israeli standard)"
+    default y
+    help
+        Enable the Hebrew (Israeli standard SI 1452) keyboard layout.
+        Enabling this option also pulls the Hebrew glyph range
+        (U+0590..U+05FF) of the Greybeard font into the firmware.
+        Hebrew typing is right-to-left; LVGL's bidirectional text
+        engine (LV_USE_BIDI) handles the visual reordering.
+
+endmenu

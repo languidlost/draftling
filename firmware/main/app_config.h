@@ -1,0 +1,134 @@
+#pragma once
+
+#include "sdkconfig.h"
+#include "display_margins.h"
+#include "display_orientation.h"
+#include "display_flip.h"
+
+/* Display dimensions (derived from Kconfig hardware model selection) */
+#define DISPLAY_WIDTH   CONFIG_DRAFTLING_DISPLAY_WIDTH
+#define DISPLAY_HEIGHT  CONFIG_DRAFTLING_DISPLAY_HEIGHT
+
+/* Build-time base rotation for the board's panel (0 for most boards,
+ * 90 for the natively-portrait Freenove panels, 270 for the Tab5). */
+#define DISPLAY_ROTATE  CONFIG_DRAFTLING_DISPLAY_ROTATE_ANGLE
+
+/* Effective rotation handed to the LVGL port. The user-selectable
+ * "Display orientation" setting (F1 -> Settings, restart to apply)
+ * adds DRAFTLING_DISPLAY_PORTRAIT_EXTRA_ROTATE degrees (90 by default,
+ * 270 on the Xteink X4 Pro whose enclosure reads better the other way)
+ * on top of the base rotation for portrait, turning a landscape board
+ * a quarter turn. The "Display upside down" setting (also F1 ->
+ * Settings, also restart to apply) then adds a further 180 degrees on
+ * top of that -- a plain half turn never changes which axis is which,
+ * so it composes with the portrait quarter turn in either order.
+ * display_orientation_init() and display_flip_init() must have both
+ * run (main.cpp calls them right after display_margins_init()) before
+ * this is evaluated. */
+#define DISPLAY_ROTATE_EFFECTIVE                                            \
+    (((display_orientation_is_portrait()                                    \
+        ? (DISPLAY_ROTATE + CONFIG_DRAFTLING_DISPLAY_PORTRAIT_EXTRA_ROTATE)  \
+        : DISPLAY_ROTATE)                                                   \
+      + (display_flip_is_upside_down() ? 180 : 0))                          \
+     % 360)
+
+/* The editor and LVGL canvas render 1:1 at the panel resolution,
+ * minus the user-adjustable margins (display_margins.h) -- pixels of
+ * physical panel hidden under an opaque bezel/enclosure cover on
+ * each edge. Zero by default on every board; adjustable via the
+ * editor's F1 -> Settings menu (Settings -> Screen margins) and
+ * takes effect on the next restart, since display_margins_init()
+ * must run before this is evaluated (see its caller in main.cpp).
+ * DISPLAY_LOGICAL_WIDTH / HEIGHT is the area actually visible through
+ * the enclosure. (High-density boards no longer upscale the
+ * framebuffer; they select a larger font instead -- see
+ * CONFIG_DRAFTLING_DISPLAY_HIDPI.) */
+#define DISPLAY_LOGICAL_WIDTH  (DISPLAY_WIDTH  - display_margin_left() - display_margin_right())
+#define DISPLAY_LOGICAL_HEIGHT (DISPLAY_HEIGHT - display_margin_top()  - display_margin_bottom())
+
+/* SD Card mount point (shared across all hardware models) */
+#define SD_MOUNT_POINT  "/sdcard"
+
+/* Per-board pin definitions and constants.  Each file defines
+ * BOARD_NAME and all GPIO / ADC macros for exactly one board. */
+#if defined(CONFIG_DRAFTLING_MODEL_WAVESHARE_RLCD42)
+#include "boards/waveshare_rlcd42.h"
+#elif defined(CONFIG_DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO)
+#include "boards/lilygo_t5_epd_s3_pro.h"
+#elif defined(CONFIG_DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO_H752)
+#include "boards/lilygo_t5_epd_s3_pro_h752.h"
+#elif defined(CONFIG_DRAFTLING_MODEL_M5STACK_PAPERS3)
+#include "boards/m5stack_papers3.h"
+#elif defined(CONFIG_DRAFTLING_MODEL_WAVESHARE_TOUCH_LCD_349)
+#include "boards/waveshare_touch_lcd_349.h"
+#elif defined(CONFIG_DRAFTLING_MODEL_JC3248W535)
+#include "boards/jc3248w535.h"
+#elif defined(CONFIG_DRAFTLING_MODEL_M5STACK_TAB5)
+#include "boards/m5stack_tab5.h"
+#elif defined(CONFIG_DRAFTLING_MODEL_SUNTON_8048S070)
+#include "boards/sunton_8048s070.h"
+#elif defined(CONFIG_DRAFTLING_MODEL_SUNTON_8048S043)
+#include "boards/sunton_8048s043.h"
+#elif defined(CONFIG_DRAFTLING_MODEL_WAVESHARE_TOUCH_LCD_7)
+#include "boards/waveshare_touch_lcd_7.h"
+#elif defined(CONFIG_DRAFTLING_MODEL_WAVESHARE_LCD_316)
+#include "boards/waveshare_lcd_316.h"
+#elif defined(CONFIG_DRAFTLING_MODEL_FREENOVE_FNK0104A)
+#include "boards/freenove_fnk0104a.h"
+#elif defined(CONFIG_DRAFTLING_MODEL_FREENOVE_FNK0104B)
+#include "boards/freenove_fnk0104b.h"
+#elif defined(CONFIG_DRAFTLING_MODEL_FREENOVE_FNK0104S)
+#include "boards/freenove_fnk0104s.h"
+#elif defined(CONFIG_DRAFTLING_MODEL_FREENOVE_FNK0104N)
+#include "boards/freenove_fnk0104n.h"
+#elif defined(CONFIG_DRAFTLING_MODEL_MICROJOURNAL_REV5)
+#include "boards/microjournal_rev5.h"
+#elif defined(CONFIG_DRAFTLING_MODEL_VIEWE_UEDX24320028_UEED035HV)
+#include "boards/viewe_uedx24320028_ueed035hv.h"
+#elif defined(CONFIG_DRAFTLING_MODEL_XTEINK_X4_PRO)
+#include "boards/xteink_x4_pro.h"
+#elif defined(CONFIG_DRAFTLING_MODEL_XTEINK_X4_CLASSIC)
+#include "boards/xteink_x4_classic.h"
+#elif defined(CONFIG_DRAFTLING_MODEL_ELECROW_CROWPANEL_579)
+#include "boards/elecrow_crowpanel_579.h"
+#elif defined(CONFIG_DRAFTLING_MODEL_WAVESHARE_EPAPER_397)
+#include "boards/waveshare_epaper_397.h"
+#elif defined(CONFIG_DRAFTLING_MODEL_SEEED_RETERMINAL_E1001)
+#include "boards/seeed_reterminal_e1001.h"
+#elif defined(CONFIG_DRAFTLING_MODEL_SEEED_RETERMINAL_STICKY)
+#include "boards/seeed_reterminal_sticky.h"
+#elif defined(CONFIG_DRAFTLING_MODEL_M5STACK_PAPERMONO)
+#include "boards/m5stack_papermono.h"
+#else
+#error "No hardware model selected. Run idf.py menuconfig and choose a model."
+#endif
+
+/* Default: no deep-sleep-only BL cut pin. Boards whose BL cannot
+ * be cut via the normal LCD_BL_PIN path (because the BL boost
+ * circuit does not tolerate the ESP32 driving the BL enable pin
+ * during normal operation) may override this to drive a separate
+ * pin LOW only at deep-sleep entry. No current board uses this
+ * fallback; kept available for future boards that need it. */
+#ifndef LCD_BL_DEEP_SLEEP_CUT_PIN
+#define LCD_BL_DEEP_SLEEP_CUT_PIN   -1
+#endif
+
+/* Default: BL pin is active HIGH (LEDC duty MAX = full brightness,
+ * duty 0 = off). Boards whose BL boost circuit is active LOW
+ * (LEDC duty 0 = full brightness, duty MAX = off) override this
+ * to 1 -- see the boards/waveshare_touch_lcd_349.h for the
+ * Waveshare ESP32-S3-Touch-LCD-3.49. */
+#ifndef LCD_BL_ACTIVE_LOW
+#define LCD_BL_ACTIVE_LOW   0
+#endif
+
+/* Default: SD card SPI host is SPI3. Boards whose SD SPI pins happen
+ * to be the ESP32-S3's native SPI2 IOMUX pins (SPI2_IOMUX_PIN_NUM_*
+ * = GPIO9/10/11/12/13/14) and don't need SPI2 for anything else may
+ * override this to SPI2_HOST to route through the fast/direct IOMUX
+ * path instead of the GPIO matrix (SPI3 has no IOMUX pins on the
+ * ESP32-S3 -- every SPI3 pin assignment goes through the matrix). See
+ * boards/waveshare_touch_lcd_7.h. */
+#ifndef SD_SPI_HOST_NUM
+#define SD_SPI_HOST_NUM SPI3_HOST
+#endif

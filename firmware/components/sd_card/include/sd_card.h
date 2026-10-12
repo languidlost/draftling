@@ -1,0 +1,78 @@
+#pragma once
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <esp_err.h>
+#include <stddef.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <sdmmc_cmd.h>
+
+/* Initialize the SD card on a 1-bit SDMMC slot. */
+esp_err_t sd_card_init(int clk_pin, int cmd_pin, int d0_pin, const char *mount_point);
+
+/*
+ * Initialize the SD card on an SPI bus.
+ *
+ *   spi_host  -- ESP-IDF SPI host id (e.g. SPI2_HOST). The bus may be
+ *                shared with other devices; if it has not been initialized
+ *                yet, this function will initialize it for you.
+ *   miso/mosi/sck -- bus pins (set sck/mosi to -1 if the bus is already
+ *                    initialized by another driver, e.g. the e-paper).
+ *   cs        -- chip-select GPIO for the SD card.
+ *   enable_gpio -- optional power-enable GPIO (driven HIGH), or -1.
+ *   mount_point -- VFS mount point, e.g. "/sdcard".
+ */
+esp_err_t sd_card_init_spi(int spi_host, int miso, int mosi, int sck,
+                           int cs, int enable_gpio, const char *mount_point);
+esp_err_t sd_card_deinit(void);
+bool sd_card_is_ready(void);
+const char *sd_card_get_mount_point(void);
+
+/* The sdmmc_card_t handle behind the currently mounted card, or NULL
+ * if none is mounted. Used by the usb_msc component to expose the
+ * same card's raw sectors to a USB host (tinyusb_msc_new_storage_sdmmc()
+ * reads/writes sectors directly against this handle -- it never goes
+ * through the FatFs mount sd_card.cpp keeps registered at
+ * sd_card_get_mount_point(), so local firmware code must simply stay
+ * off the card, rather than unmount it, while USB MSC owns it. */
+sdmmc_card_t *sd_card_get_handle(void);
+
+/* Size and free space of the mounted FAT file system, in bytes.
+ * Returns ESP_ERR_INVALID_STATE when no card is mounted. */
+esp_err_t sd_card_get_fs_space(uint64_t *total_bytes, uint64_t *free_bytes);
+
+/* Erase the mounted card by creating a fresh FAT file system on it
+ * (every file and directory is lost), then mount it again at the same
+ * mount point. Blocking: can take several seconds on a large card.
+ * Nothing else may touch the card while this runs. Returns
+ * ESP_ERR_INVALID_STATE when no card is mounted; after any other
+ * failure the card may be left unmounted (sd_card_is_ready() false). */
+esp_err_t sd_card_format(void);
+
+/* Read entire file; caller must free(*out_buf) */
+esp_err_t sd_card_read_file(const char *path, char **out_buf, size_t *out_len);
+/* Overwrite a file atomically: the bytes are written to a temporary
+ * file and flushed to the card, then renamed over `path`. A crash or
+ * power loss mid-write leaves the previous contents of `path` intact. */
+esp_err_t sd_card_write_file(const char *path, const char *data, size_t len);
+esp_err_t sd_card_append_file(const char *path, const char *data, size_t len);
+bool sd_card_file_exists(const char *path);
+esp_err_t sd_card_delete_file(const char *path);
+esp_err_t sd_card_mkdir(const char *path);
+
+typedef struct {
+    char name[256];
+    bool is_dir;
+    size_t size;
+} sd_card_file_entry_t;
+
+int sd_card_list_dir(const char *path, sd_card_file_entry_t *entries, int max_entries);
+long sd_card_file_size(const char *path);
+esp_err_t sd_card_rename(const char *old_path, const char *new_path);
+
+#ifdef __cplusplus
+}
+#endif

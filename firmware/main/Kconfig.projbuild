@@ -1,0 +1,1729 @@
+menu "DRAFTLING Configuration"
+
+choice DRAFTLING_HARDWARE_MODEL
+    prompt "Hardware Model"
+    default DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO
+    help
+        Select the target hardware platform for Draftling.
+
+config DRAFTLING_MODEL_WAVESHARE_RLCD42
+    bool "Waveshare ESP32-S3-RLCD-4.2"
+    depends on IDF_TARGET_ESP32S3
+    help
+        Waveshare ESP32-S3-RLCD-4.2 board with 400x300 reflective LCD
+        and GPIO18 deep-sleep wakeup button.
+
+config DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO
+    bool "LilyGO T5 E-Paper S3 Pro / Pro Lite"
+    depends on IDF_TARGET_ESP32S3
+    help
+        LilyGO T5 E-Paper S3 Pro (H752-01) board with a 4.7" 540x960
+        ED047TC1 e-paper panel driven by the ESP32-S3 LCD/I80 parallel
+        peripheral via the vroland/epdiy library (epd_board_v7
+        configuration, TPS65185 + PCA9535 power management). Has a
+        GT911 capacitive touch controller, BQ27220 fuel gauge,
+        PCF8563 RTC, on-board MicroSD slot (SPI shared with the SX1262
+        LoRa radio when present), and a BOOT button on GPIO 0 as the
+        deep-sleep wake source.
+
+        Also covers the "Pro Lite" SKU, which is the same H752-01
+        board with the SX1262 LoRa radio and the MIA-M10Q GPS
+        receiver depopulated. Draftling does not touch either part,
+        so a single firmware image runs on both variants.
+
+config DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO_H752
+    bool "LilyGO T5 E-Paper S3 Pro original H752"
+    depends on IDF_TARGET_ESP32S3
+    help
+        Original LilyGO T5 E-Paper S3 Pro H752 / v1.0-240810 board
+        with the 4.7" 960x540 ED047TC1 panel. This older revision is
+        not pin-compatible with the H752-01 board: it uses SDA=6,
+        SCL=5, SD SPI on 18/8/17 with CS=16, GT911 INT=15/RST=41,
+        GPIO48 as the user key, GPIO40 as the front-light enable, and
+        the older LilyGO EPD47 shift-register display driver path
+        instead of epdiy's epd_board_v7 PCA9535/TPS65185 path.
+
+config DRAFTLING_MODEL_M5STACK_PAPERS3
+    bool "M5Stack PaperS3"
+    depends on IDF_TARGET_ESP32S3
+    help
+        M5Stack PaperS3 board with a 540x960 e-paper panel (ED047TC1
+        family) driven by the ESP32-S3 LCD/I80 parallel peripheral.
+        v1 uses a 1-bit black/white waveform with full-screen refresh
+        only; partial refresh and grayscale are TODO.
+
+config DRAFTLING_MODEL_WAVESHARE_TOUCH_LCD_349
+    bool "Waveshare ESP32-S3-Touch-LCD-3.49 (AXS15231B, 3.49\" color LCD, 640x172)"
+    depends on IDF_TARGET_ESP32S3
+    help
+        Waveshare ESP32-S3-Touch-LCD-3.49 development board: 3.49"
+        IPS color LCD, 640x172, AXS15231B controller over QSPI.
+        Touch input is not used (Draftling is keyboard-driven).
+
+config DRAFTLING_MODEL_M5STACK_TAB5
+    bool "M5Stack Tab5 (ESP32-P4, ILI9881C, 5\" color MIPI-DSI LCD, 1280x720)"
+    depends on IDF_TARGET_ESP32P4
+    help
+        M5Stack Tab5 tablet (ESP32-P4): 5" IPS color LCD, 1280x720,
+        ILI9881C controller over MIPI-DSI (2 lanes). On-board GT911
+        capacitive touchscreen on I2C. Powered by a 3.7 V Li-ion
+        battery with USB-C charging; integrated PMIC, IMU, microphone
+        array, speaker, and MicroSD slot. The ESP32-P4 also exposes a
+        USB-HS host port and an ESP32-C6 co-processor for Wi-Fi /
+        Bluetooth. See https://docs.m5stack.com/en/core/Tab5.
+
+config DRAFTLING_MODEL_JC3248W535
+    bool "Guition JC3248W535 (ESP32-S3, AXS15231B, 3.5\" color LCD, 480x320)"
+    depends on IDF_TARGET_ESP32S3
+    help
+        Guition JC3248W535 development board: 3.5" IPS color LCD,
+        480x320, AXS15231B controller over QSPI. Has an on-board
+        AXS5106L capacitive touchscreen which Draftling uses as a
+        secondary input (cursor, scroll, double-tap selection in
+        the editor; tap-to-select in menus). This board has no
+        user buttons besides the power switch; deep sleep is woken
+        by the touchscreen.
+
+config DRAFTLING_MODEL_SUNTON_8048S070
+    bool "Sunton ESP32-8048S070C (ESP32-S3, 7\" RGB color LCD, 800x480)"
+    depends on IDF_TARGET_ESP32S3
+    help
+        Sunton ESP32-8048S070C development board: 7" TN color LCD,
+        800x480, 16-bit parallel RGB565 interface driven by the
+        ESP32-S3 LCD RGB peripheral (esp_lcd_new_rgb_panel). Has an
+        on-board GT911 capacitive touchscreen on I2C and a MicroSD
+        slot on SPI. Backlight on GPIO2. Keyboard-driven (USB / BLE)
+        like every other Draftling board.
+
+config DRAFTLING_MODEL_SUNTON_8048S043
+    bool "Sunton ESP32-8048S043C (ESP32-S3, 4.3\" RGB color LCD, 800x480)"
+    depends on IDF_TARGET_ESP32S3
+    help
+        Sunton ESP32-8048S043C development board: 4.3" IPS color LCD,
+        800x480, ST7262 panel on a 16-bit parallel RGB565 interface
+        driven by the ESP32-S3 LCD RGB peripheral
+        (esp_lcd_new_rgb_panel). Shares the 800x480 resolution and the
+        same display backend as the 7" ESP32-8048S070C, but uses a
+        different control-pin map (VSYNC/DE swapped), different panel
+        timings (12.5 MHz, pclk_active_neg), and a different data-line
+        order (R,G,B vs the 7" panel's B,G,R). Has an on-board GT911
+        capacitive touchscreen on I2C and a MicroSD slot on SPI.
+        Backlight on GPIO2. Keyboard-driven (USB / BLE) like every
+        other Draftling board.
+
+config DRAFTLING_MODEL_WAVESHARE_TOUCH_LCD_7
+    bool "Waveshare ESP32-S3-Touch-LCD-7 (ESP32-S3, 7\" RGB color LCD, 800x480, CH422G expander)"
+    depends on IDF_TARGET_ESP32S3
+    help
+        Waveshare ESP32-S3-Touch-LCD-7 development board: 7" IPS color
+        LCD, 800x480, ST7262 panel on a 16-bit parallel RGB565
+        interface driven by the ESP32-S3 LCD RGB peripheral
+        (esp_lcd_new_rgb_panel), same display backend as the Sunton
+        ESP32-8048S0xx family. Unlike the Sunton boards, the LCD
+        reset, backlight enable, touch reset and SD card chip-select
+        lines are not wired to direct GPIOs but sit behind an
+        on-board CH422G I2C IO-expander shared with the GT911
+        capacitive touchscreen's I2C bus. 16 MB flash, 8 MB PSRAM
+        (ESP32-S3N16R8 module).
+
+config DRAFTLING_MODEL_WAVESHARE_LCD_316
+    bool "Waveshare ESP32-S3-LCD-3.16 (ESP32-S3, 3.16\" RGB color LCD, 320x820, no touch)"
+    depends on IDF_TARGET_ESP32S3
+    help
+        Waveshare ESP32-S3-LCD-3.16 development board: 3.16" IPS color
+        LCD, 320x820 native portrait, ST7701 controller on a 16-bit
+        parallel RGB565 interface driven by the ESP32-S3 LCD RGB
+        peripheral, rendered landscape at 820x320. The ST7701 is set up
+        once at boot over a 3-wire SPI bus that shares its pins with
+        the BOOT button and the MicroSD slot (SDMMC 1-bit). PWM
+        backlight (active low) on GPIO6, LiPo cell monitored through a
+        1:2 divider on GPIO4. No touch. The BOOT button (GPIO0) is the
+        deep-sleep wakeup source. ESP32-S3R8: 16 MB flash, 8 MB PSRAM.
+        Tested on physical hardware.
+        See https://www.waveshare.com/wiki/ESP32-S3-LCD-3.16
+
+config DRAFTLING_MODEL_FREENOVE_FNK0104A
+    bool "Freenove FNK0104A (ESP32-S3, ILI9341, 2.8\" color LCD, 320x240, no touch)"
+    depends on IDF_TARGET_ESP32S3
+    help
+        Freenove FNK0104A development board: 2.8" ILI9341 color LCD,
+        240x320 native panel rendered landscape at 320x240, driven
+        over a standard SPI interface. No touch controller. Has an
+        on-board MicroSD slot (SDMMC 1-bit) and a battery ADC input.
+        The BOOT button (GPIO0) is the deep-sleep wakeup source.
+        See https://github.com/Freenove/Freenove_ESP32_S3_Display
+
+config DRAFTLING_MODEL_MICROJOURNAL_REV5
+    bool "MicroJournal Rev 5 (ESP32-S3, ILI9341, 320x240, USB host)"
+    depends on IDF_TARGET_ESP32S3
+    help
+        MicroJournal Rev 5 writerdeck with an ILI9341 SPI color LCD and
+        an on-board SPI MicroSD reader sharing the display bus. Uses an
+        ESP32-S3 N16R8 module. Display and peripheral pins are defined
+        in main/boards/microjournal_rev5.h.
+
+config DRAFTLING_MODEL_FREENOVE_FNK0104B
+    bool "Freenove FNK0104B (ESP32-S3, ILI9341, 2.8\" color LCD, 320x240, touch)"
+    depends on IDF_TARGET_ESP32S3
+    help
+        Same 2.8" ILI9341 panel and SPI wiring as the FNK0104A, plus
+        an on-board FT6336U I2C capacitive touch controller.
+        See https://github.com/Freenove/Freenove_ESP32_S3_Display
+
+config DRAFTLING_MODEL_FREENOVE_FNK0104S
+    bool "Freenove FNK0104S (ESP32-S3, ST7796, 4.0\" color LCD, 480x320, touch)"
+    depends on IDF_TARGET_ESP32S3
+    help
+        Freenove FNK0104S development board: 4.0" ST7796 color LCD,
+        320x480 native panel rendered landscape at 480x320, driven
+        over a standard SPI interface. Has an on-board FT6336U I2C
+        capacitive touch controller, a MicroSD slot (SDMMC 1-bit)
+        and a battery ADC input. The BOOT button (GPIO0) is the
+        deep-sleep wakeup source.
+        See https://github.com/Freenove/Freenove_ESP32_S3_Display
+
+config DRAFTLING_MODEL_FREENOVE_FNK0104N
+    bool "Freenove FNK0104N (ESP32-S3, ST77922, 3.5\" color LCD, 480x320, touch)"
+    depends on IDF_TARGET_ESP32S3
+    help
+        Freenove FNK0104N development board: 3.5" IPS color LCD with a
+        Sitronix ST77922 TDDI controller (display and touch in one
+        chip), 320x480 native panel rendered landscape at 480x320,
+        driven over a 4-lane QSPI bus, with the ST77922's built-in
+        capacitive touch on I2C. MicroSD slot (SDMMC 1-bit),
+        battery ADC input, PWM backlight. The BOOT button (GPIO0) is
+        the deep-sleep wakeup source. Tested on physical hardware.
+        See https://github.com/Freenove/Freenove_ESP32_S3_Display
+
+config DRAFTLING_MODEL_VIEWE_UEDX24320028_UEED035HV
+    bool "Viewe UEDX24320028E-WB-A board + UEED035HV-RX40-L001 3.5\" transflective display (ESP32-S3, ST7365, 480x320, touch)"
+    depends on IDF_TARGET_ESP32S3
+    help
+        VIEWE UEDX24320028E-WB-A ESP32-S3 board with the VIEWE
+        UEED035HV-RX40-L001 display attached in place of its stock 2.8"
+        panel: 3.5" 320x480 sunlight-readable transflective color LCD
+        (readable with the backlight off), ST7365 controller
+        (ST7796-compatible), rendered landscape at 480x320 over 4-wire
+        SPI. Both interface-mode straps are driven HIGH and display
+        inversion is on, as in Viewe's UEDX32480035E-WB-A
+        configuration. Capacitive touch at I2C 0x2E (CHSC6540-
+        compatible, FocalTech register map), MicroSD on SDMMC 1-bit,
+        PWM backlight through the board's LP3310 boost driver. No
+        battery. The BOOT button (GPIO0) is the deep-sleep wakeup
+        source. The board with its stock 2.8" GC9307 panel is not
+        supported by this option. Tested on physical hardware.
+        Board: https://github.com/VIEWESMART/UEDX24320028ESP32-2.8inch-Touch-Display
+        Display: https://viewedisplay.com/product/3-5-inch-320x480-sunlight-readable-transflective-with-super-low-power-tft-lcd-module/
+
+config DRAFTLING_MODEL_XTEINK_X4_PRO
+    bool "Xteink X4 Pro (ESP32-S3, SSD1677/UC8179/UC8279, 4.26\" e-paper, 800x480)"
+    depends on IDF_TARGET_ESP32S3
+    help
+        Xteink X4 Pro e-reader: 4.26" 800x480 e-paper panel driven
+        over plain SPI. Different manufacturing runs ship one of
+        three panel controllers (SSD1677, or one of two UltraChip
+        parts, UC8179 / UC8279); the display backend
+        (components/display/display_xteink_epd.cpp) probes the
+        controller at boot and drives whichever one is present, so a
+        single firmware image works on any run. GT911 capacitive
+        touch and a CW2017 I2C fuel gauge share one I2C bus. Dual-
+        channel (cool/warm) PWM front-light. Three buttons: Left and
+        Right scroll the editor a screen at a time (Page Up / Page
+        Down), Power is the deep-sleep wake / BLE-forget button.
+        On-board MicroSD on SDMMC 1-bit.
+
+        This board has been tested on physical hardware (see
+        HARDWARE.md). The register sequences and timing are ported
+        from the FreeInk SDK (github.com/Free-Ink/freeink-sdk, MIT
+        licensed), which reverse-engineered the OEM firmware and
+        validated the paths used here on real units. Grayscale /
+        anti-aliasing rendering is not implemented (matches the
+        existing e-paper boards).
+
+config DRAFTLING_MODEL_XTEINK_X4_CLASSIC
+    bool "Xteink X4 Classic / X4 v2 (ESP32-S3, SSD1677/UC8179/UC8279, 4.26\" e-paper, 800x480, no touch)"
+    depends on IDF_TARGET_ESP32S3
+    help
+        Xteink X4 Classic e-reader (also marketed "X4 v2"): the
+        buttons-only sibling of the Xteink X4 Pro. Same ESP32-S3
+        module, same 4.26" 800x480 e-paper glass and the same
+        auto-detecting SSD1677 / UC8179 / UC8279 display backend
+        (components/display/display_xteink_epd.cpp), same CW2017 I2C
+        fuel gauge and SDMMC 1-bit MicroSD -- but no GT911 touch and
+        no front-light. The panel's DC/RST/BUSY lines land on
+        different GPIOs than the X4 Pro (SCLK/MOSI/CS are the same).
+
+        Eight buttons drive the editor without a keyboard: Power
+        (deep-sleep wake / F1 / 2 s hold to forget BLE keyboards),
+        two side keys (Up / Down), and four bottom keys (Left, Right,
+        Enter, Esc).
+
+        This board has been added without on-hardware testing: pin
+        assignments come from the FreeInk SDK
+        (github.com/Free-Ink/freeink-sdk, MIT licensed),
+        docs/xteink-x4c-support.md. Grayscale / anti-aliasing
+        rendering is not implemented (matches the existing e-paper
+        boards).
+
+config DRAFTLING_MODEL_ELECROW_CROWPANEL_579
+    bool "Elecrow CrowPanel ESP32-S3 5.79\" E-Paper HMI (SSD1683 x2, 792x272)"
+    depends on IDF_TARGET_ESP32S3
+    help
+        Elecrow CrowPanel ESP32-S3 5.79" E-Paper HMI Display: 792x272
+        black/white e-paper panel built from two SSD1683 controllers
+        (one per half), driven over plain SPI by
+        components/display/display_ssd1683.cpp. On-board MicroSD on
+        a dedicated SPI bus. A Menu button (GPIO2) is the deep-sleep
+        wake source and doubles as F1 (open/close the Settings menu)
+        on short press / "forget all BLE keyboards" on a 2 s hold. A
+        Back button plus a 3-way dial switch (Up/Down/OK) provide
+        full menu navigation (Esc / arrow keys / Enter) without a
+        keyboard. No on-board battery monitor.
+
+        This board has been extensively tested on physical hardware;
+        see HARDWARE.md.
+
+config DRAFTLING_MODEL_WAVESHARE_EPAPER_397
+    bool "Waveshare ESP32-S3-ePaper-3.97 (SSD1677-compatible, 800x480 e-paper)"
+    depends on IDF_TARGET_ESP32S3
+    help
+        Waveshare ESP32-S3-ePaper-3.97: 3.97" 800x480 black/white
+        e-paper panel driven over plain SPI by
+        components/display/display_ws_epd397.cpp, using the same
+        SSD1677-family differential-refresh protocol as the Xteink X4
+        Pro's SSD1677 path (no manufacturing-run variance to detect
+        here -- this board carries a single panel controller). No
+        touch controller; four discrete active-low buttons
+        (Up/Function/Down plus BOOT) stand in for it, with
+        Up/Function/Down wired to arrow keys / Enter and a 2 s hold of
+        Function (the rocker's center press, GPIO5) entering deep
+        sleep (see DRAFTLING_SLEEP_BUTTON_GPIO). Battery and the
+        e-paper panel's own supply rail are both managed by an
+        on-board AXP2101 PMIC on I2C (see components/battery/battery.cpp
+        and the display backend's file header comment for the power-
+        sequencing dependency between them). On-board MicroSD on
+        SDMMC 1-bit.
+
+        This board has been tested on physical hardware. Pin
+        numbers and the AXP2101 register map come from Waveshare's
+        official ESP-IDF example (github.com/waveshareteam/ESP32-S3-
+        ePaper-3.97); that repository carries no license, so no code
+        was copied from it, only these factual pin/register
+        assignments -- see main/boards/waveshare_epaper_397.h.
+
+config DRAFTLING_MODEL_SEEED_RETERMINAL_E1001
+    bool "Seeed Studio reTerminal E1001 (UC8179, 7.5\" e-paper, 800x480)"
+    depends on IDF_TARGET_ESP32S3
+    help
+        Seeed Studio reTerminal E1001 e-paper terminal: 7.5" 800x480
+        monochrome e-paper display (UC8179 / Good Display GDEY075T7)
+        driven over plain SPI by components/display/display_seeed_e1001.cpp,
+        supporting OTP fast partial refresh and full refresh.
+        On-board MicroSD slot sharing the same SPI bus (SPI2_HOST).
+        Battery monitoring via an ADC pin (GPIO1) with active-high
+        divider enable (GPIO21). Three user buttons: KEY0 (GPIO3) is
+        the deep-sleep wakeup and BLE-forget button; KEY1 (GPIO4) and
+        KEY2 (GPIO5) scroll the editor a screen at a time (Page Up /
+        Page Down). PCF8563 RTC on I2C.
+
+config DRAFTLING_MODEL_SEEED_RETERMINAL_STICKY
+    bool "Seeed reTerminal Sticky (ESP32-S3, SSD1677, 3.97\" e-paper, 800x480, touch)"
+    depends on IDF_TARGET_ESP32S3
+    help
+        Seeed Studio reTerminal Sticky: a battery-powered, magnetically
+        mounted 3.97" 800x480 SSD1677 e-paper badge with a GT911
+        capacitive touchscreen (its own I2C bus), a BQ27220 fuel gauge
+        (a second, separate I2C bus), and a MicroSD slot sharing the
+        e-paper panel's SPI bus. Two page-turn buttons (Up/Down) plus
+        a combined Power/AI button (deep-sleep wake, short press =
+        sleep, 2 s hold = forget BLE keyboards) drive the editor
+        without a keyboard. 32 MB flash.
+
+        Tested on physical hardware. Pin assignments are
+        triple-sourced from Seeed's own
+        hardware-overview documentation and the FreeInk SDK
+        (github.com/Free-Ink/freeink-sdk, MIT licensed), which agree;
+        see main/boards/seeed_reterminal_sticky.h for the full
+        sourcing note. Grayscale /
+        anti-aliasing rendering is not implemented (matches the
+        existing e-paper boards).
+config DRAFTLING_MODEL_M5STACK_PAPERMONO
+    bool "M5Stack PaperMono / PaperMono-Lite (SSD1677, 3.97\" e-paper, 800x480)"
+    depends on IDF_TARGET_ESP32S3
+    help
+        M5Stack PaperMono-Lite (and the full PaperMono, whose extra
+        NFC and LoRa modules Draftling leaves unused): 3.97" 800x480
+        e-paper panel (SSD1677) driven over plain SPI by
+        components/display/display_m5_papermono.cpp, FT6336G
+        capacitive touch, front-light, on-board MicroSD on SDMMC
+        1-bit. Two chips on the shared I2C bus (SDA=47, SCL=48) gate
+        the board's peripherals: the M5IOE1 IO expander switches the
+        e-paper panel supply, the panel and touch reset lines and the
+        touch and MicroSD power (components/io_expander/), and the
+        M5PM1 power-management chip reports the battery voltage and
+        dims the front-light (components/battery/). Button A (GPIO2)
+        wakes the device from deep sleep; see main/boards/
+        m5stack_papermono.h for the button mapping.
+
+        Tested on physical hardware. Pin numbers and the M5PM1 /
+        M5IOE1 register maps come from M5Stack's documentation and its
+        MIT-licensed M5GFX, M5PM1, M5IOE1 and M5PaperMono-PowerDemo
+        sources.
+
+endchoice
+
+# ---- Derived: display category (driven by hardware-model choice) ----
+#
+# DRAFTLING_DISPLAY_COLOR is set automatically when the selected board
+# has a color (RGB565) panel. Other code (the color-theme selection in
+# the editor UI, lvgl_port render mode, etc.) keys off this symbol
+# instead of testing every individual board id.
+config DRAFTLING_DISPLAY_COLOR
+    bool
+    default y if DRAFTLING_MODEL_WAVESHARE_TOUCH_LCD_349
+    default y if DRAFTLING_MODEL_JC3248W535
+    default y if DRAFTLING_MODEL_M5STACK_TAB5
+    default y if DRAFTLING_MODEL_SUNTON_8048S070
+    default y if DRAFTLING_MODEL_SUNTON_8048S043
+    default y if DRAFTLING_MODEL_WAVESHARE_TOUCH_LCD_7
+    default y if DRAFTLING_MODEL_WAVESHARE_LCD_316
+    default y if DRAFTLING_MODEL_FREENOVE_FNK0104A
+    default y if DRAFTLING_MODEL_FREENOVE_FNK0104B
+    default y if DRAFTLING_MODEL_FREENOVE_FNK0104S
+    default y if DRAFTLING_MODEL_FREENOVE_FNK0104N
+    default y if DRAFTLING_MODEL_MICROJOURNAL_REV5
+    default y if DRAFTLING_MODEL_VIEWE_UEDX24320028_UEED035HV
+    default n
+
+# DRAFTLING_DISPLAY_TRANSFLECTIVE is set automatically when the
+# selected board has a transflective color panel. Such panels render
+# colors noticeably differently from transmissive IPS/TFT LCDs, so the
+# editor offers a separate color-theme table tuned for them (see
+# COLOR_THEMES in components/editor/editor_ui.cpp).
+config DRAFTLING_DISPLAY_TRANSFLECTIVE
+    bool
+    depends on DRAFTLING_DISPLAY_COLOR
+    default y if DRAFTLING_MODEL_VIEWE_UEDX24320028_UEED035HV
+    default n
+
+# DRAFTLING_DISPLAY_AXS15231B is set automatically when the selected
+# board uses an AXS15231B QSPI controller. The display backend
+# (components/display/display_axs15231b.cpp) is compiled in only for
+# these boards.
+config DRAFTLING_DISPLAY_AXS15231B
+    bool
+    default y if DRAFTLING_MODEL_WAVESHARE_TOUCH_LCD_349
+    default y if DRAFTLING_MODEL_JC3248W535
+    default n
+
+# DRAFTLING_DISPLAY_RLCD is set automatically when the selected
+# board uses a Waveshare reflective-LCD panel driven over SPI by
+# the display_rlcd.cpp backend. Code that is specific to this
+# backend (the file-level guard in display_rlcd.cpp, etc.) keys
+# off this symbol instead of the model id.
+config DRAFTLING_DISPLAY_RLCD
+    bool
+    default y if DRAFTLING_MODEL_WAVESHARE_RLCD42
+    default n
+
+# DRAFTLING_DISPLAY_MIPI_DSI is set automatically when the selected
+# board uses a MIPI-DSI color LCD driven through the ESP32-P4's
+# DSI peripheral (currently only the M5Stack Tab5: ILI9881C or
+# ST7123 panel depending on the hardware revision). The MIPI-DSI
+# backend (components/display/display_mipi_dsi.cpp) is compiled in
+# only when this symbol is set, keeping the m5stack_tab5 BSP
+# managed-component dependency out of builds for other boards.
+config DRAFTLING_DISPLAY_MIPI_DSI
+    bool
+    default y if DRAFTLING_MODEL_M5STACK_TAB5
+    default n
+
+# DRAFTLING_DISPLAY_RGB is set automatically when the selected board
+# drives a parallel RGB565 color panel through the ESP32-S3 LCD RGB
+# peripheral (esp_lcd_new_rgb_panel). The RGB backend
+# (components/display/display_rgb.cpp) is compiled in only when this
+# symbol is set.
+config DRAFTLING_DISPLAY_RGB
+    bool
+    default y if DRAFTLING_MODEL_SUNTON_8048S070
+    default y if DRAFTLING_MODEL_SUNTON_8048S043
+    default y if DRAFTLING_MODEL_WAVESHARE_TOUCH_LCD_7
+    default y if DRAFTLING_MODEL_WAVESHARE_LCD_316
+    default n
+
+# DRAFTLING_RGB_PANEL_ST7701 switches components/display/display_rgb.cpp
+# to the ST7701 panel definition of the Waveshare ESP32-S3-LCD-3.16:
+# its own pin map and timings, a direct-GPIO panel reset, an active-low
+# PWM backlight and the vendor init sequence sent once at boot over a
+# bit-banged 3-wire SPI bus (CS=GPIO0, SCK=GPIO2, SDA=GPIO1), whose
+# pins are then released to the BOOT button and the SDMMC slot.
+config DRAFTLING_RGB_PANEL_ST7701
+    bool
+    default y if DRAFTLING_MODEL_WAVESHARE_LCD_316
+    default n
+
+# DRAFTLING_RGB_BOARD_S043 switches components/display/display_rgb.cpp
+# to the Sunton ESP32-8048S043C panel definition (ST7262, 12.5 MHz
+# pclk_active_neg, VSYNC=41/DE=40 control pins and R,G,B data-line
+# order) instead of the default ESP32-8048S070C definition (12 MHz
+# pclk_idle_high, VSYNC=40/DE=41 and B,G,R data-line order).
+config DRAFTLING_RGB_BOARD_S043
+    bool
+    default y if DRAFTLING_MODEL_SUNTON_8048S043
+    default n
+
+# DRAFTLING_HAS_CH422G is set automatically on boards whose LCD reset,
+# backlight enable, touch reset and/or SD card chip-select lines sit
+# behind an on-board CH422G I2C IO-expander instead of direct ESP32-S3
+# GPIOs. The `io_expander` component (components/io_expander/) is a
+# no-op stub on every other board. Currently only the Waveshare
+# ESP32-S3-Touch-LCD-7, whose CH422G shares the I2C bus with the
+# GT911 capacitive touchscreen (SDA=8, SCL=9). When set,
+# components/display/display_rgb.cpp switches to the CH422G-based
+# panel-reset / on-off backlight path (instead of a direct GPIO
+# reset / LEDC PWM backlight), and main.cpp brings up the shared I2C
+# bus + CH422G before display_init(), pulses the LCD and touch reset
+# lines through it, and holds the SD card chip-select line low
+# (see main/boards/waveshare_touch_lcd_7.h).
+config DRAFTLING_HAS_CH422G
+    bool
+    default y if DRAFTLING_MODEL_WAVESHARE_TOUCH_LCD_7
+    default n
+
+# DRAFTLING_DISPLAY_ILI9341 is set automatically when the selected
+# board uses an ILI9341 SPI color LCD (Freenove FNK0104A / FNK0104B,
+# 2.8" 240x320 panel). The display backend
+# (components/display/display_ili9341.cpp) is compiled in for these
+# boards.
+config DRAFTLING_DISPLAY_ILI9341
+    bool
+    default y if DRAFTLING_MODEL_FREENOVE_FNK0104A
+    default y if DRAFTLING_MODEL_FREENOVE_FNK0104B
+    default y if DRAFTLING_MODEL_MICROJOURNAL_REV5
+    default n
+
+# This ILI9341 variant receives its GPIO map and hardware reset through
+# display_init(), unlike the Freenove panels' fixed pin map.
+config DRAFTLING_DISPLAY_SPI_TFT_CUSTOM_PINS
+    bool
+    default y if DRAFTLING_MODEL_MICROJOURNAL_REV5
+    default n
+
+# DRAFTLING_DISPLAY_ST7796 is set automatically when the selected
+# board uses an ST7796 SPI color LCD (Freenove FNK0104S, 4.0"
+# 320x480 panel). Shares the same SPI wiring convention and pixel
+# pipeline as DRAFTLING_DISPLAY_ILI9341
+# (components/display/display_ili9341.cpp handles both controllers,
+# selecting the correct vendor init sequence at build time).
+config DRAFTLING_DISPLAY_ST7796
+    bool
+    default y if DRAFTLING_MODEL_FREENOVE_FNK0104S
+    default n
+
+# DRAFTLING_DISPLAY_ST77922 is set automatically when the selected
+# board uses a Sitronix ST77922 QSPI color LCD (Freenove FNK0104N,
+# 3.5" 320x480 panel). The display backend
+# (components/display/display_st77922.cpp) is compiled in only for
+# this board.
+config DRAFTLING_DISPLAY_ST77922
+    bool
+    default y if DRAFTLING_MODEL_FREENOVE_FNK0104N
+    default n
+
+# DRAFTLING_DISPLAY_ST7365 is set automatically when the selected
+# board drives Viewe's UEED035HV-RX40-L001 3.5" 320x480 transflective
+# display (ST7365 controller, ST7796-compatible command set). Same
+# MIPI-DCS SPI protocol and pixel pipeline as
+# DRAFTLING_DISPLAY_ST7796; handled by
+# components/display/display_ili9341.cpp with its own pins, RST and
+# interface-mode straps, and Viewe's init table.
+config DRAFTLING_DISPLAY_ST7365
+    bool
+    default y if DRAFTLING_MODEL_VIEWE_UEDX24320028_UEED035HV
+    default n
+
+# DRAFTLING_DISPLAY_CAN_ROTATE enables a runtime "Rotate 180" entry in
+# the F1 -> Settings menu (persisted in NVS). It is offered on boards
+# whose display backend implements the software 180-degree flip in
+# lvgl_port.cpp's flush path. A 180 flip never changes the reported
+# panel resolution, so it can be toggled at runtime without rebuilding
+# the LVGL widget tree. Currently enabled on the parallel-RGB boards
+# (the Sunton ESP32-8048S0xx family), where the USB-C / SD-card edge
+# may be on either side depending on the enclosure.
+config DRAFTLING_DISPLAY_CAN_ROTATE
+    bool
+    default y if DRAFTLING_DISPLAY_RGB
+    default n
+
+# DRAFTLING_DISPLAY_CAN_INVERT enables a runtime "Inverted screen" entry
+# in the F1 -> Settings menu (persisted in NVS), offered on boards whose
+# display backend implements a software pixel-polarity flip in its
+# display_flush() path. When enabled, pixels that would normally show
+# as "active" (drawn / ink) show the background instead, and vice
+# versa -- a full visual invert, akin to a dark-mode toggle on a panel
+# that has no native inversion command wired up to the editor. Currently
+# only the Waveshare ESP32-S3-RLCD-4.2 (display_rlcd.cpp complements the
+# framebuffer bytes at flush time when the option is on).
+config DRAFTLING_DISPLAY_CAN_INVERT
+    bool
+    default y if DRAFTLING_DISPLAY_RLCD
+    default n
+
+# DRAFTLING_DISPLAY_EPD is set automatically when the selected
+# board has an electronic-paper panel. Code that has to be aware
+# of e-paper specifics (slow refresh, no blinking cursor, white-on-
+# sleep wipe, partial-refresh interval, etc.) keys off this
+# symbol instead of the model id so adding a new e-paper board
+# does not require touching every consumer.
+config DRAFTLING_DISPLAY_EPD
+    bool
+    default y if DRAFTLING_MODEL_M5STACK_PAPERS3
+    default y if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO
+    default y if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO_H752
+    default y if DRAFTLING_MODEL_XTEINK_X4_PRO
+    default y if DRAFTLING_MODEL_XTEINK_X4_CLASSIC
+    default y if DRAFTLING_MODEL_ELECROW_CROWPANEL_579
+    default y if DRAFTLING_MODEL_WAVESHARE_EPAPER_397
+    default y if DRAFTLING_MODEL_SEEED_RETERMINAL_E1001
+    default y if DRAFTLING_MODEL_SEEED_RETERMINAL_STICKY
+    default y if DRAFTLING_MODEL_M5STACK_PAPERMONO
+    default n
+
+# DRAFTLING_DISPLAY_EPDIY is set automatically when the selected
+# e-paper board is driven by the vroland/epdiy library. The set
+# currently includes both LilyGO T5 E-Paper S3 Pro variants (driven
+# by epdiy's built-in epd_board_v7: 8-bit parallel data bus + TPS65185
+# high-voltage supply controlled via a PCA9535 I2C IO expander) and
+# the M5Stack PaperS3 (driven by the in-tree epd_board_papers3.c:
+# same 8-bit bus topology but with direct-GPIO power gates, no
+# TPS65185 and no I/O expander). The EPDIY display backend
+# (components/display/display_epdiy.cpp) is compiled in only when
+# this symbol is set.
+config DRAFTLING_DISPLAY_EPDIY
+    bool
+    default y if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO
+    default y if DRAFTLING_MODEL_M5STACK_PAPERS3
+    default n
+
+# DRAFTLING_DISPLAY_H752_EPD selects the original LilyGO H752
+# shift-register EPD47 backend. It is intentionally separate from
+# DRAFTLING_DISPLAY_EPDIY because original H752 has no PCA9535 or
+# TPS65185 and cannot use epdiy's epd_board_v7 path.
+config DRAFTLING_DISPLAY_H752_EPD
+    bool
+    default y if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO_H752
+    default n
+
+# DRAFTLING_DISPLAY_XTEINK_EPD selects the from-scratch SPI e-paper
+# backend for the Xteink X4 Pro (components/display/display_xteink_epd.cpp).
+# Unlike the other e-paper backends it drives the panel directly over
+# SPI (no parallel LCD/I80 bus, no vroland/epdiy) and auto-detects
+# which of three possible controllers (SSD1677, UC8179, UC8279) the
+# panel is wired to at boot.
+config DRAFTLING_DISPLAY_XTEINK_EPD
+    bool
+    default y if DRAFTLING_MODEL_XTEINK_X4_PRO
+    default y if DRAFTLING_MODEL_XTEINK_X4_CLASSIC
+    default n
+
+# DRAFTLING_MODEL_XTEINK_X4 groups the two Xteink X4 boards
+# (X4 Pro and X4 Classic) that share the display_xteink_epd.cpp
+# backend, the CW2017 gauge, the SDMMC slot and the OTA partition
+# table. Code that is common to both keys off this instead of
+# testing the two model ids.
+config DRAFTLING_MODEL_XTEINK_X4
+    bool
+    default y if DRAFTLING_MODEL_XTEINK_X4_PRO
+    default y if DRAFTLING_MODEL_XTEINK_X4_CLASSIC
+    default n
+
+# DRAFTLING_DISPLAY_SSD1683 selects the from-scratch dual-controller
+# SPI e-paper backend for the Elecrow CrowPanel 5.79" E-Paper HMI
+# Display (components/display/display_ssd1683.cpp). The 792x272
+# panel is built from two SSD1683 driver chips (one per half); the
+# backend streams the framebuffer to each half through its own
+# windowed RAM-write command sequence, ported from the community
+# ESPHome driver at github.com/samperk1/esphome-crowpanel-579.
+config DRAFTLING_DISPLAY_SSD1683
+    bool
+    default y if DRAFTLING_MODEL_ELECROW_CROWPANEL_579
+    default n
+
+# DRAFTLING_DISPLAY_WS_EPD397 selects the from-scratch SPI e-paper
+# backend for the Waveshare ESP32-S3-ePaper-3.97
+# (components/display/display_ws_epd397.cpp). Unlike the Xteink X4
+# Pro's DRAFTLING_DISPLAY_XTEINK_EPD, this board carries a single
+# panel controller (SSD1677-family protocol), so no boot-time
+# controller-detection probe is needed.
+config DRAFTLING_DISPLAY_WS_EPD397
+    bool
+    default y if DRAFTLING_MODEL_WAVESHARE_EPAPER_397
+    default n
+
+# DRAFTLING_DISPLAY_SEEED_E1001 selects the from-scratch SPI e-paper
+# backend for the Seeed Studio reTerminal E1001
+# (components/display/display_seeed_e1001.cpp). Drives the 7.5"
+# 800x480 monochrome panel directly over SPI via the UC8179
+# controller with OTP waveforms for full and fast partial updates.
+config DRAFTLING_DISPLAY_SEEED_E1001
+    bool
+    default y if DRAFTLING_MODEL_SEEED_RETERMINAL_E1001
+
+# DRAFTLING_DISPLAY_RETERMINAL_STICKY selects the from-scratch SPI
+# e-paper backend for the Seeed reTerminal Sticky
+# (components/display/display_reterminal_sticky.cpp). Same SSD1677-
+# family protocol as DRAFTLING_DISPLAY_WS_EPD397 (single controller,
+# no boot-time detection needed), repinned for this board and with
+# MISO wired since the MicroSD card shares this panel's SPI bus.
+config DRAFTLING_DISPLAY_RETERMINAL_STICKY
+    bool
+    default y if DRAFTLING_MODEL_SEEED_RETERMINAL_STICKY
+    default n
+
+# DRAFTLING_DISPLAY_M5_PAPERMONO selects the from-scratch SPI e-paper
+# backend for the M5Stack PaperMono / PaperMono-Lite
+# (components/display/display_m5_papermono.cpp): the same single
+# SSD1677-family controller and differential-refresh protocol as
+# display_ws_epd397.cpp, with the panel supply and reset behind the
+# M5IOE1 IO expander (driven from main.cpp before display_init()) and
+# the front-light dimmed through the M5PM1 PWM output.
+config DRAFTLING_DISPLAY_M5_PAPERMONO
+    bool
+    default y if DRAFTLING_MODEL_M5STACK_PAPERMONO
+    default n
+
+# DRAFTLING_HAS_M5IOE1 compiles in the M5Stack M5IOE1 I2C IO-expander
+# driver (components/io_expander/io_expander_m5ioe1.cpp). On every
+# other board its functions are no-op stubs.
+config DRAFTLING_HAS_M5IOE1
+    bool
+    default y if DRAFTLING_MODEL_M5STACK_PAPERMONO
+    default n
+
+# DRAFTLING_EPDIY_BOARD_PAPERS3 selects the in-tree PaperS3 board
+# definition (components/display/epd_board_papers3.c) instead of
+# epdiy's built-in epd_board_v7. The PaperS3 has no TPS65185 and no
+# I/O expander; its EPD power rail is gated by two direct GPIO pins
+# (EPD_EN on GPIO45, BST_EN on GPIO46).
+config DRAFTLING_EPDIY_BOARD_PAPERS3
+    bool
+    default y if DRAFTLING_MODEL_M5STACK_PAPERS3
+    default n
+
+# DRAFTLING_DISPLAY_HAS_BACKLIGHT is set automatically on boards
+# whose display backend drives a controllable backlight GPIO via
+# LEDC PWM. The editor exposes a "Backlight" entry in the F1
+# Settings menu (persisted in NVS) on these boards only.
+config DRAFTLING_DISPLAY_HAS_BACKLIGHT
+    bool
+    default y if DRAFTLING_DISPLAY_AXS15231B
+    default y if DRAFTLING_DISPLAY_MIPI_DSI
+    default y if DRAFTLING_DISPLAY_RGB
+    default y if DRAFTLING_DISPLAY_ILI9341 && !DRAFTLING_DISPLAY_SPI_TFT_CUSTOM_PINS
+    default y if DRAFTLING_DISPLAY_ST7796
+    default y if DRAFTLING_DISPLAY_ST7365
+    default y if DRAFTLING_DISPLAY_ST77922
+    # LilyGO T5 E-Paper S3 Pro / Pro Lite carry a controllable white
+    # front-light edge-lit LED on GPIO 11 (BOARD_BL_EN in the LilyGO
+    # factory firmware). The EPDIY display backend drives it with
+    # the standard LEDC PWM block, so the editor Settings menu and
+    # Ctrl+B shortcut work on these boards too.
+    default y if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO
+    default y if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO_H752
+    # Xteink X4 Pro: dual-channel (cool/warm) PWM front-light, both
+    # channels driven identically from this single percentage since
+    # Draftling has no warm/cool color-temperature UI. The X4 Classic
+    # has no front-light and is deliberately left off here.
+    default y if DRAFTLING_MODEL_XTEINK_X4_PRO
+    # M5Stack PaperMono: front-light PWM on the M5PM1's GPIO3 (PWM0),
+    # set over I2C by the display backend.
+    default y if DRAFTLING_MODEL_M5STACK_PAPERMONO
+    default n
+
+# DRAFTLING_DISPLAY_BACKLIGHT_BINARY is set automatically on boards
+# whose backlight enable line can only be switched fully on or off --
+# no PWM dimming is physically possible, so a brightness control would
+# be misleading (every intermediate step of the usual percentage
+# ladder would look identical to the user). Currently the CH422G-
+# driven backlight (Waveshare Touch-LCD-7): the expander pin is a
+# plain digital output, not a PWM channel. When set, the editor omits
+# the backlight feature entirely -- no "Backlight: NN%" entry in F1 ->
+# Settings and no Ctrl+B shortcut (every
+# CONFIG_DRAFTLING_DISPLAY_HAS_BACKLIGHT guard in
+# components/editor/editor_ui.cpp also requires this symbol to be
+# unset) -- rather than expose a control that can only toggle the
+# backlight fully on or off. The backlight is left at the display
+# backend's own default (on).
+config DRAFTLING_DISPLAY_BACKLIGHT_BINARY
+    bool
+    default y if DRAFTLING_HAS_CH422G
+    default n
+
+# Minimum backlight percentage offered by the Settings menu. The
+# editor cycles through the steps {0, 10, 25, 50, 75, 100} % (with
+# an extra 5 % step on the LilyGO T5 E-Paper S3 Pro / Pro Lite
+# front-light), but on some panels the lowest steps are too dark
+# to be usable. Bumping this value drops the dim steps from the
+# cycle so the user cannot accidentally land on an unreadable
+# brightness. The 0 % step is
+# only included when this value is 0 (it makes sense for reflective
+# / e-paper panels that stay readable without any back/front-light;
+# transmissive LCDs would just go fully dark). Non-prompted; set
+# per model below. Irrelevant on DRAFTLING_DISPLAY_BACKLIGHT_BINARY
+# boards -- the whole Settings/Ctrl+B feature is compiled out there.
+config DRAFTLING_BACKLIGHT_MIN_PCT
+    int
+    depends on DRAFTLING_DISPLAY_HAS_BACKLIGHT
+    # E-paper boards remain readable without the front-light, so let
+    # the user dial brightness all the way down to 0 %.
+    default 0 if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO
+    default 0 if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO_H752
+    default 0 if DRAFTLING_MODEL_XTEINK_X4_PRO
+    default 0 if DRAFTLING_MODEL_M5STACK_PAPERMONO
+    # Viewe UEDX24320028E-WB-A + UEED035HV: transflective LCD,
+    # readable in ambient light with the backlight fully off.
+    default 0 if DRAFTLING_MODEL_VIEWE_UEDX24320028_UEED035HV
+    # Waveshare ESP32-S3-LCD-3.16: transmissive IPS panel that is too
+    # dark to read at 10 %.
+    default 25 if DRAFTLING_MODEL_WAVESHARE_LCD_316
+    # X4 Classic has no front-light, so DRAFTLING_DISPLAY_HAS_BACKLIGHT
+    # is off there and this value is never consulted.
+    default 10
+
+# DRAFTLING_BL_DUTY_FLOOR_PCT shifts the bottom of the PWM duty
+# range so that the lowest UI brightness steps are still visible
+# on panels whose LED driver has a high "barely on" threshold.
+# The backend remaps the user-facing 1..100 % linearly into
+# [FLOOR..100] %% of full PWM duty: e.g. with FLOOR=40, user 10 %
+# maps to 46 % duty, 25 % -> 55 %, 50 % -> 70 %, 100 % -> 100 %.
+# A user setting of exactly 0 %% still produces duty 0 (fully off).
+# Default 0 = no remap (linear). Non-prompted; set per model.
+#
+# Waveshare Touch-LCD-3.49: the backlight LED driver is invisible
+# below ~45 % duty (10 % and 25 % look "completely dark"); a
+# floor of 40 lets all five UI steps stay above the visibility
+# threshold while still spanning a perceptible brightness range.
+config DRAFTLING_BL_DUTY_FLOOR_PCT
+    int
+    depends on DRAFTLING_DISPLAY_HAS_BACKLIGHT
+    default 40 if DRAFTLING_MODEL_WAVESHARE_TOUCH_LCD_349
+    default 0
+
+# DRAFTLING_BL_GPIO_BINARY tells the display backend to drive the
+# backlight enable GPIO as a plain on/off digital output instead of
+# an LEDC PWM channel. Kept available for future boards whose BL
+# boost circuit does not tolerate LEDC PWM, but no current board
+# defaults it to y. The polarity is taken from LCD_BL_ACTIVE_LOW in
+# app_config.h (default 0 = active HIGH, 1 = active LOW), so the
+# backend can drive the correct "on" / "off" level for either
+# convention.
+config DRAFTLING_BL_GPIO_BINARY
+    bool
+    default n
+
+# DRAFTLING_HAS_BATTERY is set automatically on boards that wire
+# the LiPo cell through a divider to an ADC pin (BATT_ADC_PIN >= 0
+# in app_config.h). Used by the editor UI to decide whether to
+# create the battery-percentage status-bar label and timer, instead
+# of testing every model id individually.
+config DRAFTLING_HAS_BATTERY
+    bool
+    default y if DRAFTLING_MODEL_WAVESHARE_RLCD42
+    default y if DRAFTLING_MODEL_M5STACK_PAPERS3
+    default y if DRAFTLING_MODEL_WAVESHARE_TOUCH_LCD_349
+    # LilyGO T5 E-Paper S3 Pro / Pro Lite: battery is monitored via a
+    # BQ27220 fuel gauge on I2C (driver in components/battery,
+    # gated on DRAFTLING_BATTERY_BQ27220 below). The shared I2C
+    # bus owned by main.cpp is passed to battery_init_bq27220().
+    default y if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO
+    default y if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO_H752
+    # M5Stack Tab5: 2S NP-F550 Li-ion pack is monitored by an INA226
+    # power monitor on the system I2C bus at 0x41 (see
+    # DRAFTLING_BATTERY_INA226 below). main.cpp calls
+    # battery_init_ina226() with the BSP-owned I2C handle.
+    default y if DRAFTLING_MODEL_M5STACK_TAB5
+    # Freenove FNK0104 family: LiPo cell monitored through a 1:2
+    # divider on a dedicated ADC pin (GPIO9 on FNK0104A/B/S).
+    default y if DRAFTLING_MODEL_FREENOVE_FNK0104A
+    default y if DRAFTLING_MODEL_FREENOVE_FNK0104B
+    default y if DRAFTLING_MODEL_FREENOVE_FNK0104S
+    default y if DRAFTLING_MODEL_FREENOVE_FNK0104N
+    # Waveshare ESP32-S3-LCD-3.16: LiPo cell through a 1:2 divider on
+    # GPIO4.
+    default y if DRAFTLING_MODEL_WAVESHARE_LCD_316
+    # Xteink X4 Pro / X4 Classic: battery is monitored via a CW2017
+    # fuel gauge on the shared I2C bus (driver in components/battery,
+    # gated on DRAFTLING_BATTERY_CW2017 below).
+    default y if DRAFTLING_MODEL_XTEINK_X4
+    # Waveshare ESP32-S3-ePaper-3.97: battery is monitored via an
+    # AXP2101 PMIC on the shared I2C bus (driver in components/battery,
+    # gated on DRAFTLING_BATTERY_AXP2101 below). The same chip also
+    # switches the e-paper panel's own supply rail; see the display
+    # backend's file header comment.
+    default y if DRAFTLING_MODEL_WAVESHARE_EPAPER_397
+    default y if DRAFTLING_MODEL_SEEED_RETERMINAL_E1001
+
+    # Seeed reTerminal Sticky: battery is monitored via a BQ27220 fuel
+    # gauge on its own, dedicated I2C bus (driver in components/battery,
+    # gated on DRAFTLING_BATTERY_BQ27220 below).
+    default y if DRAFTLING_MODEL_SEEED_RETERMINAL_STICKY
+    # M5Stack PaperMono: battery voltage read from the M5PM1
+    # power-management chip (DRAFTLING_BATTERY_M5PM1 below).
+    default y if DRAFTLING_MODEL_M5STACK_PAPERMONO
+    default n
+
+# Selects the M5Stack M5PM1 power-management backend in
+# components/battery/. main.cpp calls battery_init_m5pm1(shared_i2c_bus)
+# early in boot, before display_init(): besides reporting the battery
+# voltage it disables the chip's I2C idle sleep and watchdog and turns
+# on its 3.3 V rails, and its PWM0 output drives the front-light
+# (battery_m5pm1_set_frontlight(), called by the display backend).
+config DRAFTLING_BATTERY_M5PM1
+    bool
+    default y if DRAFTLING_MODEL_M5STACK_PAPERMONO
+    default n
+
+# Selects the CW2017 fuel-gauge backend in components/battery/
+# instead of the GPIO ADC backend. main.cpp calls
+# battery_init_cw2017(shared_i2c_bus) when this symbol is set. There
+# is no charger IC on this board's I2C bus, so
+# battery_read_charging() always reports "unknown" (-1) for this
+# backend.
+config DRAFTLING_BATTERY_CW2017
+    bool
+    default y if DRAFTLING_MODEL_XTEINK_X4
+    default n
+
+# Selects the AXP2101 PMIC backend in components/battery/ instead of
+# the GPIO ADC backend. main.cpp calls battery_init_axp2101(shared_i2c_bus)
+# when this symbol is set. Unlike the CW2017, the AXP2101 has a real
+# integrated charger, so battery_read_charging() reports real charge
+# state instead of always returning -1. This same chip's ALDO3 output
+# also powers the e-paper panel itself: the display backend
+# (components/display/display_ws_epd397.cpp) calls
+# battery_axp2101_enable_display_rail() from its
+# display_set_shared_i2c_bus() hook, before display_init() and before
+# battery_init_axp2101() run.
+config DRAFTLING_BATTERY_AXP2101
+    bool
+    default y if DRAFTLING_MODEL_WAVESHARE_EPAPER_397
+    default n
+
+# Selects the BQ27220 fuel-gauge backend in components/battery/
+# instead of the GPIO ADC backend. main.cpp calls
+# battery_init_bq27220(bus) when this symbol is set. On the LilyGO T5
+# E-Paper S3 Pro / Pro Lite the BQ27220 device is added to the shared
+# I2C bus that already carries epdiy's TPS65185 / PCA9535 and the
+# GT911 touch controller. On the Seeed reTerminal Sticky it instead
+# gets its own dedicated I2C bus (main.cpp creates a second one just
+# for it), since that board's gauge and touch controller sit on two
+# physically separate buses.
+config DRAFTLING_BATTERY_BQ27220
+    bool
+    default y if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO
+    default y if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO_H752
+    default y if DRAFTLING_MODEL_SEEED_RETERMINAL_STICKY
+    default n
+
+# BQ27220 boards whose gauge Data Memory is programmed for the pack:
+# battery_read_percent() reports the gauge's StateOfCharge (0x2C)
+# instead of running the cell voltage through the LiPo LUT. Left off
+# on the LilyGO T5, whose gauge ships with default Data Memory and
+# reports a meaningless ~50 %.
+config DRAFTLING_BATTERY_BQ27220_GAUGE_SOC
+    bool
+    depends on DRAFTLING_BATTERY_BQ27220
+    default y if DRAFTLING_MODEL_SEEED_RETERMINAL_STICKY
+    default n
+
+# Selects the TI INA226 bus-voltage backend in components/battery/.
+# main.cpp calls battery_init_ina226(i2c_bus, 0x41, 2) when this
+# symbol is set (Tab5 wires a 2S NP-F550 pack through the INA226).
+# Percentage is derived from per-cell voltage via the same 4.2-3.6 V
+# LiPo lookup table the ADC backend uses.
+config DRAFTLING_BATTERY_INA226
+    bool
+    default y if DRAFTLING_MODEL_M5STACK_TAB5
+    default n
+
+# Enables the BQ25896 single-cell Li-ion charger init in
+# components/battery (battery_init_bq25896). The chip lives on the
+# shared I2C bus at 0x6B on the LilyGO T5 E-Paper S3 Pro / Pro Lite
+# and ships with conservative defaults (500 mA IINLIM, 40 s I2C
+# watchdog that reverts host writes, AUTO_DPDM that re-snaps IINLIM
+# back to USB SDP). Without an explicit init the cell only charges
+# at ~500 mA. main.cpp calls battery_init_bq25896(shared_i2c_bus)
+# right after the shared bus is created when this symbol is set.
+config DRAFTLING_CHARGER_BQ25896
+    bool
+    default y if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO
+    default y if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO_H752
+    default n
+
+# Diagnostic power-management instrumentation. Off by default so it
+# never noise-pollutes a production boot log. When set:
+#   - On every cold boot, main.cpp dumps the full BQ27220 fuel-gauge
+#     state (voltage, SoC, Flags, signed current in mA) and, if the
+#     previous run persisted a sleep-entry timestamp + SoC, the
+#     estimated deep-sleep drain rate in uA derived from the SoC delta.
+#   - While the BQ25896 charger reports VBUS present, a 30-second
+#     periodic task dumps REG00 / REG0B-REG13 so a sustained charge
+#     can be characterised in-field without a USB power meter.
+# Use this to confirm a deep-sleep change actually lowers idle draw
+# and to localise charge tapering symptoms to the specific BQ25896
+# status bit responsible (THERM_STAT, VDPM_STAT, NTC_FAULT, etc.).
+config DRAFTLING_DEBUG_POWER
+    bool "Enable verbose power-management diagnostics"
+    default n
+    help
+        Adds a boot-time BQ27220 register dump, a deep-sleep drain
+        estimator and a periodic BQ25896 charger-status dump. Useful
+        for diagnosing battery drain and slow-charge regressions on
+        the LilyGO T5 E-Paper S3 Pro / Pro Lite. Leave disabled in
+        production builds.
+
+# Periodically (every 30 s) re-asserts the most safety-critical
+# BQ25896 settings -- ICO_EN=0 in REG02 and WATCHDOG=00 in REG07 --
+# so a one-off bus glitch or a missed I2C write at boot cannot leave
+# the charger in its 500 mA USB-SDP default. Independent of
+# DRAFTLING_DEBUG_POWER so production builds still get the
+# tamper-resistance without the verbose logs.
+config DRAFTLING_CHARGER_WATCHDOG_REASSERT
+    bool
+    depends on DRAFTLING_CHARGER_BQ25896
+    default y if DRAFTLING_CHARGER_BQ25896
+    default n
+
+# Enables the USB Host stack + USB HID keyboard driver
+# (components/usb_kbd) on boards that wire a host-mode USB-A port.
+# On M5Stack Tab5 the USB-A connector is gated by BSP_FEATURE_USB
+# (PI4IOE5V6408 #2 P5); main.cpp brings it up before BLE so a
+# physically attached USB keyboard preempts BLE pairing. If a USB
+# keyboard is detected within DRAFTLING_USB_KBD_PROBE_MS at boot,
+# the ble_keyboard component is left uninitialised.
+config DRAFTLING_HAS_USB_HOST
+    bool
+    default y if DRAFTLING_MODEL_M5STACK_TAB5
+    default y if DRAFTLING_MODEL_MICROJOURNAL_REV5
+    default n
+
+# Some USB host ports are initialized by a board support package rather
+# than usb_kbd. The Tab5 BSP owns its PHY, port power and host daemon.
+config DRAFTLING_USB_HOST_BSP_MANAGED
+    bool
+    default y if DRAFTLING_MODEL_M5STACK_TAB5
+    default n
+
+config DRAFTLING_USB_KBD_PROBE_MS
+    int
+    depends on DRAFTLING_HAS_USB_HOST
+    default 1500
+    help
+        Milliseconds main.cpp waits after bringing up the USB Host
+        stack before deciding whether a USB keyboard is plugged in.
+        1500 ms covers reset + enumeration + boot-protocol switch on
+        all keyboards tested so far. If shorter, slow keyboards may
+        miss the window and BLE will be brought up instead.
+
+# Enables the "SD card via USB" F1 menu item (components/usb_msc):
+# expose the SD card as a USB Mass Storage device over the ESP32-S3's
+# native USB-OTG controller, for boards whose USB port wires that
+# controller straight to the connector (as opposed to a UART-to-USB
+# bridge chip used only for flashing / charging). Off, Read-only and
+# Read-write are the three menu values; see usb_msc.h for the
+# lifecycle. Every board here also needs CONFIG_TINYUSB_MSC_ENABLED=y
+# (set in its sdkconfig.defaults.<board>) for the underlying esp_tinyusb
+# storage class to actually be compiled in.
+#
+# M5Stack Tab5 (ESP32-P4) was tried on its separate USB-C charging
+# port (its USB-A port is already claimed, in USB Host mode, by the
+# wired-keyboard feature) and found not to work on physical hardware,
+# so it is deliberately absent from this list.
+config DRAFTLING_HAS_USB_MSC
+    bool
+    default y if DRAFTLING_MODEL_XTEINK_X4_PRO
+    default y if DRAFTLING_MODEL_XTEINK_X4_CLASSIC
+    default y if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO
+    default y if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO_H752
+    default y if DRAFTLING_MODEL_M5STACK_PAPERS3
+    default y if DRAFTLING_MODEL_WAVESHARE_EPAPER_397
+    default y if DRAFTLING_MODEL_WAVESHARE_RLCD42
+    default y if DRAFTLING_MODEL_FREENOVE_FNK0104A
+    default y if DRAFTLING_MODEL_FREENOVE_FNK0104B
+    default y if DRAFTLING_MODEL_FREENOVE_FNK0104S
+    default y if DRAFTLING_MODEL_FREENOVE_FNK0104N
+    default y if DRAFTLING_MODEL_WAVESHARE_TOUCH_LCD_7
+    default y if DRAFTLING_MODEL_WAVESHARE_LCD_316
+    default y if DRAFTLING_MODEL_VIEWE_UEDX24320028_UEED035HV
+    default y if DRAFTLING_MODEL_WAVESHARE_TOUCH_LCD_349
+    default y if DRAFTLING_MODEL_M5STACK_PAPERMONO
+    default n
+
+config DRAFTLING_USB_MSC_IDLE_TIMEOUT_SEC
+    int
+    depends on DRAFTLING_HAS_USB_MSC
+    default 300
+    help
+        Seconds usb_msc waits with no USB host attached (from
+        activation, or since the last detach) before automatically
+        reverting "SD card via USB" to Off, so leaving it on by
+        mistake does not permanently cut the editor off from the SD
+        card.
+
+# Enables the M5Stack Tab5 attachable keyboard driver
+# (components/tab5_kbd). The keyboard talks over its own dedicated
+# I2C bus (address 0x6D) plus a dedicated interrupt line. main.cpp
+# probes for it at boot; if present it feeds the editor alongside any
+# USB keyboard, and BLE is left available on demand via the menu.
+config DRAFTLING_HAS_TAB5_KBD
+    bool
+    default y if DRAFTLING_MODEL_M5STACK_TAB5
+    default n
+
+config DRAFTLING_TAB5_KBD_INT_GPIO
+    int
+    depends on DRAFTLING_HAS_TAB5_KBD
+    default 50
+    help
+        GPIO wired to the Tab5 keyboard's interrupt (INT) line. The
+        keyboard pulls this line low when a key event is queued; the
+        driver reads the event over I2C on the falling edge.
+
+config DRAFTLING_TAB5_KBD_I2C_SDA_GPIO
+    int
+    depends on DRAFTLING_HAS_TAB5_KBD
+    default 0
+    help
+        SDA GPIO of the dedicated I2C bus the Tab5 keyboard is wired
+        to. The keyboard does not share the system I2C bus (touch /
+        IMU / codec); main.cpp creates a separate master bus on this
+        pin pair for it.
+
+config DRAFTLING_TAB5_KBD_I2C_SCL_GPIO
+    int
+    depends on DRAFTLING_HAS_TAB5_KBD
+    default 1
+    help
+        SCL GPIO of the dedicated I2C bus the Tab5 keyboard is wired
+        to. See DRAFTLING_TAB5_KBD_I2C_SDA_GPIO.
+
+# DRAFTLING_HAS_POWER_LATCH is set automatically on boards that wire
+# the battery rail through a hardware latch (typically a TCA9554 IO
+# expander pin) so that the firmware can fully power the device off.
+# The `power` component implements the latch + PWR button handling;
+# when this symbol is set, the standby manager cuts the power latch
+# instead of entering deep sleep on battery, and the editor exposes
+# a Power-Off menu entry. Currently only the Waveshare ESP32-S3-
+# Touch-LCD-3.49 wires this circuitry; on every other board the
+# device falls back to a regular ESP32 deep-sleep cycle.
+config DRAFTLING_HAS_POWER_LATCH
+    bool
+    default y if DRAFTLING_MODEL_WAVESHARE_TOUCH_LCD_349
+    default n
+
+# DRAFTLING_SD_SDMMC selects the on-chip SDMMC peripheral (1-bit
+# mode) for SD card access. When unset, SD access goes through a
+# generic SPI bus. Used by main.cpp's SD-init branch instead of
+# testing per-board model ids.
+config DRAFTLING_SD_SDMMC
+    bool
+    default y if DRAFTLING_MODEL_WAVESHARE_RLCD42
+    # Freenove FNK0104 family: on-board MicroSD wired to SDMMC.
+    # Draftling only uses the 1-bit mode (CLK/CMD/D0); the D1-D3
+    # lines are left unconfigured (relying on the module's own
+    # pull-ups), matching the existing RLCD-4.2 usage.
+    default y if DRAFTLING_MODEL_FREENOVE_FNK0104A
+    default y if DRAFTLING_MODEL_FREENOVE_FNK0104B
+    default y if DRAFTLING_MODEL_FREENOVE_FNK0104S
+    default y if DRAFTLING_MODEL_FREENOVE_FNK0104N
+    # Viewe UEDX24320028E-WB-A: MicroSD wired for 4-bit SD (CLK=14,
+    # CMD=17, D0..D3=16/18/15/21); Draftling uses 1-bit mode.
+    default y if DRAFTLING_MODEL_VIEWE_UEDX24320028_UEED035HV
+    # Waveshare ESP32-S3-LCD-3.16: MicroSD on SDMMC 1-bit (CLK=1,
+    # CMD=2, D0=42). CLK and CMD double as the ST7701's 3-wire SPI
+    # init bus, which display_init() releases before the SD card is
+    # mounted.
+    default y if DRAFTLING_MODEL_WAVESHARE_LCD_316
+    # Xteink X4 Pro / X4 Classic: on-board MicroSD wired to SDMMC 1-bit.
+    default y if DRAFTLING_MODEL_XTEINK_X4
+    # Waveshare ESP32-S3-ePaper-3.97: on-board MicroSD wired to SDMMC.
+    # The vendor wires a full 4-bit bus, but Draftling only uses 1-bit
+    # mode (CLK/CMD/D0); the D1-D3 lines are left unconfigured.
+    default y if DRAFTLING_MODEL_WAVESHARE_EPAPER_397
+    # M5Stack PaperMono: 4-bit wired, used in 1-bit mode. The card's
+    # supply is switched by the M5IOE1 expander (main.cpp turns it on).
+    default y if DRAFTLING_MODEL_M5STACK_PAPERMONO
+    default n
+
+# DRAFTLING_WAKEUP_GPIO is the per-board RTC-capable GPIO used as
+# the EXT0 deep-sleep wake source. Selected here so the standby
+# component does not need to test individual model ids. The matching
+# WAKEUP_GPIO_NUM macro in main/app_config.h is kept in lock-step
+# for any code that includes app_config.h directly.
+#
+# When CONFIG_DRAFTLING_STANDBY_WAKE_ON_TOUCH is set the standby code
+# arms EXT0 on CONFIG_DRAFTLING_TOUCH_INT_GPIO instead, regardless of
+# this value.
+config DRAFTLING_WAKEUP_GPIO
+    int
+    default 18 if DRAFTLING_MODEL_WAVESHARE_RLCD42
+    default 0  if DRAFTLING_MODEL_M5STACK_PAPERS3
+    default 0  if DRAFTLING_MODEL_WAVESHARE_TOUCH_LCD_349
+    default 0  if DRAFTLING_MODEL_JC3248W535
+    default 0  if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO
+    default 48 if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO_H752
+    # M5Stack Tab5 (ESP32-P4): no BOOT button is wired to an LP_IO
+    # (the only LP_IO range on the P4 is GPIO0-15), so there is no
+    # GPIO wake source available. On Tab5 standby enters real deep
+    # sleep and the only wake path is the hardware RESET button --
+    # the chip cold-boots and the editor restores from autosave.
+    # This value is set anyway for code paths that reference
+    # WAKEUP_GPIO_NUM directly but no EXT0/LP_IO arming is done on
+    # the P4 (see standby.cpp).
+    default 0  if DRAFTLING_MODEL_M5STACK_TAB5
+    default 0  if DRAFTLING_MODEL_SUNTON_8048S070
+    default 0  if DRAFTLING_MODEL_SUNTON_8048S043
+    default 0  if DRAFTLING_MODEL_WAVESHARE_TOUCH_LCD_7
+    # Waveshare ESP32-S3-LCD-3.16: BOOT button on GPIO0 (also the
+    # ST7701's SPI chip-select during display init).
+    default 0  if DRAFTLING_MODEL_WAVESHARE_LCD_316
+    # Freenove FNK0104 family: BOOT button on GPIO0 (KEY_PIN in the
+    # Freenove reference sketches).
+    default 0  if DRAFTLING_MODEL_FREENOVE_FNK0104A
+    default 0  if DRAFTLING_MODEL_FREENOVE_FNK0104B
+    default 0  if DRAFTLING_MODEL_FREENOVE_FNK0104S
+    default 0  if DRAFTLING_MODEL_FREENOVE_FNK0104N
+    default -1 if DRAFTLING_MODEL_MICROJOURNAL_REV5
+    # Viewe UEDX24320028E-WB-A: BOOT button on GPIO0 (shared with
+    # the WS2812B RGB LED data line, which Draftling leaves unused).
+    default 0  if DRAFTLING_MODEL_VIEWE_UEDX24320028_UEED035HV
+    # Xteink X4 Pro / X4 Classic: Power button on GPIO3 (active-low,
+    # RTC-capable).
+    default 3  if DRAFTLING_MODEL_XTEINK_X4
+    # Elecrow CrowPanel 5.79" E-Paper HMI: Menu button on GPIO2
+    # (active-low, RTC-capable).
+    default 2  if DRAFTLING_MODEL_ELECROW_CROWPANEL_579
+    # Waveshare ESP32-S3-ePaper-3.97: BOOT button on GPIO0.
+    default 0  if DRAFTLING_MODEL_WAVESHARE_EPAPER_397
+    # Seeed Studio reTerminal E1001: KEY0 button on GPIO3 (active-low, RTC-capable).
+    default 3  if DRAFTLING_MODEL_SEEED_RETERMINAL_E1001
+
+    # Seeed reTerminal Sticky: combined Power/AI button on GPIO4
+    # (active-low).
+    default 4  if DRAFTLING_MODEL_SEEED_RETERMINAL_STICKY
+    # M5Stack PaperMono: Button A on GPIO2 (active-low, RTC-capable).
+    default 2  if DRAFTLING_MODEL_M5STACK_PAPERMONO
+    default 0
+
+# DRAFTLING_SLEEP_BUTTON_GPIO names a second, board-specific GPIO
+# that enters deep sleep (via standby_enter_sleep()) on a
+# BTN_LONG_PRESS_MS hold, independent of DRAFTLING_WAKEUP_GPIO above.
+# It exists for boards whose deep-sleep trigger is not the BOOT/wake
+# button but a separate navigation control -- e.g. a button that is
+# already wired to a short-press action (Enter, F1, ...) in the
+# board's own key poller. The generic sleep_button_poll_cb() handler
+# in main.cpp polls this pin on its own timer, entirely independent
+# of whatever short-press handling that same pin already gets, so
+# both behaviors coexist without extra per-board C code. -1 (default)
+# disables the handler: most boards have no second sleep-trigger
+# button and rely solely on DRAFTLING_WAKEUP_GPIO /
+# DRAFTLING_HAS_POWER_LATCH for a manual sleep/power-off trigger.
+config DRAFTLING_SLEEP_BUTTON_GPIO
+    int
+    # Waveshare ESP32-S3-ePaper-3.97: the Function button (GPIO5,
+    # BTN_FUNCTION_PIN, the center press of the Up/Function/Down
+    # rocker) injects KB_KEY_ENTER on short press
+    # (ws_epaper397_nav_poll_cb); a 2 s hold enters deep sleep instead.
+    default 5  if DRAFTLING_MODEL_WAVESHARE_EPAPER_397
+    # M5Stack PaperMono: Button B (GPIO3) is Page Down on a short
+    # press (papermono_btn_poll_cb); a 2 s hold enters deep sleep.
+    default 3  if DRAFTLING_MODEL_M5STACK_PAPERMONO
+    default -1
+
+# ---- Touchscreen support ----
+#
+# DRAFTLING_TOUCHSCREEN enables an I2C touch-controller driver
+# (currently only the AXS5106L on the Guition JC3248W535) and an
+# LVGL pointer input device. When enabled, the editor accepts tap
+# (move cursor), vertical swipe (scroll), and double-tap (select
+# word) gestures; list screens (main menu, settings, file browser)
+# accept tap-to-select on rows.
+#
+# The default is on for boards that have no user buttons besides the
+# power switch (Guition JC3248W535).
+config DRAFTLING_TOUCHSCREEN
+    bool "Enable touchscreen input"
+    default y if DRAFTLING_MODEL_JC3248W535
+    default y if DRAFTLING_MODEL_M5STACK_PAPERS3
+    default y if DRAFTLING_MODEL_WAVESHARE_TOUCH_LCD_349
+    default y if DRAFTLING_MODEL_M5STACK_TAB5
+    # LilyGO T5 E-Paper S3 Pro / Pro Lite carry a GT911 capacitive
+    # touch controller on the same on-board I2C bus as epdiy's
+    # PCA9535 I/O expander + TPS65185 power-management IC. epdiy is
+    # pinned (see components/display/idf_component.yml) to a post-
+    # 2.0.0 commit that migrates its on-board I2C to driver-NG and
+    # accepts a caller-supplied i2c_master_bus_handle_t via
+    # epd_init_with_config(). main.cpp creates the bus once, hands
+    # it to the display backend (display_set_shared_i2c_bus) and
+    # to the touchscreen component (touchscreen_config_t.i2c_bus),
+    # so the two driver-NG consumers coexist on a single I2C port.
+    # Both Pro and Pro Lite physically populate the GT911 (see the
+    # H752-01 schematic and the per-board comment in app_config.h),
+    # so default touch on for both SKUs.
+    default y if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO
+    default y if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO_H752
+    # Freenove FNK0104 touch variants (FNK0104B / FNK0104S, and the
+    # FNK0104N's ST77922 built-in touch).
+    default y if DRAFTLING_MODEL_FREENOVE_FNK0104N
+    # FNK0104A has no touch controller wired and is left off.
+    default y if DRAFTLING_MODEL_FREENOVE_FNK0104B
+    default y if DRAFTLING_MODEL_FREENOVE_FNK0104S
+    default y if DRAFTLING_MODEL_XTEINK_X4_PRO
+    default y if DRAFTLING_MODEL_VIEWE_UEDX24320028_UEED035HV
+    # Waveshare ESP32-S3-Touch-LCD-7: unlike the Sunton RGB boards
+    # (touch left opt-in there because their GT911 INT is unwired, so
+    # bring-up falls back to a dual-address probe), this board wires
+    # both GT911 INT (GPIO4) and RST (via CH422G EXIO1), giving a
+    # deterministic address-select reset -- see the CH422G bring-up
+    # block in main.cpp. Default touch on to match the "Touch-LCD"
+    # naming and the reliable wiring.
+    default y if DRAFTLING_MODEL_WAVESHARE_TOUCH_LCD_7
+    # Seeed reTerminal Sticky: GT911 capacitive touch on its own,
+    # dedicated I2C bus -- the board has only two page-turn buttons
+    # plus a combined Power/confirm button, so touch is the primary
+    # way to interact with menus and dialogs without a keyboard.
+    default y if DRAFTLING_MODEL_SEEED_RETERMINAL_STICKY
+    default y if DRAFTLING_MODEL_M5STACK_PAPERMONO
+    default n
+    help
+        Enable I2C touch-controller support and an LVGL pointer
+        input device. The editor and list screens become
+        touch-navigable in addition to the keyboard. Required on
+        boards that have no user buttons.
+
+# Touch controller silicon. Each model wires a different I2C chip
+# (AXS5106L on the Guition JC3248W535, GT911 on the M5Stack
+# PaperS3). The touchscreen component carries one driver per
+# controller and dispatches at build time on these symbols.
+#
+# Both are non-prompted derived bools so the value tracks the
+# hardware-model choice automatically (no stickiness in sdkconfig).
+config DRAFTLING_TOUCH_AXS5106L
+    bool
+    depends on DRAFTLING_TOUCHSCREEN
+    default y if DRAFTLING_MODEL_JC3248W535
+    default y if DRAFTLING_MODEL_WAVESHARE_TOUCH_LCD_349
+    default n
+    help
+        Allystar AXS5106L / AXS5106. Uses a fixed 8-byte read-request
+        magic packet over I2C and returns one touch point. Default
+        I2C address 0x3B.
+
+config DRAFTLING_TOUCH_GT911
+    bool
+    depends on DRAFTLING_TOUCHSCREEN
+    default y if DRAFTLING_MODEL_M5STACK_PAPERS3
+    default y if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO
+    default y if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO_H752
+    default y if DRAFTLING_MODEL_M5STACK_TAB5
+    default y if DRAFTLING_MODEL_SUNTON_8048S070
+    default y if DRAFTLING_MODEL_SUNTON_8048S043
+    default y if DRAFTLING_MODEL_XTEINK_X4_PRO
+    default y if DRAFTLING_MODEL_WAVESHARE_TOUCH_LCD_7
+    default y if DRAFTLING_MODEL_SEEED_RETERMINAL_STICKY
+    default n
+    help
+        Goodix GT911. Register-addressed protocol: 16-bit register
+        address sent MSB-first, status byte at 0x814E, touch points
+        at 0x814F+. Default I2C address 0x5D (0x14 as backup).
+
+config DRAFTLING_TOUCH_FT6336U
+    bool
+    depends on DRAFTLING_TOUCHSCREEN
+    default y if DRAFTLING_MODEL_FREENOVE_FNK0104B
+    default y if DRAFTLING_MODEL_FREENOVE_FNK0104S
+    # M5Stack PaperMono: FT6336G (same register protocol) at 0x38.
+    default y if DRAFTLING_MODEL_M5STACK_PAPERMONO
+    # Viewe UEDX24320028E-WB-A + UEED035HV: CHSC6540-compatible touch
+    # at 0x2E, whose touch-point registers (0x02..0x06) follow the same
+    # FocalTech layout (read from 0x00, see touchscreen.cpp).
+    default y if DRAFTLING_MODEL_VIEWE_UEDX24320028_UEED035HV
+    default n
+    help
+        FocalTech FT6336U. Register-addressed protocol: 8-bit
+        register address, touch-point count at register 0x02
+        (TD_STATUS), first point's X/Y at registers 0x03/0x05 (top
+        nibble of each 16-bit value is the event/id, low 12 bits are
+        the coordinate). Default I2C address 0x38. Used by the
+        Freenove FNK0104B / FNK0104S.
+
+config DRAFTLING_TOUCH_ST77922
+    bool
+    depends on DRAFTLING_TOUCHSCREEN
+    default y if DRAFTLING_MODEL_FREENOVE_FNK0104N
+    default n
+    help
+        Touch half of the Sitronix ST77922 TDDI controller (Freenove
+        FNK0104N). I2C address 0x55, 16-bit register addresses sent
+        MSB-first: status at 0x0001 (low nibble busy after reset),
+        max touch points at 0x0009, touch info at 0x0010 (bit 3 = new
+        data), first point at 0x0014 (7 bytes: bit 7 of byte 0 =
+        touching, 14-bit X in bytes 0-1, 14-bit Y in bytes 2-3, in the
+        panel's native 320x480 portrait frame).
+
+# Touchscreen INT GPIO. The touch controller pulses this line low
+# on touch. Used by the LVGL pointer indev (the read_cb only polls
+# I2C when INT is low to avoid bus noise on every LVGL tick) and,
+# when CONFIG_DRAFTLING_STANDBY_WAKE_ON_TOUCH is set, as the EXT0
+# deep-sleep wake source. Must be RTC-capable (GPIO0-21 on the
+# ESP32-S3) for the wake-on-touch path to work.
+#
+# Non-prompted: derived from the hardware-model choice. Defaults
+# verified for: Guition JC3248W535 (GPIO3, AXS5106L), M5Stack
+# PaperS3 (GPIO48, GT911).
+config DRAFTLING_TOUCH_INT_GPIO
+    int
+    depends on DRAFTLING_TOUCHSCREEN
+    range -1 54
+    default 3  if DRAFTLING_MODEL_JC3248W535
+    default 48 if DRAFTLING_MODEL_M5STACK_PAPERS3
+    default 3  if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO
+    default 15 if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO_H752
+    # M5Stack Tab5: GT911 INT on GPIO23. main.cpp pre-drives this
+    # pin LOW *and* power-cycles BSP_TOUCH_EN (PI4IOE5V6408 #1, IO5)
+    # before display_init() so the GT911 actually re-runs its
+    # internal POR with INT low and latches its backup I2C address
+    # 0x14 (the BSP only ever probes 0x14; a hardware 3V3 pull-up
+    # on INT would otherwise force the primary 0x5D path which the
+    # board does not route). The power-cycle is what makes this
+    # work across warm reboots, where TOUCH_EN was already high
+    # from the previous boot and the GT911 had already latched
+    # 0x5D before we got control.
+    # ESP32-P4 GPIO23 is not LP_IO so EXT0/EXT1/LP_IO deep-sleep wake
+    # on this pin is unavailable: standby on Tab5 therefore enters
+    # real deep sleep with NO GPIO wake source and the only wake
+    # path is the hardware RESET button (cold boot, autosave is
+    # restored). DRAFTLING_STANDBY_WAKE_ON_TOUCH must NOT be set
+    # on Tab5 -- it would try to arm EXT0 on a non-LP_IO pin.
+    default 23 if DRAFTLING_MODEL_M5STACK_TAB5
+    # Waveshare ESP32-S3-Touch-LCD-7: GT911 INT on GPIO4. main.cpp
+    # pre-drives this pin LOW as a push-pull output while pulsing the
+    # CH422G-based touch reset line (EXIO1) so the GT911 latches its
+    # primary I2C address 0x5D, then releases INT back to input
+    # before touchscreen_init() runs (same address-select technique
+    # used on the M5Stack Tab5, minus the TOUCH_EN power-cycle since
+    # this board's GT911 does have a dedicated reset line).
+    default 4  if DRAFTLING_MODEL_WAVESHARE_TOUCH_LCD_7
+    # Freenove FNK0104B / FNK0104S: FT6336U INT_N_PIN.
+    default 17 if DRAFTLING_MODEL_FREENOVE_FNK0104B
+    default 17 if DRAFTLING_MODEL_FREENOVE_FNK0104S
+    # Freenove FNK0104N: ST77922 TP_INT.
+    default 47 if DRAFTLING_MODEL_FREENOVE_FNK0104N
+    # Viewe UEDX24320028E-WB-A: CHSC6540 INT.
+    default 4  if DRAFTLING_MODEL_VIEWE_UEDX24320028_UEED035HV
+    # Xteink X4 Pro: GT911 INT.
+    default 10 if DRAFTLING_MODEL_XTEINK_X4_PRO
+    # Seeed reTerminal Sticky: GT911 INT.
+    default 21 if DRAFTLING_MODEL_SEEED_RETERMINAL_STICKY
+    # M5Stack PaperMono: FT6336G INT on GPIO4. Its reset line is on
+    # the M5IOE1 expander, pulsed from main.cpp.
+    default 4  if DRAFTLING_MODEL_M5STACK_PAPERMONO
+    default -1
+
+# Touchscreen reset GPIO. The reset line is often tied to the LCD
+# reset on combo touch+LCD boards; set to -1 to skip a software
+# reset pulse during touchscreen_init.
+#
+# Non-prompted: derived from the hardware-model choice. On all
+# currently-supported touch boards RST is tied to the LCD reset
+# or a fixed pull-up, so the default is -1.
+config DRAFTLING_TOUCH_RST_GPIO
+    int
+    depends on DRAFTLING_TOUCHSCREEN
+    range -1 54
+    default 9  if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO
+    default 41 if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO_H752
+    default 38 if DRAFTLING_MODEL_SUNTON_8048S070
+    default 38 if DRAFTLING_MODEL_SUNTON_8048S043
+    # Freenove FNK0104B / FNK0104S: FT6336U RST_N_PIN.
+    default 18 if DRAFTLING_MODEL_FREENOVE_FNK0104B
+    default 18 if DRAFTLING_MODEL_FREENOVE_FNK0104S
+    # Freenove FNK0104N: ST77922 TP_RESXP (touch reset only; the
+    # display half is reset through CHIP_PU).
+    default 48 if DRAFTLING_MODEL_FREENOVE_FNK0104N
+    # Viewe UEDX24320028E-WB-A: CHSC6540 RST.
+    default 2  if DRAFTLING_MODEL_VIEWE_UEDX24320028_UEED035HV
+    # Xteink X4 Pro: GT911 RST.
+    default 4  if DRAFTLING_MODEL_XTEINK_X4_PRO
+    # Seeed reTerminal Sticky: GT911 RST.
+    default 41 if DRAFTLING_MODEL_SEEED_RETERMINAL_STICKY
+    default -1
+
+
+config DRAFTLING_TOUCH_DEBUG_LOG
+    bool "Log every raw/logical touch coordinate (verbose)"
+    depends on DRAFTLING_TOUCHSCREEN
+    default n
+    help
+        Emit an INFO-level log line on every successful touch poll
+        with the raw native coordinates from the controller and
+        the logical (post-transform) coordinates handed to LVGL.
+
+        Useful when bringing up a new touch panel to dial in
+        TOUCH_SWAP_XY / TOUCH_MIRROR_X / TOUCH_MIRROR_Y in
+        app_config.h. Spammy during normal use, so leave off in
+        production builds.
+
+# ---- Standby behavior ----
+#
+# By default the standby manager enters real ESP32 deep sleep on
+# inactivity (or on "no keyboard within N seconds"). On boards with
+# no buttons that can wake the chip, two alternative paths are
+# available:
+#
+#   * DRAFTLING_STANDBY_DISPLAY_OFF -- keep the MCU running but blank
+#     the display (clear framebuffer + backlight off + DISPOFF + SLPIN
+#     on backends that support it). Wakes on any LVGL input event.
+#
+#   * DRAFTLING_STANDBY_WAKE_ON_TOUCH -- on deep sleep, arm EXT0 on
+#     the touch INT pin instead of the BOOT button. Lets a touch wake
+#     the device from real deep sleep. Requires DRAFTLING_TOUCHSCREEN
+#     and a touch INT pin on an RTC-capable GPIO (GPIO0-21).
+#
+# When both are set the WAKE_ON_TOUCH path is preferred (it draws
+# less power than keeping the MCU running). When neither is set the
+# behavior is the existing BOOT-button EXT0 wake.
+#
+# On the Guition JC3248W535 (no user buttons) we default to deep
+# sleep + wake-on-touch.
+config DRAFTLING_STANDBY_DISPLAY_OFF
+    bool "Standby: turn display off (keep MCU running) instead of deep sleep"
+    default n
+    help
+        On standby, blank the display and put the panel into its
+        low-power sleep mode instead of deep-sleeping the MCU.
+        Any LVGL input event (touch, BLE keyboard) wakes the
+        display.
+
+        Use this on boards with no RTC-capable wake source (no
+        BOOT button on an RTC GPIO and no touch INT on an RTC
+        GPIO). It draws more power than deep sleep -- prefer
+        DRAFTLING_STANDBY_WAKE_ON_TOUCH if you have a touch
+        controller wired to an RTC GPIO.
+
+config DRAFTLING_STANDBY_WAKE_ON_TOUCH
+    bool "Standby: wake from deep sleep on touchscreen tap"
+    depends on DRAFTLING_TOUCHSCREEN
+    default y if DRAFTLING_MODEL_JC3248W535
+    default n
+    help
+        On standby, enter real deep sleep and arm EXT0 on the
+        touch INT line so any tap wakes the device. Requires
+        DRAFTLING_TOUCH_INT_GPIO to be on an RTC-capable GPIO
+        (0-21 on ESP32-S3).
+
+        When this is set the touch INT pin overrides
+        DRAFTLING_WAKEUP_GPIO as the deep-sleep wake source.
+
+config DRAFTLING_DISPLAY_WIDTH
+    int
+    range 64 2048
+    default 400 if DRAFTLING_MODEL_WAVESHARE_RLCD42
+    default 960 if DRAFTLING_MODEL_M5STACK_PAPERS3
+    default 960 if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO
+    default 960 if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO_H752
+    default 640 if DRAFTLING_MODEL_WAVESHARE_TOUCH_LCD_349
+    default 480 if DRAFTLING_MODEL_JC3248W535
+    default 720 if DRAFTLING_MODEL_M5STACK_TAB5
+    default 800 if DRAFTLING_MODEL_SUNTON_8048S070
+    default 800 if DRAFTLING_MODEL_SUNTON_8048S043
+    default 800 if DRAFTLING_MODEL_WAVESHARE_TOUCH_LCD_7
+    # Waveshare ESP32-S3-LCD-3.16: native 320x820 portrait panel; the
+    # 270-degree base rotation (DRAFTLING_DISPLAY_ROTATE) renders the
+    # editor landscape at 820x320.
+    default 320 if DRAFTLING_MODEL_WAVESHARE_LCD_316
+    # Freenove FNK0104 family: native panel is portrait (240x320 on
+    # the 2.8" ILI9341 boards, 320x480 on the 4.0" board); the
+    # display backend rotates 90 deg so the editor renders landscape.
+    default 320 if DRAFTLING_MODEL_FREENOVE_FNK0104A
+    default 320 if DRAFTLING_MODEL_FREENOVE_FNK0104B
+    default 480 if DRAFTLING_MODEL_FREENOVE_FNK0104S
+    # Freenove FNK0104N: native 320x480 portrait panel; the
+    # 90-degree base rotation (DRAFTLING_DISPLAY_ROTATE) renders the
+    # editor landscape at 480x320.
+    default 320 if DRAFTLING_MODEL_FREENOVE_FNK0104N
+    default 320 if DRAFTLING_MODEL_MICROJOURNAL_REV5
+    # Viewe UEDX24320028E-WB-A + UEED035HV: 320x480 portrait panel,
+    # rendered landscape by the display backend (MADCTL MV).
+    default 480 if DRAFTLING_MODEL_VIEWE_UEDX24320028_UEED035HV
+    default 800 if DRAFTLING_MODEL_XTEINK_X4
+    default 792 if DRAFTLING_MODEL_ELECROW_CROWPANEL_579
+    default 800 if DRAFTLING_MODEL_WAVESHARE_EPAPER_397
+    default 800 if DRAFTLING_MODEL_SEEED_RETERMINAL_E1001
+    default 800 if DRAFTLING_MODEL_SEEED_RETERMINAL_STICKY
+    default 800 if DRAFTLING_MODEL_M5STACK_PAPERMONO
+    help
+        Display width in pixels (derived). Driven by the hardware-model
+        choice. Must be a multiple of 8 for e-paper backends.
+
+config DRAFTLING_DISPLAY_HEIGHT
+    int
+    range 64 2048
+    default 300 if DRAFTLING_MODEL_WAVESHARE_RLCD42
+    default 540 if DRAFTLING_MODEL_M5STACK_PAPERS3
+    default 540 if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO
+    default 540 if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO_H752
+    default 172 if DRAFTLING_MODEL_WAVESHARE_TOUCH_LCD_349
+    default 320 if DRAFTLING_MODEL_JC3248W535
+    default 1280 if DRAFTLING_MODEL_M5STACK_TAB5
+    default 480 if DRAFTLING_MODEL_SUNTON_8048S070
+    default 480 if DRAFTLING_MODEL_SUNTON_8048S043
+    default 480 if DRAFTLING_MODEL_WAVESHARE_TOUCH_LCD_7
+    default 820 if DRAFTLING_MODEL_WAVESHARE_LCD_316
+    default 240 if DRAFTLING_MODEL_FREENOVE_FNK0104A
+    default 240 if DRAFTLING_MODEL_FREENOVE_FNK0104B
+    default 240 if DRAFTLING_MODEL_MICROJOURNAL_REV5
+    default 320 if DRAFTLING_MODEL_FREENOVE_FNK0104S
+    default 480 if DRAFTLING_MODEL_FREENOVE_FNK0104N
+    default 320 if DRAFTLING_MODEL_VIEWE_UEDX24320028_UEED035HV
+    default 480 if DRAFTLING_MODEL_XTEINK_X4
+    default 272 if DRAFTLING_MODEL_ELECROW_CROWPANEL_579
+    default 480 if DRAFTLING_MODEL_WAVESHARE_EPAPER_397
+    default 480 if DRAFTLING_MODEL_SEEED_RETERMINAL_E1001
+    default 480 if DRAFTLING_MODEL_SEEED_RETERMINAL_STICKY
+    default 480 if DRAFTLING_MODEL_M5STACK_PAPERMONO
+    help
+        Display height in pixels (derived). Driven by the hardware-model
+        choice.
+
+choice DRAFTLING_DISPLAY_ROTATE
+    prompt "Display rotation angle"
+    default DRAFTLING_DISPLAY_ROTATE_270 if DRAFTLING_MODEL_M5STACK_TAB5
+    default DRAFTLING_DISPLAY_ROTATE_270 if DRAFTLING_MODEL_WAVESHARE_LCD_316
+    default DRAFTLING_DISPLAY_ROTATE_90 if DRAFTLING_MODEL_FREENOVE_FNK0104N
+    default DRAFTLING_DISPLAY_ROTATE_0
+    help
+        Rotation angle for the display in degrees.
+
+config DRAFTLING_DISPLAY_ROTATE_0
+    bool "0 degrees (no rotation)"
+
+config DRAFTLING_DISPLAY_ROTATE_90
+    bool "90 degrees"
+
+config DRAFTLING_DISPLAY_ROTATE_180
+    bool "180 degrees"
+
+config DRAFTLING_DISPLAY_ROTATE_270
+    bool "270 degrees"
+
+endchoice
+
+config DRAFTLING_DISPLAY_ROTATE_ANGLE
+    int
+    default 0 if DRAFTLING_DISPLAY_ROTATE_0
+    default 90 if DRAFTLING_DISPLAY_ROTATE_90
+    default 180 if DRAFTLING_DISPLAY_ROTATE_180
+    default 270 if DRAFTLING_DISPLAY_ROTATE_270
+
+# Degrees added on top of DRAFTLING_DISPLAY_ROTATE_ANGLE when the user
+# picks "Portrait" in F1 -> Settings -> Display orientation (see
+# app_config.h's DISPLAY_ROTATE_EFFECTIVE). 90 turns a landscape board
+# a quarter turn clockwise; 270 turns it the other way. Non-prompted
+# derived int so the per-board value tracks the hardware-model choice.
+# The Xteink X4 Pro's enclosure reads better with portrait rotated the
+# opposite way from the default; the X4 Classic is assumed to match
+# (its pocket enclosure is the same family; not verified on hardware).
+config DRAFTLING_DISPLAY_PORTRAIT_EXTRA_ROTATE
+    int
+    default 270 if DRAFTLING_MODEL_XTEINK_X4
+    default 90
+
+# DRAFTLING_DISPLAY_HIDPI -- high-density panel that renders the UI
+# 1:1 with the larger Hack font family instead of upscaling the
+# Greybeard framebuffer. Non-prompted derived bool so the per-board
+# value tracks the hardware-model choice automatically.
+#
+# On these boards the panel is dense enough that 1:1 Greybeard text
+# would be uncomfortably small, so the editor selects the Hack fonts
+# (components/fonts/hack_*.c), sized so each text row is roughly the
+# height the user saw with Greybeard rendered at the old 2x scale.
+# The display backend paints one LVGL pixel per panel pixel; there is
+# no framebuffer upscaling. Boards that leave this unset keep
+# Greybeard at the native panel resolution.
+config DRAFTLING_DISPLAY_HIDPI
+    bool
+    default y if DRAFTLING_MODEL_M5STACK_PAPERS3
+    default y if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO
+    default y if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO_H752
+    default y if DRAFTLING_MODEL_M5STACK_TAB5
+    default y if DRAFTLING_MODEL_SUNTON_8048S070
+    default y if DRAFTLING_MODEL_SUNTON_8048S043
+    default y if DRAFTLING_MODEL_XTEINK_X4
+    default y if DRAFTLING_MODEL_WAVESHARE_TOUCH_LCD_7
+    # Waveshare ESP32-S3-LCD-3.16: 320x820 on a 3.16" panel is ~280
+    # DPI, denser than any other board here.
+    default y if DRAFTLING_MODEL_WAVESHARE_LCD_316
+    # Waveshare ESP32-S3-ePaper-3.97: 800x480 on a 3.97" panel is
+    # ~235 DPI, even denser than the Xteink X4 Pro's 800x480 on 4.26"
+    # (~219 DPI) above -- use the same Hack-font HIDPI path.
+    default y if DRAFTLING_MODEL_WAVESHARE_EPAPER_397
+    default y if DRAFTLING_MODEL_SEEED_RETERMINAL_E1001
+
+    # Seeed reTerminal Sticky: same 3.97" 800x480 panel class as the
+    # Waveshare ESP32-S3-ePaper-3.97 above (~235 DPI).
+    default y if DRAFTLING_MODEL_SEEED_RETERMINAL_STICKY
+    default y if DRAFTLING_MODEL_M5STACK_PAPERMONO
+    default n
+config DRAFTLING_EPD_FULL_REFRESH_INTERVAL
+    int "E-paper full-refresh interval (partial updates between full refreshes)"
+    depends on DRAFTLING_DISPLAY_EPD
+    range 1 1000
+    default 30
+    help
+        How many partial refreshes the e-paper driver performs before it
+        forces a full refresh to clear residual ghosting. Lower values
+        give cleaner pixels at the cost of more frequent slow (3-5 s)
+        full refreshes; higher values keep the UI snappy but let
+        ghosting accumulate. The default of 30 is a reasonable balance
+        for a Markdown editor; the M5Stack PaperS3 backend uses the
+        single-pulse epd_fast waveform for partial refreshes, which is
+        faster than the older two-pass epd_text but accumulates
+        ghosting slightly more quickly.
+
+config DRAFTLING_EPD_BLACK_BACKGROUND
+    bool "Black background (white text on black)"
+    depends on DRAFTLING_DISPLAY_EPD
+    default n
+    help
+        When enabled, the editor renders white text on a black
+        background instead of the default black text on a white
+        background. Applies to the editor, file browser, menu, settings
+        and all overlay dialogs. Selection and active-row highlights
+        are inverted accordingly (they become black-on-white).
+
+        Available only on e-paper boards. The screen is still wiped to
+        white before deep sleep regardless of this setting, so the
+        panel is left in a clean state while the MCU is asleep.
+
+config DRAFTLING_NO_KEYBOARD_SLEEP_SEC
+    int "Deep-sleep timeout when no keyboard connects (s)"
+    range 0 3600
+    default 0 if DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO_H752
+    default 180
+    help
+        If no Bluetooth keyboard connects within this many seconds
+        after boot, the device enters deep sleep to conserve battery.
+        Useful when the device is powered on accidentally or the
+        previously-paired keyboard is unavailable.
+
+        Set to 0 to disable -- the device will then keep scanning
+        indefinitely. The countdown is cancelled the first time a
+        keyboard connects; after that the regular inactivity timeout
+        (settable from the editor's F1 menu and persisted in NVS)
+        takes over.
+
+        Default is 180 seconds (3 minutes).
+
+
+endmenu

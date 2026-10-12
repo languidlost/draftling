@@ -1,0 +1,3346 @@
+#include <cstdio>
+#include <cinttypes>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <esp_log.h>
+#include <esp_system.h>
+#include <esp_timer.h>
+#include <nvs_flash.h>
+#include <nvs.h>
+#include <driver/spi_common.h>
+#include <driver/spi_master.h>
+#include <driver/gpio.h>
+#include <driver/rtc_io.h>
+#include <driver/uart.h>
+#include <esp_sleep.h>
+#include <driver/rmt_tx.h>
+#if defined(CONFIG_DRAFTLING_DISPLAY_EPDIY) || defined(CONFIG_DRAFTLING_DISPLAY_H752_EPD) || \
+    defined(CONFIG_DRAFTLING_DISPLAY_XTEINK_EPD) || defined(CONFIG_DRAFTLING_HAS_CH422G) || \
+    defined(CONFIG_DRAFTLING_DISPLAY_WS_EPD397) || \
+    defined(CONFIG_DRAFTLING_MODEL_SEEED_RETERMINAL_STICKY) || \
+    defined(CONFIG_DRAFTLING_DISPLAY_M5_PAPERMONO) || \
+    defined(CONFIG_DRAFTLING_MODEL_WAVESHARE_LCD_316)
+#include <driver/i2c_master.h>
+#endif
+#if defined(CONFIG_DRAFTLING_DISPLAY_MIPI_DSI)
+#include "bsp/m5stack_tab5.h"
+#endif
+#include "sdkconfig.h"
+
+#if defined(CONFIG_ESP_HOSTED_ENABLED)
+#include "esp_hosted.h"
+#include "esp_hosted_event.h"
+#include "esp_event.h"
+#include <freertos/event_groups.h>
+#endif
+
+#include "app_config.h"
+#include "display.h"
+#include "lvgl_port.h"
+#include "sd_card.h"
+#include "ble_keyboard.h"
+#include "editor.h"
+#include "editor_ui.h"
+#include "wifi_manager.h"
+#include "git_sync.h"
+#include "standby.h"
+#include "battery.h"
+#include "touchscreen.h"
+#include "power.h"
+#include "io_expander_ch422g.h"
+#include "io_expander_m5ioe1.h"
+#if defined(CONFIG_DRAFTLING_HAS_USB_HOST)
+#include "usb_kbd.h"
+#endif
+#if defined(CONFIG_DRAFTLING_HAS_TAB5_KBD)
+#include "tab5_kbd.h"
+#endif
+#if defined(CONFIG_DRAFTLING_HAS_USB_MSC)
+#include "usb_msc.h"
+#endif
+
+static const char *TAG = "Draftling";
+
+#if defined(CONFIG_DRAFTLING_DEBUG_POWER) || \
+    defined(CONFIG_DRAFTLING_CHARGER_WATCHDOG_REASSERT)
+/* esp_timer handle for the periodic charger maintenance task. Created
+ * once after battery_init_bq25896() succeeds; runs every 30 s and
+ * does two things:
+ *
+ *   - Always re-asserts the safety-critical BQ25896 registers
+ *     (ICO_EN=0 in REG02, WATCHDOG=00 in REG07) when
+ *     CONFIG_DRAFTLING_CHARGER_WATCHDOG_REASSERT is set. Idempotent
+ *     and cheap (two I2C RMW + write transactions). Catches the
+ *     edge case where a one-off bus glitch or a missed write at
+ *     boot would otherwise leave the charger in its 500 mA USB-SDP
+ *     default until reboot.
+ *
+ *   - When CONFIG_DRAFTLING_DEBUG_POWER is also set AND the chip
+ *     currently sees VBUS, logs the full diagnostic register set
+ *     (REG00 / REG0B / REG0C / REG0E / REG0F / REG10 / REG11 /
+ *     REG12 / REG13). This is enough to localise a slow-charge
+ *     regression to a specific status bit (THERM_STAT, VDPM_STAT,
+ *     NTC_FAULT, IDPM_STAT, etc.) without a bench meter.
+ */
+static esp_timer_handle_t s_charger_maint_timer = NULL;
+
+/* 30 s cadence for the BQ25896 maintenance / debug timer: short
+ * enough to recover from a 40 s POR I2C watchdog timeout before it
+ * reverts our register writes, long enough that the periodic I2C
+ * traffic is negligible. */
+#define CHARGER_MAINT_PERIOD_US ((uint64_t)30 * 1000 * 1000)
+
+static void charger_maint_cb(void *arg)
+{
+    (void)arg;
+#if defined(CONFIG_DRAFTLING_CHARGER_WATCHDOG_REASSERT)
+    battery_bq25896_reassert_config();
+#endif
+#if defined(CONFIG_DRAFTLING_DEBUG_POWER)
+    /* Only dump status while charging is plausible. Avoids spamming
+     * the log every 30 s when the device is running on battery and
+     * there is no useful charger telemetry to report. */
+    if (battery_bq25896_vbus_present() == 1) {
+        battery_bq25896_dump_status();
+    }
+#endif
+}
+
+static void charger_maint_start(void)
+{
+    if (s_charger_maint_timer) return;
+    esp_timer_create_args_t args = {};
+    args.callback = charger_maint_cb;
+    args.name     = "charger_maint";
+    if (esp_timer_create(&args, &s_charger_maint_timer) != ESP_OK) {
+        ESP_LOGW(TAG, "charger_maint: esp_timer_create failed");
+        s_charger_maint_timer = NULL;
+        return;
+    }
+    /* 30 s cadence: see CHARGER_MAINT_PERIOD_US comment above. */
+    if (esp_timer_start_periodic(s_charger_maint_timer,
+                                 CHARGER_MAINT_PERIOD_US) != ESP_OK) {
+        ESP_LOGW(TAG, "charger_maint: esp_timer_start_periodic failed");
+    }
+}
+#endif /* DEBUG_POWER || CHARGER_WATCHDOG_REASSERT */
+
+#if defined(CONFIG_DRAFTLING_DEBUG_POWER)
+/* NVS keys for the deep-sleep drain estimator. Written by
+ * pre_sleep_t5_deinit on the way into deep sleep; read back here on
+ * the next cold boot to compute "uA average" across the sleep
+ * interval. esp_sleep_get_wakeup_cause() distinguishes wake-from-
+ * deep-sleep (we have a meaningful delta) from a real cold boot
+ * (we don't -- the SOC drop, if any, came from active use, not
+ * sleep). The wall-clock anchor is uptime since wake; combined with
+ * the BQ27220's reported SOC step it is enough for a rough but
+ * useful "device drew X uA average for Y minutes" estimate. */
+static void log_boot_power_telemetry(void)
+{
+    int mv  = battery_read_mv();
+    int soc = battery_read_percent();
+    int cur = battery_read_current_ma();
+    ESP_LOGI(TAG, "Boot telemetry: %dmV %d%% %dmA (signed: +charge / -load)",
+             mv, soc, cur);
+
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    if (cause == ESP_SLEEP_WAKEUP_UNDEFINED) {
+        /* Power-on / RESET / brown-out: no prior sleep entry to
+         * compare against, so the persisted entry SOC is stale. */
+        return;
+    }
+
+    nvs_handle_t h;
+    if (nvs_open("draftling_pwr", NVS_READONLY, &h) != ESP_OK) return;
+    uint8_t entry_soc = 0xFF;
+    int32_t entry_mv  = 0;
+    int32_t entry_cur = 0;
+    esp_err_t e1 = nvs_get_u8(h,  "entry_soc",  &entry_soc);
+    (void)nvs_get_i32(h, "entry_mv",   &entry_mv);
+    (void)nvs_get_i32(h, "entry_curr", &entry_cur);
+    nvs_close(h);
+    if (e1 != ESP_OK || entry_soc > 100 || soc < 0) return;
+
+    int delta_soc = (int)entry_soc - soc;
+    /* esp_sleep_get_wakeup_cause is set on the wake that just
+     * happened; uptime since wake is a good proxy for "time spent
+     * post-wake" but the *sleep duration* is what we actually want.
+     * ESP-IDF exposes that only on targets with RTC slow clock
+     * retention; with RTC_SLOW_MEM powered off (our pre-sleep
+     * hook) it is unavailable. As a fallback we report the SOC
+     * delta and let the operator divide by their observed wall
+     * clock. Without a wall-clock the uA estimate is meaningless,
+     * so we skip it. */
+    ESP_LOGI(TAG,
+        "Sleep delta vs persisted entry: dSOC=%d%% (entry %u%% @ %ldmV, %ldmA) "
+        "-> woke at %d%% @ %dmV, %dmA",
+        delta_soc,
+        (unsigned)entry_soc, (long)entry_mv, (long)entry_cur,
+        soc, mv, cur);
+}
+#endif /* CONFIG_DRAFTLING_DEBUG_POWER */
+
+/* Save one open document (called for every in-use doc via
+ * editor_doc_foreach) before deep sleep. Persists the body if it has
+ * unsaved changes and a path, and always persists the cursor/scroll
+ * sidecar so reopening resumes at the last position. */
+static void pre_sleep_save_doc_cb(editor_doc_t *doc, void *ctx)
+{
+    (void)ctx;
+    if (editor_doc_is_modified(doc) && editor_doc_get_path(doc)) {
+        ESP_LOGI(TAG, "Auto-saving %s before deep sleep...",
+                 editor_doc_get_path(doc));
+        esp_err_t err = editor_doc_save(doc);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Auto-save failed: %s", esp_err_to_name(err));
+        }
+    }
+    editor_doc_save_meta(doc);
+}
+
+/* Called by standby just before entering deep sleep */
+static void pre_sleep_autosave(void)
+{
+    ESP_LOGI(TAG, "Pre-sleep: autosave + EPD wipe (generic path)");
+#if defined(CONFIG_DRAFTLING_HAS_USB_MSC)
+    /* Cleanly tell any attached USB host the volume is going away and
+     * hand the SD card back to local FatFs before the autosave below
+     * writes to it -- deep sleep is not a graceful USB disconnect, and
+     * the editor should never write to the card while usb_msc still
+     * thinks it owns it. usb_msc_set_mode() is a no-op if the mode is
+     * already Off. */
+    usb_msc_set_mode(USB_MSC_MODE_OFF);
+#endif
+    /* Persist every open document (both panes when split), not just the
+     * active one. Each callback saves the body if modified and always
+     * writes the cursor/scroll sidecar so reopening resumes in place. */
+    editor_doc_foreach(pre_sleep_save_doc_cb, NULL);
+#if defined(CONFIG_DRAFTLING_DISPLAY_EPD)
+    /* E-paper retains its image without power. Wipe the panel to a
+     * clean white frame so the user does not see the editor frozen on
+     * the display while the MCU is in deep sleep. We do this even when
+     * CONFIG_DRAFTLING_EPD_BLACK_BACKGROUND is enabled -- the panel is
+     * easier to read at a glance when blank, and a black frame held
+     * indefinitely is worse for the e-paper than a white one.
+     *
+     * Take the LVGL mutex first so this does not race with the LVGL
+     * task's flush_cb. */
+    /* Take the LVGL mutex so the wipe does not race with the LVGL
+     * task's flush_cb -- the e-paper backends have no internal lock, so
+     * a concurrent display_full_refresh() here and a flush_cb push from
+     * the LVGL task corrupt the panel's SPI transaction / dirty-rect
+     * state (symptom: the device appears to hang instead of sleeping).
+     * The mutex is recursive (draftling_lvgl_port_init), so this also
+     * works when pre_sleep_autosave runs inside the LVGL task itself
+     * (the "Sleep now" menu path). Wait generously: a single flush is
+     * at most a full-screen e-paper refresh (~2 s), and this path is
+     * followed immediately by deep sleep, so a few extra seconds cost
+     * nothing. A longer wait matters most in the rotated (portrait)
+     * flush path, which is slower than the unrotated one. Only wipe
+     * without the lock if the LVGL task is genuinely wedged. */
+    bool locked = draftling_lvgl_port_lock(5000);
+    display_clear(0xFF);
+    display_full_refresh();
+    if (locked) {
+        draftling_lvgl_port_unlock();
+    } else {
+        ESP_LOGW(TAG, "pre_sleep wipe: LVGL lock not acquired in 5 s, "
+                      "proceeded anyway");
+    }
+#endif
+}
+
+#if defined(BOARD_WS2812_PIN)
+/* Switch off an on-board WS2812 RGB LED that Draftling does not use.
+ * With its data line undriven the LED latches noise as colour data and
+ * lights up, so send it one all-zero GRB pixel (WS2812 timing through
+ * the RMT peripheral at 10 MHz: a 0 bit is 0.3 us high + 0.9 us low)
+ * and then hold the line low. The hold also keeps the LED dark
+ * through deep sleep (the display backend's
+ * display_deep_sleep_prepare() enables deep-sleep pad holds); it is
+ * released here first because it survives the wake reset. */
+static void ws2812_off(void)
+{
+    gpio_hold_dis((gpio_num_t)BOARD_WS2812_PIN);
+
+    rmt_channel_handle_t chan = NULL;
+    rmt_tx_channel_config_t ccfg = {};
+    ccfg.gpio_num          = (gpio_num_t)BOARD_WS2812_PIN;
+    ccfg.clk_src           = RMT_CLK_SRC_DEFAULT;
+    ccfg.resolution_hz     = 10 * 1000 * 1000;
+    ccfg.mem_block_symbols = 64;
+    ccfg.trans_queue_depth = 1;
+    rmt_encoder_handle_t enc = NULL;
+    rmt_bytes_encoder_config_t ecfg = {};
+    ecfg.bit0.level0 = 1; ecfg.bit0.duration0 = 3;
+    ecfg.bit0.level1 = 0; ecfg.bit0.duration1 = 9;
+    ecfg.bit1.level0 = 1; ecfg.bit1.duration0 = 9;
+    ecfg.bit1.level1 = 0; ecfg.bit1.duration1 = 3;
+    ecfg.flags.msb_first = 1;
+
+    if (rmt_new_tx_channel(&ccfg, &chan) == ESP_OK &&
+        rmt_new_bytes_encoder(&ecfg, &enc) == ESP_OK &&
+        rmt_enable(chan) == ESP_OK) {
+        static const uint8_t off[3] = { 0, 0, 0 };
+        rmt_transmit_config_t tcfg = {};
+        if (rmt_transmit(chan, enc, off, sizeof(off), &tcfg) == ESP_OK) {
+            rmt_tx_wait_all_done(chan, 100);
+        }
+        rmt_disable(chan);
+    } else {
+        ESP_LOGW(TAG, "WS2812 LED: RMT setup failed; LED left as is");
+    }
+    if (enc) rmt_del_encoder(enc);
+    if (chan) rmt_del_channel(chan);
+
+    gpio_config_t g = {};
+    g.pin_bit_mask = 1ULL << BOARD_WS2812_PIN;
+    g.mode         = GPIO_MODE_OUTPUT;
+    gpio_config(&g);
+    gpio_set_level((gpio_num_t)BOARD_WS2812_PIN, 0);
+    gpio_hold_en((gpio_num_t)BOARD_WS2812_PIN);
+}
+#endif
+
+#if defined(CONFIG_DRAFTLING_MODEL_WAVESHARE_LCD_316)
+/* Waveshare ESP32-S3-LCD-3.16: put the unused I2C chips in their
+ * lowest-power state. Both stay powered from the 3V3 rail (the RTC
+ * also from its coin cell) for as long as the board is on, including
+ * deep sleep, so this runs once per boot:
+ *
+ *   * QMI8658 IMU: comes up in "Power-On Default" with its 2 MHz
+ *     oscillator running (~50 uA). Setting CTRL1 (0x02) bit 0,
+ *     sensorDisable, enters Power-Down (~20 uA); accelerometer and
+ *     gyroscope are already off (CTRL7 = 0 at power-on). Bits 7:1 are
+ *     written with their power-on defaults (big-endian reads, 0x20).
+ *
+ *   * PCF85063AT RTC: its CLKOUT pin drives a 32.768 kHz square wave
+ *     from power-on, but is unconnected on this board. COF[2:0] = 111
+ *     in Control_2 (0x01) turns it off. The other Control_2 bits
+ *     (alarm / timer flags and enables) are written back unchanged;
+ *     time and date are not touched.
+ *
+ * The bus is created only for these writes and deleted again. A chip
+ * that does not answer is skipped. */
+static void ws_lcd316_quiet_i2c_peripherals(void)
+{
+    i2c_master_bus_handle_t bus = NULL;
+    i2c_master_bus_config_t bus_cfg = {};
+    bus_cfg.i2c_port          = -1;
+    bus_cfg.sda_io_num        = (gpio_num_t)IMU_RTC_I2C_SDA_PIN;
+    bus_cfg.scl_io_num        = (gpio_num_t)IMU_RTC_I2C_SCL_PIN;
+    bus_cfg.clk_source        = I2C_CLK_SRC_DEFAULT;
+    bus_cfg.glitch_ignore_cnt = 7;
+    bus_cfg.flags.enable_internal_pullup = true;
+    if (i2c_new_master_bus(&bus_cfg, &bus) != ESP_OK) {
+        ESP_LOGW(TAG, "IMU/RTC I2C bus init failed; left as powered up");
+        return;
+    }
+
+    i2c_device_config_t dev_cfg = {};
+    dev_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+    dev_cfg.scl_speed_hz    = 100000;
+    i2c_master_dev_handle_t dev = NULL;
+
+    dev_cfg.device_address = QMI8658_I2C_ADDR;
+    if (i2c_master_bus_add_device(bus, &dev_cfg, &dev) == ESP_OK) {
+        const uint8_t ctrl1[2] = { 0x02, 0x21 };
+        esp_err_t err = i2c_master_transmit(dev, ctrl1, sizeof(ctrl1), 50);
+        ESP_LOGI(TAG, "QMI8658 power-down: %s", esp_err_to_name(err));
+        i2c_master_bus_rm_device(dev);
+    }
+
+    dev_cfg.device_address = PCF85063_I2C_ADDR;
+    if (i2c_master_bus_add_device(bus, &dev_cfg, &dev) == ESP_OK) {
+        uint8_t reg = 0x01, ctrl2 = 0;
+        esp_err_t err = i2c_master_transmit_receive(dev, &reg, 1, &ctrl2, 1, 50);
+        if (err == ESP_OK && (ctrl2 & 0x07) != 0x07) {
+            const uint8_t w[2] = { 0x01, (uint8_t)(ctrl2 | 0x07) };
+            err = i2c_master_transmit(dev, w, sizeof(w), 50);
+        }
+        ESP_LOGI(TAG, "PCF85063 CLKOUT off: %s", esp_err_to_name(err));
+        i2c_master_bus_rm_device(dev);
+    }
+
+    i2c_del_master_bus(bus);
+}
+#endif
+
+#if defined(CONFIG_DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO) || \
+    defined(CONFIG_DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO_H752)
+/* LilyGO T5 E-Paper S3 Pro / Pro Lite: deep-sleep current budget.
+ *
+ * Without this hook the board pulls ~30 mA in deep sleep (a 1500 mAh
+ * NP-F battery dies in ~2 days). Target after this hook is < 100 uA,
+ * giving > 2 weeks idle. Each step plugs one peripheral:
+ *
+ *   Peripheral             Sleep state we drive it to            Source
+ *   --------------------   ----------------------------------    ----------
+ *   GT911 touch ctrlr      cmd 0x05 -> "sleep" (~8 uA)           GT911 DS sec.6
+ *   SX1262 LoRa (Pro)      SetSleep(0x00) (~600 nA cold)         SX126x DS sec.13.1.7
+ *   SD card (SPI)          SPI3 bus freed; card to standby        sd_card_deinit()
+ *   EPDIY (TPS65185+exp)   epd_poweroff() -> WAKEUP low (<1 uA)   epdiy README
+ *   Front-light LED (G11)  driven LOW + RTC IO hold                display_deep_sleep_prepare()
+ *   ESP32-S3 RTC_PERIPH    powered down                            esp_sleep_pd_config()
+ *
+ * The display + touch deinit must happen with the I2C bus still
+ * alive, so the sequence is:
+ *   touchscreen_sleep()              (uses I2C)
+ *   display_deep_sleep_prepare()     (uses I2C, then tears it down)
+ *   sd_card_deinit()                 (releases SPI3)
+ *   SX1262 SetSleep over SPI3        (must run BEFORE spi_bus_free,
+ *                                     but sd_card_deinit closes the
+ *                                     bus, so we do LoRa first)
+ *   esp_sleep_pd_config(RTC_PERIPH)  (final hint to PMU)
+ *   gpio_deep_sleep_hold_en()        (latch all gpio_hold_en pads)
+ *
+ * `standby_enter_sleep()` does the actual `esp_deep_sleep_start()`
+ * after this callback returns.
+ */
+
+/* SX1262 SetSleep opcode (sx126x datasheet sec.13.1.7). We issue a
+ * cold-start sleep (no register retention -- we don't have any
+ * persistent radio state to keep). 1-byte opcode + 1-byte param.
+ *
+ * Before issuing SetSleep we read a GetStatus byte. If the chip is
+ * depopulated (Lite variant) the MISO line will read 0xFF or 0x00
+ * idle and we skip the sleep write; on the Pro variant a healthy
+ * SX1262 returns a non-trivial status byte and we proceed. This
+ * prevents two failure modes:
+ *   - on Lite, a stale "SX1262 entered sleep" log when no radio
+ *     actually responded;
+ *   - on Pro, a SetSleep being NAK'd because the radio is mid-FSK
+ *     RX after a stray init -- a state we cannot recover from
+ *     blind. */
+static void t5_lora_sleep(void)
+{
+#if defined(BOARD_LORA_CS_PIN) && (BOARD_LORA_CS_PIN >= 0)
+    /* The SX1262 sits on SPI3 (shared with the SD card). Talk to it
+     * directly via spi_bus_add_device using the LoRa CS, then remove
+     * the device when done. Failure is non-fatal -- the radio chip
+     * is depopulated on the Lite variant, so a NACK / no-response is
+     * the expected outcome there. */
+    spi_device_handle_t lora = NULL;
+    spi_device_interface_config_t devcfg = {};
+    devcfg.clock_speed_hz = 1 * 1000 * 1000;  /* 1 MHz is safe for SetSleep */
+    devcfg.mode           = 0;
+    devcfg.spics_io_num   = BOARD_LORA_CS_PIN;
+    devcfg.queue_size     = 1;
+    esp_err_t err = spi_bus_add_device(SPI3_HOST, &devcfg, &lora);
+    if (err != ESP_OK) {
+        ESP_LOGD(TAG, "SX1262 spi_bus_add_device failed: %s",
+                 esp_err_to_name(err));
+        goto repark_cs;
+    }
+
+    /* GetStatus (opcode 0xC0) returns the chip mode + command status
+     * in the byte clocked back as we send a 0x00 dummy. SX1262
+     * datasheet sec. 13.5.1: bits[6:4] = ChipMode (1..6 == valid;
+     * 0/7 == invalid/reserved). On a depopulated bus we'll read 0x00
+     * or 0xFF here -- both invalid -- and bail out without spamming
+     * the log. */
+    {
+        uint8_t gs_tx[2] = { 0xC0, 0x00 };
+        uint8_t gs_rx[2] = { 0xFF, 0xFF };
+        spi_transaction_t gs = {};
+        gs.length    = sizeof(gs_tx) * 8;
+        gs.tx_buffer = gs_tx;
+        gs.rx_buffer = gs_rx;
+        err = spi_device_polling_transmit(lora, &gs);
+        if (err != ESP_OK) {
+            ESP_LOGD(TAG, "SX1262 GetStatus transmit failed: %s",
+                     esp_err_to_name(err));
+            goto remove_device;
+        }
+        uint8_t chip_mode = (gs_rx[1] >> 4) & 0x07;
+        if (chip_mode == 0 || chip_mode == 7) {
+            ESP_LOGD(TAG, "SX1262 GetStatus=0x%02X (no chip response) -- "
+                     "skipping SetSleep", gs_rx[1]);
+            goto remove_device;
+        }
+
+        uint8_t tx[2] = { 0x84 /* SetSleep */, 0x00 /* cold start */ };
+        spi_transaction_t t = {};
+        t.length    = sizeof(tx) * 8;
+        t.tx_buffer = tx;
+        err = spi_device_polling_transmit(lora, &t);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "SX1262 entered sleep mode (was ChipMode=%u)",
+                     (unsigned)chip_mode);
+        } else {
+            ESP_LOGD(TAG, "SX1262 SetSleep transmit failed: %s",
+                     esp_err_to_name(err));
+        }
+    }
+
+remove_device:
+    spi_bus_remove_device(lora);
+
+repark_cs:
+    /* spi_bus_remove_device() releases the CS GPIO back to the GPIO
+     * matrix with no defined level. If the SX1262 CS is then left
+     * floating again the radio resumes snooping on subsequent SD
+     * traffic over the shared SPI3 bus -- exactly the
+     * "LilyGO T5S3-4.7-e-paper-PRO issue #3" we work around at SD
+     * mount time. Observed symptom: SD card mounts, multi-sector
+     * data-phase probe passes, but FatFs's first cluster-chain read
+     * a few hundred ms later returns 0x107 ESP_ERR_TIMEOUT or
+     * 0x108 ESP_ERR_INVALID_RESPONSE from sdmmc_read_sectors_dma.
+     * Re-pin LoRa CS HIGH as a plain GPIO output on every exit path
+     * (including the early bail-outs above for a depopulated /
+     * unresponsive radio) so the radio stays deselected for the rest
+     * of the active session. */
+    {
+        gpio_config_t lora_cs = {};
+        lora_cs.intr_type    = GPIO_INTR_DISABLE;
+        lora_cs.mode         = GPIO_MODE_OUTPUT;
+        lora_cs.pin_bit_mask = (1ULL << BOARD_LORA_CS_PIN);
+        gpio_config(&lora_cs);
+        gpio_set_level((gpio_num_t)BOARD_LORA_CS_PIN, 1);
+    }
+#endif
+}
+
+/* MIA-M10Q GPS (Pro variant) -> UBX-RXM-PMREQ "backup" mode.
+ *
+ * The T5 E-Paper S3 Pro / Pro Lite carries the MIA-M10Q on UART2
+ * (TX=43, RX=44, default baud 38400 -- see the factory firmware
+ * peri_gps.cpp comment "Set u-blox m10q gps baudrate 38400"). The
+ * chip has *no* dedicated power-enable GPIO -- it is hard-wired to
+ * the 3V3 rail -- so the only software lever for its ~25 mA run
+ * draw is the receiver's own RXM-PMREQ command (u-blox M10 interface
+ * description, sec.3.13.6.4). In backup the chip idles at ~15 uA
+ * until a level transition on its RX pin or a hardware reset wakes
+ * it up again. Draftling never uses GPS during normal operation, so
+ * we issue PMREQ once at boot and again from pre_sleep_t5_deinit().
+ *
+ * The Lite variant has the GPS chip depopulated; we still drive
+ * the UART pins, the bytes clock into a floating line, and the
+ * gpio_reset_pin() at the end releases them. No harm done. */
+static void t5_gps_sleep(void)
+{
+#if defined(BOARD_GPS_TX_PIN) && defined(BOARD_GPS_RX_PIN) && \
+    (BOARD_GPS_TX_PIN >= 0) && (BOARD_GPS_RX_PIN >= 0)
+    /* UBX-RXM-PMREQ v0 (CLASS=0x02, ID=0x41, len=8):
+     *   duration[4] = 0   (infinite)
+     *   flags[4]    = 0x06 (bit1=backup, bit2=force)
+     * Checksum is 8-bit Fletcher over class..payload (sec.3.4 of
+     * the M10 interface description). Pre-computed and frozen here
+     * so we don't have to drag a checksum helper into main.cpp. */
+    static const uint8_t kPmreqBackup[] = {
+        0xB5, 0x62,                         /* sync chars                  */
+        0x02, 0x41,                         /* class=RXM, id=PMREQ         */
+        0x08, 0x00,                         /* payload length = 8 (LE)     */
+        0x00, 0x00, 0x00, 0x00,             /* duration = 0 (infinite)     */
+        0x06, 0x00, 0x00, 0x00,             /* flags = backup | force      */
+        0x51, 0x4B                          /* CK_A, CK_B                  */
+    };
+
+    static const uart_port_t kPort = UART_NUM_1;
+    uart_config_t cfg = {};
+    cfg.baud_rate = 38400;
+    cfg.data_bits = UART_DATA_8_BITS;
+    cfg.parity    = UART_PARITY_DISABLE;
+    cfg.stop_bits = UART_STOP_BITS_1;
+    cfg.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
+    cfg.source_clk = UART_SCLK_DEFAULT;
+
+    esp_err_t err = uart_driver_install(kPort, 256, 0, 0, NULL, 0);
+    bool installed_here = (err == ESP_OK);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGD(TAG, "GPS UART install failed: %s", esp_err_to_name(err));
+        return;
+    }
+    (void)uart_param_config(kPort, &cfg);
+    (void)uart_set_pin(kPort, BOARD_GPS_TX_PIN, BOARD_GPS_RX_PIN,
+                       UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+
+    int n = uart_write_bytes(kPort, (const char *)kPmreqBackup,
+                             sizeof(kPmreqBackup));
+    if (n == (int)sizeof(kPmreqBackup)) {
+        (void)uart_wait_tx_done(kPort, pdMS_TO_TICKS(100));
+        ESP_LOGI(TAG, "MIA-M10Q GPS: sent UBX-RXM-PMREQ backup (%d bytes)", n);
+    } else {
+        ESP_LOGD(TAG, "GPS UART write returned %d", n);
+    }
+
+    if (installed_here) {
+        (void)uart_driver_delete(kPort);
+    }
+    /* Release the UART pins so they go to high-Z and don't drive
+     * against the GPS once it has entered backup. The pads are not
+     * RTC-IO (GPIO 43/44 sit outside the 0..21 RTC range) so they
+     * default to high-Z in deep sleep automatically; this just
+     * detaches the UART matrix early. */
+    gpio_reset_pin((gpio_num_t)BOARD_GPS_TX_PIN);
+    gpio_reset_pin((gpio_num_t)BOARD_GPS_RX_PIN);
+#endif
+}
+
+/* One-shot "shut every Pro-only radio up" helper, called from
+ * app_main() right after SD init (so SPI3 is available to the LoRa
+ * sleep path). Idempotent and safe to re-invoke later. */
+static void t5_disable_radios_at_boot(void)
+{
+    ESP_LOGI(TAG, "Pro: disabling SX1262 LoRa and MIA-M10Q GPS at boot");
+    t5_lora_sleep();
+    t5_gps_sleep();
+}
+
+#if defined(CONFIG_DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO)
+/* Sweep a hard-coded list of GPIOs that are not wired to any
+ * peripheral on the T5 (per the LilyGO factory schematic) and
+ * isolate them so they don't leak through floating inputs in deep
+ * sleep. We restrict the list to RTC-capable pins because
+ * rtc_gpio_isolate() is the documented low-power state for those.
+ * Non-RTC pins are released to high-Z via gpio_reset_pin -- the
+ * pad's analog input is already off in deep sleep, so a high-Z
+ * output is the lowest-leakage state available.
+ *
+ * Only the original Pro variant uses the deep-sleep path that
+ * calls into these helpers; the H752 build has its own teardown
+ * and would warn-as-unused if these were compiled in. */
+static void t5_isolate_unused_gpios(void)
+{
+    /* ESP32-S3 RTC-IO range is GPIO0..GPIO21. Skip pins that are
+     * actively used in deep sleep OR are otherwise NOT spare:
+     *   GPIO0           -- BOOT button, EXT0 wake (handled by standby.cpp)
+     *   GPIO5..GPIO10   -- EPD 8-bit parallel data bus (epd_board_v7
+     *                      pins D0..D5; released by epd_lcd_deinit()
+     *                      inside display_deep_sleep_prepare(), so
+     *                      isolating them again here is redundant and
+     *                      historically mis-described as "unused").
+     *   GPIO11          -- front-light LED, held LOW with gpio_hold_en
+     *                      (display_deep_sleep_prepare); must NOT be
+     *                      reclaimed by an isolate call.
+     *   GPIO12          -- SD CS (released by sd_card_deinit).
+     *   GPIO13          -- SD MOSI / shared SPI3 (released by sd_card_deinit).
+     *   GPIO14          -- SD SCK  / shared SPI3 (released by sd_card_deinit).
+     *   GPIO15..GPIO18  -- EPD 8-bit parallel data bus (epd_board_v7
+     *                      pins D3, D4, D5, D6; same rationale as
+     *                      GPIO5..GPIO10).
+     *   GPIO19, GPIO20  -- ESP32-S3 USB-Serial-JTAG (USB CDC console).
+     *                      Isolating these silently kills the last
+     *                      few lines of log output before
+     *                      esp_deep_sleep_start(), which makes any
+     *                      pre-sleep crash invisible to `idf.py
+     *                      monitor`. Leave them alone -- the
+     *                      USB-Serial-JTAG controller is powered
+     *                      down by the digital domain in deep sleep
+     *                      regardless.
+     *   GPIO21          -- SD MISO / shared SPI3 (released by sd_card_deinit).
+     *
+     * That leaves GPIO1, GPIO2, GPIO3, GPIO4 as the genuinely spare
+     * RTC-IO pins on this board. GPIO3 (TOUCH_INT on the T5) is
+     * normally driven by the GT911; once display_deep_sleep_prepare()
+     * has collapsed the EPD rail the GT911 is unpowered and its INT
+     * line floats, so isolating GPIO3 here is appropriate. */
+    static const int rtc_unused[] = {
+        1, 2, 3, 4
+    };
+    for (size_t i = 0; i < sizeof(rtc_unused) / sizeof(rtc_unused[0]); ++i) {
+        gpio_num_t g = (gpio_num_t)rtc_unused[i];
+        if (rtc_gpio_is_valid_gpio(g)) {
+            (void)rtc_gpio_isolate(g);
+        }
+    }
+}
+
+/* Undo, at boot, every IO state we forced into deep sleep:
+ *
+ *   * gpio_deep_sleep_hold_en() -- chip-wide latch enable. On
+ *     ESP32-S3 the per-pin hold registers survive the wake reset
+ *     and keep latched pads driven (or, for inputs, isolated)
+ *     until explicitly released. Without this, the front-light
+ *     stays dark and the touchscreen INT line never goes back to
+ *     a normal digital input.
+ *
+ *   * gpio_hold_en() on the front-light (GPIO11). Pinned LOW by
+ *     display_deep_sleep_prepare() so the LED does not glow on
+ *     leakage during sleep. Released here so display_init() ->
+ *     backlight_pwm_init() can route LEDC back to the pin.
+ *
+ *   * rtc_gpio_isolate() on the spare RTC-IO pads (GPIO1..GPIO4)
+ *     from t5_isolate_unused_gpios(). Isolation switches the pad
+ *     to the RTC GPIO mux with both input and output buffers
+ *     disabled, *and engages an RTC-domain pad hold* via
+ *     rtc_gpio_hold_en(). That selection AND the hold survive the
+ *     wake reset on ESP32-S3. The chip-wide gpio_deep_sleep_hold_dis()
+ *     above only releases *digital* pad holds (the ones armed by
+ *     gpio_hold_en()), and rtc_gpio_deinit() only flips the IO
+ *     mux back to the digital matrix -- neither of them clears the
+ *     RTC hold register. So we have to call rtc_gpio_hold_dis()
+ *     explicitly first, before rtc_gpio_deinit(), or the pad stays
+ *     clamped at its isolated level. GPIO3 (the GT911 TOUCH_INT)
+ *     in particular has to come back to a normal digital input
+ *     before touchscreen_init() configures it as an input with
+ *     pull-up, otherwise the INT line never reads a valid level
+ *     and the touchscreen appears dead after wake even though the
+ *     I2C side of the controller responds.
+ *
+ * Safe to call unconditionally on every boot: gpio_hold_dis /
+ * rtc_gpio_hold_dis on a pad that was never latched is a no-op,
+ * and rtc_gpio_deinit on a pad already in the digital mux just
+ * rewrites the (same) mux selection. */
+static void t5_release_held_gpios_after_wake(void)
+{
+    gpio_deep_sleep_hold_dis();
+
+    /* Front-light pin must match EPDIY_BL_PIN in display_epdiy.cpp. */
+    gpio_hold_dis((gpio_num_t)11);
+
+    static const int rtc_isolated[] = {
+        1, 2, 3, 4
+    };
+    for (size_t i = 0; i < sizeof(rtc_isolated) / sizeof(rtc_isolated[0]); ++i) {
+        gpio_num_t g = (gpio_num_t)rtc_isolated[i];
+        if (rtc_gpio_is_valid_gpio(g)) {
+            /* Release the RTC pad hold engaged by rtc_gpio_isolate()
+             * before flipping the mux back to the digital GPIO
+             * matrix; otherwise the pad stays clamped at its
+             * isolated level. */
+            (void)rtc_gpio_hold_dis(g);
+            (void)rtc_gpio_deinit(g);
+        }
+    }
+}
+#endif /* CONFIG_DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO */
+
+#if defined(CONFIG_DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO)
+static void pre_sleep_t5_deinit(void)
+{
+    ESP_LOGI(TAG, "Pre-sleep: LilyGO T5 peripheral teardown");
+    /* Run the editor autosave + EPD wipe first; that path uses the
+     * touch / display / I2C / SD subsystems while they are still up. */
+    pre_sleep_autosave();
+
+    /* GT911 touch controller -> sleep (uses the shared I2C bus).
+     * Issued before EPD power-down because the GT911 lives on the
+     * same bus that epd_deinit() will tear down. */
+    touchscreen_sleep();
+
+#if defined(CONFIG_DRAFTLING_DEBUG_POWER)
+    /* Snapshot the fuel gauge's current draw and SOC immediately
+     * before we start cutting peripherals. The next cold boot will
+     * read the persisted SOC delta and estimate average sleep draw
+     * in uA without needing a bench meter. */
+    {
+        int mv_now   = battery_read_mv();
+        int soc_now  = battery_read_percent();
+        int cur_now  = battery_read_current_ma();
+        ESP_LOGI(TAG, "Pre-sleep telemetry: %dmV %d%% %dmA (active draw)",
+                 mv_now, soc_now, cur_now);
+        if (soc_now >= 0) {
+            nvs_handle_t h;
+            if (nvs_open("draftling_pwr", NVS_READWRITE, &h) == ESP_OK) {
+                /* Persist the entry SOC and a wall-clock anchor. We
+                 * use uptime in microseconds (esp_timer_get_time)
+                 * because no RTC time-of-day is guaranteed to be
+                 * synced; on the next cold boot we can read RTC
+                 * residual time via esp_sleep_get_wakeup_cause +
+                 * gpio_dump_io_configuration, but the simplest
+                 * portable proxy is "store wall time if SNTP got us
+                 * one, else nothing". Always store SOC. */
+                (void)nvs_set_u8(h,  "entry_soc",  (uint8_t)soc_now);
+                (void)nvs_set_i32(h, "entry_curr", (int32_t)cur_now);
+                (void)nvs_set_i32(h, "entry_mv",   (int32_t)mv_now);
+                (void)nvs_commit(h);
+                nvs_close(h);
+            }
+        }
+    }
+#endif
+
+    /* SX1262 LoRa -> sleep (Pro variant only; harmless NACK on Lite). */
+    t5_lora_sleep();
+
+    /* MIA-M10Q GPS -> backup mode (Pro variant only; bytes clock into
+     * an unconnected line on Lite, which is harmless). Done before the
+     * RTC-IO isolation sweep so the UART pins are released cleanly. */
+    t5_gps_sleep();
+
+    /* If we are about to enter deep sleep on battery (no USB plugged
+     * in), put the BQ25896 charger into HIZ so it stops drawing its
+     * ~1.5 mA idle bias current from the cell. No-op when VBUS is
+     * present (user wants to keep charging through sleep) or when
+     * the chip was never initialised. Cold-boot re-init clears HIZ.
+     *
+     * Done here -- BEFORE display_deep_sleep_prepare() tears down the
+     * shared I2C bus inside epd_deinit() -- so all the I2C-attached
+     * peripherals on this board (GT911 touch, BQ27220 fuel gauge,
+     * BQ25896 charger, TPS65185 EPD PMIC, PCA9535 expander) are
+     * touched in a single linear sweep with the bus still alive. */
+    battery_bq25896_prepare_sleep();
+
+    /* Release the SD card + SPI3 bus so the card itself drops to
+     * standby and the bus pins float free. After this point any SPI3
+     * transaction (including the LoRa one above) is illegal -- which
+     * is why we do LoRa first. */
+    (void)sd_card_deinit();
+
+    /* Tear down the EPD power IC + epdiy I2C state. After this call
+     * the shared I2C bus may have been released by epd_deinit(),
+     * so any further I2C work (touchscreen, BQ27220, BQ25896) must
+     * have already happened above.
+     *
+     * We deliberately do NOT re-issue touchscreen_sleep() afterwards.
+     * The GT911's RST line is wired through the TPS65185 / PCA9535
+     * expander, so epd_poweroff() can yank reset and the controller
+     * may come back at its backup I2C address 0x14 instead of 0x5D;
+     * blindly retrying a sleep command into that state is racy.
+     * The authoritative GT911 sleep already happened above (before
+     * any EPD teardown), with the bus still in a known-good state. */
+    display_deep_sleep_prepare();
+
+    /* Isolate every unused RTC-IO pin so floating inputs don't leak. */
+    t5_isolate_unused_gpios();
+
+    /* Power down the RTC peripherals domain. We have no ULP and no
+     * RTC SLOW memory data to retain across wake (the SoC cold-boots
+     * on wake and the editor restores from autosave), so dropping
+     * this domain saves ~40 uA on ESP32-S3 over the default. The
+     * ESP32-S3 does not expose separate ESP_PD_DOMAIN_RTC_SLOW_MEM /
+     * RTC_FAST_MEM controls in current ESP-IDF -- those memories
+     * follow the RTC_PERIPH / VDD_SDIO domains automatically. */
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH,   ESP_PD_OPTION_OFF);
+
+    /* Latch every pad that called gpio_hold_en() (the front-light,
+     * specifically) so the level stays driven through deep sleep. */
+    gpio_deep_sleep_hold_en();
+}
+#endif /* CONFIG_DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO */
+
+#if defined(CONFIG_DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO_H752)
+static void pre_sleep_h752_deinit(void)
+{
+    ESP_LOGI(TAG, "Pre-sleep: LilyGO original H752 peripheral teardown");
+
+    pre_sleep_autosave();
+
+    /* H752 sleeps via esp_light_sleep_start() (GPIO48 is not an RTC
+     * IO, see standby.cpp), which freezes the CPU while the BT
+     * controller would otherwise keep scanning; stop BLE first so
+     * the controller is quiescent when the clocks gate. */
+    ble_keyboard_disable();
+    touchscreen_sleep();
+
+    t5_lora_sleep();
+    t5_gps_sleep();
+
+    battery_bq25896_prepare_sleep();
+    (void)sd_card_deinit();
+
+    display_deep_sleep_prepare();
+    gpio_deep_sleep_hold_en();
+}
+#endif /* CONFIG_DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO_H752 */
+#endif /* LilyGO T5 EPD S3 family */
+
+#if defined(CONFIG_DRAFTLING_MODEL_XTEINK_X4_PRO)
+static void pre_sleep_xteink_x4_pro_deinit(void)
+{
+    ESP_LOGI(TAG, "Pre-sleep: Xteink X4 Pro peripheral teardown");
+
+    pre_sleep_autosave();
+    touchscreen_sleep();
+    (void)sd_card_deinit();
+    display_deep_sleep_prepare();
+    gpio_deep_sleep_hold_en();
+}
+#endif /* CONFIG_DRAFTLING_MODEL_XTEINK_X4_PRO */
+
+#if defined(CONFIG_DRAFTLING_MODEL_XTEINK_X4_CLASSIC)
+static void pre_sleep_xteink_x4_classic_deinit(void)
+{
+    ESP_LOGI(TAG, "Pre-sleep: Xteink X4 Classic peripheral teardown");
+
+    /* Same as the X4 Pro teardown minus touchscreen_sleep() -- this
+     * board has no touch controller. */
+    pre_sleep_autosave();
+    (void)sd_card_deinit();
+    display_deep_sleep_prepare();
+    gpio_deep_sleep_hold_en();
+}
+#endif /* CONFIG_DRAFTLING_MODEL_XTEINK_X4_CLASSIC */
+
+#if defined(CONFIG_DRAFTLING_MODEL_ELECROW_CROWPANEL_579)
+static void pre_sleep_crowpanel_579_deinit(void)
+{
+    ESP_LOGI(TAG, "Pre-sleep: Elecrow CrowPanel 5.79in peripheral teardown");
+
+    pre_sleep_autosave();
+    (void)sd_card_deinit();
+
+    /* Cut the SD card's 3.3 V rail (IO42_TF_3.3_CTL) and latch it
+     * through deep sleep. Unlike the EPD panel rail (see
+     * display_deep_sleep_prepare() in display_ssd1683.cpp, which is
+     * deliberately left alone), there is no bistable image to
+     * preserve here -- the card was already cleanly unmounted above,
+     * so cutting its rail is safe and saves power. */
+    gpio_set_level((gpio_num_t)SD_POWER_EN_PIN, 0);
+    gpio_hold_en((gpio_num_t)SD_POWER_EN_PIN);
+    gpio_deep_sleep_hold_en();
+
+    display_deep_sleep_prepare();
+}
+#endif /* CONFIG_DRAFTLING_MODEL_ELECROW_CROWPANEL_579 */
+
+#if defined(CONFIG_DRAFTLING_MODEL_WAVESHARE_EPAPER_397)
+static void pre_sleep_ws_epaper397_deinit(void)
+{
+    ESP_LOGI(TAG, "Pre-sleep: Waveshare ESP32-S3-ePaper-3.97 peripheral teardown");
+
+    pre_sleep_autosave();
+    /* No touchscreen on this board -- unlike
+     * pre_sleep_xteink_x4_pro_deinit(), there is no touchscreen_sleep()
+     * call here. */
+    (void)sd_card_deinit();
+    display_deep_sleep_prepare();
+    gpio_deep_sleep_hold_en();
+}
+#endif /* CONFIG_DRAFTLING_MODEL_WAVESHARE_EPAPER_397 */
+
+#if defined(CONFIG_DRAFTLING_MODEL_M5STACK_PAPERMONO)
+static void pre_sleep_papermono_deinit(void)
+{
+    ESP_LOGI(TAG, "Pre-sleep: M5Stack PaperMono peripheral teardown");
+
+    pre_sleep_autosave();
+    (void)sd_card_deinit();
+    display_deep_sleep_prepare();
+    display_set_backlight(0);
+
+    /* The M5IOE1 keeps its outputs through the ESP32's deep sleep:
+     * switch off the MicroSD, touch and e-paper supplies (the panel
+     * keeps its image unpowered) and hold both reset lines low. */
+    m5ioe1_set_pin(SD_EN_IOE_PIN, false);
+    m5ioe1_set_pin(TOUCH_EN_IOE_PIN, false);
+    m5ioe1_set_pin(TOUCH_RST_IOE_PIN, false);
+    m5ioe1_set_pin(EPD_RST_IOE_PIN, false);
+    m5ioe1_set_pin(EPD_EN_IOE_PIN, false);
+    gpio_deep_sleep_hold_en();
+}
+#endif /* CONFIG_DRAFTLING_MODEL_M5STACK_PAPERMONO */
+
+#if defined(CONFIG_DRAFTLING_MODEL_SEEED_RETERMINAL_E1001)
+static void pre_sleep_seeed_reterminal_e1001_deinit(void)
+{
+    ESP_LOGI(TAG, "Pre-sleep: Seeed reTerminal E1001 peripheral teardown");
+
+    pre_sleep_autosave();
+    (void)sd_card_deinit();
+    display_deep_sleep_prepare();
+}
+#endif /* CONFIG_DRAFTLING_MODEL_SEEED_RETERMINAL_E1001 */
+
+#if defined(CONFIG_DRAFTLING_MODEL_SEEED_RETERMINAL_STICKY)
+static void pre_sleep_reterminal_sticky_deinit(void)
+{
+    ESP_LOGI(TAG, "Pre-sleep: Seeed reTerminal Sticky peripheral teardown");
+
+    pre_sleep_autosave();
+    touchscreen_sleep();
+    (void)sd_card_deinit();
+    display_deep_sleep_prepare();
+
+    /* PWR_HOLD/PWR_LOCK (neither is RTC-capable) and CHARGE_EN must
+     * keep their currently-driven levels through the digital IOMUX
+     * power-down that deep sleep performs, or the board loses power
+     * / stops charging the instant it sleeps -- see the board header
+     * comment. gpio_deep_sleep_hold_en() below arms the holds latched
+     * here. */
+    gpio_hold_en((gpio_num_t)PWR_HOLD_PIN);
+    gpio_hold_en((gpio_num_t)PWR_LOCK_PIN);
+    gpio_hold_en((gpio_num_t)CHARGE_EN_PIN);
+    gpio_deep_sleep_hold_en();
+}
+#endif /* CONFIG_DRAFTLING_MODEL_SEEED_RETERMINAL_STICKY */
+
+/* Poll period and long-press threshold shared by the H752 side-key
+ * handler and the generic wakeup-GPIO handler below. */
+#define BTN_POLL_PERIOD_MS    30
+#define BTN_LONG_PRESS_MS     2000
+#define BTN_LONG_PRESS_TICKS  (BTN_LONG_PRESS_MS / BTN_POLL_PERIOD_MS)
+
+#if defined(CONFIG_DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO_H752)
+/* ---- H752 hardware shortcut keys ----
+ *
+ * The side key (GPIO48, also the light-sleep wake source) doubles as
+ * a Menu key during normal operation: a press injects F1 through the
+ * same editor_ui_handle_key() path the BLE/USB keyboards use, so it
+ * opens or closes the menu exactly like F1 on a keyboard. Polled at
+ * 30 ms by an esp_timer with a two-sample debounce; the synthetic
+ * event is injected as press+release in one go so the key-repeat
+ * tracker never fires a second toggle while the button is held.
+ *
+ * A 2-second hold triggers "forget all keyboards" (clears every
+ * stored BLE bond and starts a fresh scan). The short-press F1
+ * action is only injected on release, after confirming the hold
+ * was shorter than 2 s, so the two actions are mutually exclusive.
+ *
+ * The capacitive touch key below the panel (GT911 status bit 0x10,
+ * surfaced by touchscreen_set_button_callback) acts as Back: it
+ * injects Esc, which closes the menu / settings / prompts, and in
+ * the editor returns to the file browser (auto-saving, see
+ * editor_ui.cpp). */
+
+static void h752_inject_key(uint8_t keycode)
+{
+    ESP_LOGD(TAG, "H752 key inject: keycode=0x%02X", keycode);
+    kb_event_t ev = {};
+    ev.keycode = keycode;
+    ev.pressed = true;
+    editor_ui_handle_key(&ev);
+    ev.pressed = false;
+    editor_ui_handle_key(&ev);
+}
+
+static void h752_touch_button_cb(void)
+{
+    h752_inject_key(KB_KEY_ESCAPE);
+}
+
+/* Poll period BTN_POLL_PERIOD_MS ms; BTN_LONG_PRESS_TICKS ticks = 2 s hold. */
+#define H752_LONG_PRESS_TICKS BTN_LONG_PRESS_TICKS
+
+static void h752_user_key_poll_cb(void *arg)
+{
+    (void)arg;
+    static bool down             = false;
+    static int  stable           = 0;
+    static int  hold_ticks       = 0;
+    static bool long_press_fired = false;
+
+    bool raw_down = gpio_get_level((gpio_num_t)WAKEUP_GPIO_NUM) == 0;
+
+    if (raw_down == down) {
+        /* No state change -- count hold time while button is held */
+        if (down) {
+            hold_ticks++;
+            if (!long_press_fired && hold_ticks >= H752_LONG_PRESS_TICKS) {
+                long_press_fired = true;
+                ESP_LOGI(TAG, "H752 side key: 2 s long press -- "
+                              "forgetting all keyboards (GPIO%d)",
+                         WAKEUP_GPIO_NUM);
+                ble_keyboard_forget_all();
+            }
+        }
+        stable = 0;
+        return;
+    }
+
+    if (++stable < 2) return;
+
+    stable = 0;
+    down = raw_down;
+    ESP_LOGD(TAG, "H752 side key %s (GPIO%d)",
+             down ? "PRESSED" : "released", WAKEUP_GPIO_NUM);
+
+    if (down) {
+        hold_ticks       = 0;
+        long_press_fired = false;
+    } else {
+        /* Released: inject F1 only for a short press (< 2 s). */
+        if (!long_press_fired) {
+            h752_inject_key(KB_KEY_F1);
+        }
+        hold_ticks       = 0;
+        long_press_fired = false;
+    }
+}
+
+static void h752_user_key_init(void)
+{
+    gpio_config_t g = {};
+    g.intr_type    = GPIO_INTR_DISABLE;
+    g.mode         = GPIO_MODE_INPUT;
+    g.pin_bit_mask = 1ULL << WAKEUP_GPIO_NUM;
+    g.pull_up_en   = GPIO_PULLUP_ENABLE;
+    g.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    gpio_config(&g);
+
+    esp_timer_create_args_t targs = {};
+    targs.callback = h752_user_key_poll_cb;
+    targs.name     = "h752_key";
+    esp_timer_handle_t t = NULL;
+    ESP_ERROR_CHECK(esp_timer_create(&targs, &t));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(t, (uint64_t)BTN_POLL_PERIOD_MS * 1000));
+    ESP_LOGI(TAG, "H752 side key poller started (GPIO%d, level now %d)",
+             WAKEUP_GPIO_NUM, gpio_get_level((gpio_num_t)WAKEUP_GPIO_NUM));
+}
+#endif /* CONFIG_DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO_H752 */
+
+#if defined(CONFIG_DRAFTLING_MODEL_XTEINK_X4_PRO)
+/* ---- Xteink X4 Pro Left/Right buttons ----
+ *
+ * Left and Right (active-low, RTC-capable GPIOs) scroll the editor a
+ * screen at a time by injecting Page Up / Page Down through the same
+ * editor_ui_handle_key() path the BLE/USB keyboards use -- so a page
+ * can be turned without a keyboard connected. Power (WAKEUP_GPIO_NUM)
+ * keeps using the generic wakeup_btn_init() path below unchanged
+ * (deep-sleep wake source + 2 s hold to forget BLE keyboards). */
+
+static void xteink_x4_pro_inject_key(uint8_t keycode)
+{
+    kb_event_t ev = {};
+    ev.keycode = keycode;
+    ev.pressed = true;
+    editor_ui_handle_key(&ev);
+    ev.pressed = false;
+    editor_ui_handle_key(&ev);
+}
+
+static void xteink_x4_pro_btn_poll_cb(void *arg)
+{
+    (void)arg;
+    static const struct { int pin; uint8_t keycode; } kButtons[] = {
+        { BTN_LEFT_PIN,  KB_KEY_PAGEUP },
+        { BTN_RIGHT_PIN, KB_KEY_PAGEDOWN },
+    };
+    static bool down[2]   = { false, false };
+    static int  stable[2] = { 0, 0 };
+
+    for (int i = 0; i < 2; i++) {
+        bool raw_down = gpio_get_level((gpio_num_t)kButtons[i].pin) == 0;
+        if (raw_down == down[i]) {
+            stable[i] = 0;
+            continue;
+        }
+        if (++stable[i] < 2) continue;
+        stable[i] = 0;
+        down[i] = raw_down;
+        if (!down[i]) {
+            /* Inject on release, matching the H752 side-key convention. */
+            xteink_x4_pro_inject_key(kButtons[i].keycode);
+        }
+    }
+}
+
+static void xteink_x4_pro_btn_init(void)
+{
+    gpio_config_t g = {};
+    g.intr_type    = GPIO_INTR_DISABLE;
+    g.mode         = GPIO_MODE_INPUT;
+    g.pin_bit_mask = (1ULL << BTN_LEFT_PIN) | (1ULL << BTN_RIGHT_PIN);
+    g.pull_up_en   = GPIO_PULLUP_ENABLE;
+    g.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    gpio_config(&g);
+
+    esp_timer_create_args_t targs = {};
+    targs.callback = xteink_x4_pro_btn_poll_cb;
+    targs.name     = "x4pro_btn";
+    esp_timer_handle_t t = NULL;
+    ESP_ERROR_CHECK(esp_timer_create(&targs, &t));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(t, (uint64_t)BTN_POLL_PERIOD_MS * 1000));
+    ESP_LOGI(TAG, "Xteink X4 Pro Left/Right button poller started "
+                  "(GPIO%d/GPIO%d)", BTN_LEFT_PIN, BTN_RIGHT_PIN);
+}
+#endif /* CONFIG_DRAFTLING_MODEL_XTEINK_X4_PRO */
+
+#if defined(CONFIG_DRAFTLING_MODEL_XTEINK_X4_CLASSIC)
+/* ---- Xteink X4 Classic buttons ----
+ *
+ * The X4 Classic has no touchscreen, so its eight buttons are the
+ * only way to drive the editor until a BLE keyboard pairs -- the same
+ * situation as the Elecrow CrowPanel 5.79", and handled the same way.
+ *
+ * Power (WAKEUP_GPIO_NUM, also the deep-sleep wake source) doubles as
+ * F1 on a short press (open/close the Settings menu) and forgets every
+ * stored BLE keyboard bond on a 2 s hold. The remaining six keys are
+ * injected on release as Up / Down (side keys) and Left / Right /
+ * Enter / Esc (bottom keys), giving full menu + editor navigation.
+ *
+ * Debounce: 5 consecutive BTN_POLL_PERIOD_MS samples, matching the
+ * CrowPanel -- an e-paper partial refresh's boost-converter transient
+ * can dip a weakly-pulled button line enough to read as a brief press,
+ * and a refresh follows every keystroke. */
+#define XTEINK_X4C_DEBOUNCE_SAMPLES 5
+#define XTEINK_X4C_LONG_PRESS_TICKS BTN_LONG_PRESS_TICKS
+
+static void xteink_x4_classic_inject_key(uint8_t keycode)
+{
+    kb_event_t ev = {};
+    ev.keycode = keycode;
+    ev.pressed = true;
+    editor_ui_handle_key(&ev);
+    ev.pressed = false;
+    editor_ui_handle_key(&ev);
+}
+
+static void xteink_x4_classic_power_key_poll_cb(void *arg)
+{
+    (void)arg;
+    static bool down             = false;
+    static int  stable           = 0;
+    static int  hold_ticks       = 0;
+    static bool long_press_fired = false;
+
+    bool raw_down = gpio_get_level((gpio_num_t)WAKEUP_GPIO_NUM) == 0;
+
+    if (raw_down == down) {
+        if (down) {
+            hold_ticks++;
+            if (!long_press_fired && hold_ticks >= XTEINK_X4C_LONG_PRESS_TICKS) {
+                long_press_fired = true;
+                ESP_LOGI(TAG, "X4 Classic Power button: 2 s long press -- "
+                              "forgetting all keyboards (GPIO%d)",
+                         WAKEUP_GPIO_NUM);
+                ble_keyboard_forget_all();
+            }
+        }
+        stable = 0;
+        return;
+    }
+
+    if (++stable < XTEINK_X4C_DEBOUNCE_SAMPLES) return;
+
+    stable = 0;
+    down = raw_down;
+
+    if (down) {
+        hold_ticks       = 0;
+        long_press_fired = false;
+    } else {
+        if (!long_press_fired) {
+            xteink_x4_classic_inject_key(KB_KEY_F1);
+        }
+        hold_ticks       = 0;
+        long_press_fired = false;
+    }
+}
+
+static void xteink_x4_classic_nav_poll_cb(void *arg)
+{
+    (void)arg;
+    static const struct { int pin; uint8_t keycode; } kButtons[] = {
+        { BTN_LEFT_PIN,         KB_KEY_UP },
+        { BTN_RIGHT_PIN,        KB_KEY_DOWN },
+        { BTN_BOTTOM_LEFT_PIN,  KB_KEY_LEFT },
+        { BTN_BOTTOM_RIGHT_PIN, KB_KEY_RIGHT },
+        { BTN_CONFIRM_PIN,      KB_KEY_ENTER },
+        { BTN_BACK_PIN,         KB_KEY_ESCAPE },
+    };
+    static bool down[6]   = { false, false, false, false, false, false };
+    static int  stable[6] = { 0, 0, 0, 0, 0, 0 };
+
+    for (int i = 0; i < 6; i++) {
+        bool raw_down = gpio_get_level((gpio_num_t)kButtons[i].pin) == 0;
+        if (raw_down == down[i]) {
+            stable[i] = 0;
+            continue;
+        }
+        if (++stable[i] < XTEINK_X4C_DEBOUNCE_SAMPLES) continue;
+        stable[i] = 0;
+        down[i] = raw_down;
+        if (!down[i]) {
+            xteink_x4_classic_inject_key(kButtons[i].keycode);
+        }
+    }
+}
+
+static void xteink_x4_classic_btn_init(void)
+{
+    gpio_config_t g = {};
+    g.intr_type    = GPIO_INTR_DISABLE;
+    g.mode         = GPIO_MODE_INPUT;
+    g.pin_bit_mask = (1ULL << WAKEUP_GPIO_NUM) |
+                     (1ULL << BTN_LEFT_PIN) | (1ULL << BTN_RIGHT_PIN) |
+                     (1ULL << BTN_BOTTOM_LEFT_PIN) | (1ULL << BTN_BOTTOM_RIGHT_PIN) |
+                     (1ULL << BTN_CONFIRM_PIN) | (1ULL << BTN_BACK_PIN);
+    g.pull_up_en   = GPIO_PULLUP_ENABLE;
+    g.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    gpio_config(&g);
+
+    esp_timer_create_args_t pargs = {};
+    pargs.callback = xteink_x4_classic_power_key_poll_cb;
+    pargs.name     = "x4c_power";
+    esp_timer_handle_t pt = NULL;
+    ESP_ERROR_CHECK(esp_timer_create(&pargs, &pt));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(pt, (uint64_t)BTN_POLL_PERIOD_MS * 1000));
+
+    esp_timer_create_args_t nargs = {};
+    nargs.callback = xteink_x4_classic_nav_poll_cb;
+    nargs.name     = "x4c_nav";
+    esp_timer_handle_t nt = NULL;
+    ESP_ERROR_CHECK(esp_timer_create(&nargs, &nt));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(nt, (uint64_t)BTN_POLL_PERIOD_MS * 1000));
+
+    ESP_LOGI(TAG, "Xteink X4 Classic button pollers started "
+                  "(Power=GPIO%d; Up=GPIO%d Down=GPIO%d Left=GPIO%d "
+                  "Right=GPIO%d Enter=GPIO%d Esc=GPIO%d)",
+             WAKEUP_GPIO_NUM, BTN_LEFT_PIN, BTN_RIGHT_PIN,
+             BTN_BOTTOM_LEFT_PIN, BTN_BOTTOM_RIGHT_PIN,
+             BTN_CONFIRM_PIN, BTN_BACK_PIN);
+}
+#endif /* CONFIG_DRAFTLING_MODEL_XTEINK_X4_CLASSIC */
+
+#if defined(CONFIG_DRAFTLING_MODEL_ELECROW_CROWPANEL_579)
+/* ---- CrowPanel 5.79in Menu button + Back button/dial switch ----
+ *
+ * This board has no touchscreen, so the four buttons below are the
+ * only way to drive the editor without a keyboard connected.
+ *
+ * The Menu button (GPIO2, also the deep-sleep wake source) doubles
+ * as an F1 key during normal operation, mirroring the LilyGO T5 Pro
+ * H752 side-key convention above: a short press injects F1 (open/
+ * close the Settings menu), a 2 s hold clears every stored BLE
+ * keyboard bond and starts a fresh scan. The synthetic event is
+ * injected as press+release in one go so the key-repeat tracker
+ * never fires a second toggle while the button is held.
+ *
+ * The Back button and the 3-way dial switch (Up/Down/OK -- a
+ * rocker-style navigation switch on this board, not a rotary
+ * encoder) round out full menu navigation once it is open: Back
+ * injects Esc (closes the menu / settings / prompts, and in the
+ * editor returns to the file browser), the dial's Up/Down positions
+ * inject the arrow keys, and pressing the dial (OK) injects Enter.
+ * All four are polled at 30 ms and injected on release.
+ *
+ * Debounce: field testing showed the H752-style two-sample (60 ms)
+ * debounce used elsewhere in this file is too short here -- a
+ * partial EPD refresh's current draw (the panel's high-voltage boost
+ * converter switching) can dip the logic rail enough to read as a
+ * brief button press on these lines, which only have the ESP32-S3's
+ * weak internal pull-up (~45 kohm) holding them idle. Because a
+ * refresh follows every keystroke, this shows up as spurious cursor
+ * movement or, worse, an accidental trip into the Settings menu's
+ * Keyboard Layout entry while typing. CROWPANEL_DEBOUNCE_SAMPLES
+ * requires 5 consecutive 30 ms samples (150 ms) of the new level
+ * before accepting it -- comfortably longer than the vendor's own
+ * factory-firmware debounce (100 ms, see the 5.79_key Arduino
+ * example) and any single boost-converter transient, while still
+ * well under normal human button-press duration. */
+#define CROWPANEL_DEBOUNCE_SAMPLES 5
+
+static void crowpanel_inject_key(uint8_t keycode)
+{
+    kb_event_t ev = {};
+    ev.keycode = keycode;
+    ev.pressed = true;
+    editor_ui_handle_key(&ev);
+    ev.pressed = false;
+    editor_ui_handle_key(&ev);
+}
+
+/* Poll period BTN_POLL_PERIOD_MS ms; BTN_LONG_PRESS_TICKS ticks = 2 s hold. */
+#define CROWPANEL_MENU_LONG_PRESS_TICKS BTN_LONG_PRESS_TICKS
+
+static void crowpanel_menu_key_poll_cb(void *arg)
+{
+    (void)arg;
+    static bool down             = false;
+    static int  stable           = 0;
+    static int  hold_ticks       = 0;
+    static bool long_press_fired = false;
+
+    bool raw_down = gpio_get_level((gpio_num_t)WAKEUP_GPIO_NUM) == 0;
+
+    if (raw_down == down) {
+        if (down) {
+            hold_ticks++;
+            if (!long_press_fired && hold_ticks >= CROWPANEL_MENU_LONG_PRESS_TICKS) {
+                long_press_fired = true;
+                ESP_LOGI(TAG, "CrowPanel Menu button: 2 s long press -- "
+                              "forgetting all keyboards (GPIO%d)",
+                         WAKEUP_GPIO_NUM);
+                ble_keyboard_forget_all();
+            }
+        }
+        stable = 0;
+        return;
+    }
+
+    if (++stable < CROWPANEL_DEBOUNCE_SAMPLES) return;
+
+    stable = 0;
+    down = raw_down;
+
+    if (down) {
+        hold_ticks       = 0;
+        long_press_fired = false;
+    } else {
+        if (!long_press_fired) {
+            crowpanel_inject_key(KB_KEY_F1);
+        }
+        hold_ticks       = 0;
+        long_press_fired = false;
+    }
+}
+
+static void crowpanel_menu_key_init(void)
+{
+    gpio_config_t g = {};
+    g.intr_type    = GPIO_INTR_DISABLE;
+    g.mode         = GPIO_MODE_INPUT;
+    g.pin_bit_mask = 1ULL << WAKEUP_GPIO_NUM;
+    g.pull_up_en   = GPIO_PULLUP_ENABLE;
+    g.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    gpio_config(&g);
+
+    esp_timer_create_args_t targs = {};
+    targs.callback = crowpanel_menu_key_poll_cb;
+    targs.name     = "crowpanel_menu";
+    esp_timer_handle_t t = NULL;
+    ESP_ERROR_CHECK(esp_timer_create(&targs, &t));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(t, (uint64_t)BTN_POLL_PERIOD_MS * 1000));
+    ESP_LOGI(TAG, "CrowPanel Menu button poller started (GPIO%d)", WAKEUP_GPIO_NUM);
+}
+
+static void crowpanel_nav_poll_cb(void *arg)
+{
+    (void)arg;
+    static const struct { int pin; uint8_t keycode; } kButtons[] = {
+        { BTN_BACK_PIN,      KB_KEY_ESCAPE },
+        { BTN_DIAL_UP_PIN,   KB_KEY_UP },
+        { BTN_DIAL_DOWN_PIN, KB_KEY_DOWN },
+        { BTN_DIAL_OK_PIN,   KB_KEY_ENTER },
+    };
+    static bool down[4]   = { false, false, false, false };
+    static int  stable[4] = { 0, 0, 0, 0 };
+
+    for (int i = 0; i < 4; i++) {
+        bool raw_down = gpio_get_level((gpio_num_t)kButtons[i].pin) == 0;
+        if (raw_down == down[i]) {
+            stable[i] = 0;
+            continue;
+        }
+        if (++stable[i] < CROWPANEL_DEBOUNCE_SAMPLES) continue;
+        stable[i] = 0;
+        down[i] = raw_down;
+        if (!down[i]) {
+            crowpanel_inject_key(kButtons[i].keycode);
+        }
+    }
+}
+
+static void crowpanel_nav_init(void)
+{
+    gpio_config_t g = {};
+    g.intr_type    = GPIO_INTR_DISABLE;
+    g.mode         = GPIO_MODE_INPUT;
+    g.pin_bit_mask = (1ULL << BTN_BACK_PIN) | (1ULL << BTN_DIAL_UP_PIN) |
+                      (1ULL << BTN_DIAL_DOWN_PIN) | (1ULL << BTN_DIAL_OK_PIN);
+    g.pull_up_en   = GPIO_PULLUP_ENABLE;
+    g.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    gpio_config(&g);
+
+    esp_timer_create_args_t targs = {};
+    targs.callback = crowpanel_nav_poll_cb;
+    targs.name     = "crowpanel_nav";
+    esp_timer_handle_t t = NULL;
+    ESP_ERROR_CHECK(esp_timer_create(&targs, &t));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(t, (uint64_t)BTN_POLL_PERIOD_MS * 1000));
+    ESP_LOGI(TAG, "CrowPanel Back/dial-switch poller started "
+                  "(Back=GPIO%d, Up=GPIO%d, Down=GPIO%d, OK=GPIO%d)",
+             BTN_BACK_PIN, BTN_DIAL_UP_PIN, BTN_DIAL_DOWN_PIN, BTN_DIAL_OK_PIN);
+}
+#endif /* CONFIG_DRAFTLING_MODEL_ELECROW_CROWPANEL_579 */
+
+#if defined(CONFIG_DRAFTLING_MODEL_WAVESHARE_EPAPER_397)
+/* ---- Waveshare ESP32-S3-ePaper-3.97 Up/Function/Down buttons ----
+ *
+ * This board has no touchscreen, so these three buttons (plus BOOT,
+ * handled by the generic wakeup_btn_init() below) are the only way to
+ * drive the editor without a keyboard connected: Up/Down inject the
+ * arrow keys and Function injects Enter, mirroring the Elecrow
+ * CrowPanel 5.79"'s Back/dial-switch convention above. All three are
+ * polled at BTN_POLL_PERIOD_MS and injected on release. */
+
+static void ws_epaper397_inject_key(uint8_t keycode)
+{
+    kb_event_t ev = {};
+    ev.keycode = keycode;
+    ev.pressed = true;
+    editor_ui_handle_key(&ev);
+    ev.pressed = false;
+    editor_ui_handle_key(&ev);
+}
+
+static void ws_epaper397_nav_poll_cb(void *arg)
+{
+    (void)arg;
+    static const struct { int pin; uint8_t keycode; } kButtons[] = {
+        { BTN_UP_PIN,       KB_KEY_UP },
+        { BTN_DOWN_PIN,     KB_KEY_DOWN },
+        { BTN_FUNCTION_PIN, KB_KEY_ENTER },
+    };
+    static bool down[3]   = { false, false, false };
+    static int  stable[3] = { 0, 0, 0 };
+
+    for (int i = 0; i < 3; i++) {
+        bool raw_down = gpio_get_level((gpio_num_t)kButtons[i].pin) == 0;
+        if (raw_down == down[i]) {
+            stable[i] = 0;
+            continue;
+        }
+        if (++stable[i] < 2) continue;
+        stable[i] = 0;
+        down[i] = raw_down;
+        if (!down[i]) {
+            ws_epaper397_inject_key(kButtons[i].keycode);
+        }
+    }
+}
+
+static void ws_epaper397_nav_init(void)
+{
+    gpio_config_t g = {};
+    g.intr_type    = GPIO_INTR_DISABLE;
+    g.mode         = GPIO_MODE_INPUT;
+    g.pin_bit_mask = (1ULL << BTN_UP_PIN) | (1ULL << BTN_DOWN_PIN) |
+                      (1ULL << BTN_FUNCTION_PIN);
+    g.pull_up_en   = GPIO_PULLUP_ENABLE;
+    g.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    gpio_config(&g);
+
+    esp_timer_create_args_t targs = {};
+    targs.callback = ws_epaper397_nav_poll_cb;
+    targs.name     = "ws397_nav";
+    esp_timer_handle_t t = NULL;
+    ESP_ERROR_CHECK(esp_timer_create(&targs, &t));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(t, (uint64_t)BTN_POLL_PERIOD_MS * 1000));
+    ESP_LOGI(TAG, "Waveshare ePaper-3.97 Up/Function/Down poller started "
+                  "(Up=GPIO%d, Function=GPIO%d, Down=GPIO%d)",
+             BTN_UP_PIN, BTN_FUNCTION_PIN, BTN_DOWN_PIN);
+}
+#endif /* CONFIG_DRAFTLING_MODEL_WAVESHARE_EPAPER_397 */
+
+#if defined(CONFIG_DRAFTLING_MODEL_SEEED_RETERMINAL_STICKY)
+/* ---- Seeed reTerminal Sticky Up/Down page-turn buttons ----
+ *
+ * Up and Down (active-low, internal pull-ups) scroll the editor a
+ * screen at a time by injecting Page Up / Page Down -- the same
+ * convention as the Xteink X4 Pro's Left/Right buttons. Power
+ * (WAKEUP_GPIO_NUM) keeps using the generic wakeup_btn_init() path
+ * below unchanged (deep-sleep wake source, short press = sleep, 2 s
+ * hold = forget BLE keyboards). */
+
+static void reterminal_sticky_inject_key(uint8_t keycode)
+{
+    kb_event_t ev = {};
+    ev.keycode = keycode;
+    ev.pressed = true;
+    editor_ui_handle_key(&ev);
+    ev.pressed = false;
+    editor_ui_handle_key(&ev);
+}
+
+static void reterminal_sticky_btn_poll_cb(void *arg)
+{
+    (void)arg;
+    static const struct { int pin; uint8_t keycode; } kButtons[] = {
+        { BTN_UP_PIN,   KB_KEY_PAGEUP },
+        { BTN_DOWN_PIN, KB_KEY_PAGEDOWN },
+    };
+    static bool down[2]   = { false, false };
+    static int  stable[2] = { 0, 0 };
+
+    for (int i = 0; i < 2; i++) {
+        bool raw_down = gpio_get_level((gpio_num_t)kButtons[i].pin) == 0;
+        if (raw_down == down[i]) {
+            stable[i] = 0;
+            continue;
+        }
+        if (++stable[i] < 2) continue;
+        stable[i] = 0;
+        down[i] = raw_down;
+        if (!down[i]) {
+            /* Inject on release, matching the Xteink X4 Pro convention. */
+            reterminal_sticky_inject_key(kButtons[i].keycode);
+        }
+    }
+}
+
+static void reterminal_sticky_btn_init(void)
+{
+    gpio_config_t g = {};
+    g.intr_type    = GPIO_INTR_DISABLE;
+    g.mode         = GPIO_MODE_INPUT;
+    g.pin_bit_mask = (1ULL << BTN_UP_PIN) | (1ULL << BTN_DOWN_PIN);
+    g.pull_up_en   = GPIO_PULLUP_ENABLE;
+    g.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    gpio_config(&g);
+
+    esp_timer_create_args_t targs = {};
+    targs.callback = reterminal_sticky_btn_poll_cb;
+    targs.name     = "sticky_btn";
+    esp_timer_handle_t t = NULL;
+    ESP_ERROR_CHECK(esp_timer_create(&targs, &t));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(t, (uint64_t)BTN_POLL_PERIOD_MS * 1000));
+    ESP_LOGI(TAG, "Seeed reTerminal Sticky Up/Down button poller started "
+                  "(GPIO%d/GPIO%d)", BTN_UP_PIN, BTN_DOWN_PIN);
+}
+#endif /* CONFIG_DRAFTLING_MODEL_SEEED_RETERMINAL_STICKY */
+
+#if defined(CONFIG_DRAFTLING_MODEL_M5STACK_PAPERMONO)
+/* ---- M5Stack PaperMono Button A / Button B ----
+ *
+ * Short presses scroll the editor: A = Page Up, B = Page Down,
+ * injected on release. A press held for the 2 s long-press time
+ * injects nothing, since those holds already mean something else:
+ * A (the wake button) forgets all BLE keyboards through the generic
+ * wakeup_btn_poll_cb(), and B enters deep sleep through
+ * sleep_button_poll_cb() (CONFIG_DRAFTLING_SLEEP_BUTTON_GPIO). */
+
+static void papermono_inject_key(uint8_t keycode)
+{
+    kb_event_t ev = {};
+    ev.keycode = keycode;
+    ev.pressed = true;
+    editor_ui_handle_key(&ev);
+    ev.pressed = false;
+    editor_ui_handle_key(&ev);
+}
+
+static void papermono_btn_poll_cb(void *arg)
+{
+    (void)arg;
+    static const struct { int pin; uint8_t keycode; } kButtons[] = {
+        { BTN_A_PIN, KB_KEY_PAGEUP },
+        { BTN_B_PIN, KB_KEY_PAGEDOWN },
+    };
+    static bool down[2]       = { false, false };
+    static int  stable[2]     = { 0, 0 };
+    static int  hold_ticks[2] = { 0, 0 };
+
+    for (int i = 0; i < 2; i++) {
+        bool raw_down = gpio_get_level((gpio_num_t)kButtons[i].pin) == 0;
+        if (raw_down == down[i]) {
+            stable[i] = 0;
+            if (down[i] && hold_ticks[i] < BTN_LONG_PRESS_TICKS) hold_ticks[i]++;
+            continue;
+        }
+        if (++stable[i] < 2) continue;
+        stable[i] = 0;
+        down[i] = raw_down;
+        if (!down[i] && hold_ticks[i] < BTN_LONG_PRESS_TICKS) {
+            papermono_inject_key(kButtons[i].keycode);
+        }
+        hold_ticks[i] = 0;
+    }
+}
+
+static void papermono_btn_init(void)
+{
+    gpio_config_t g = {};
+    g.intr_type    = GPIO_INTR_DISABLE;
+    g.mode         = GPIO_MODE_INPUT;
+    g.pin_bit_mask = (1ULL << BTN_A_PIN) | (1ULL << BTN_B_PIN);
+    g.pull_up_en   = GPIO_PULLUP_ENABLE;
+    g.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    gpio_config(&g);
+
+    esp_timer_create_args_t targs = {};
+    targs.callback = papermono_btn_poll_cb;
+    targs.name     = "papermono_btn";
+    esp_timer_handle_t t = NULL;
+    ESP_ERROR_CHECK(esp_timer_create(&targs, &t));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(t, (uint64_t)BTN_POLL_PERIOD_MS * 1000));
+    ESP_LOGI(TAG, "PaperMono button poller started (A=GPIO%d PgUp, B=GPIO%d PgDn)",
+             BTN_A_PIN, BTN_B_PIN);
+}
+#endif /* CONFIG_DRAFTLING_MODEL_M5STACK_PAPERMONO */
+
+/* ---- Generic wakeup-GPIO long-press handler ----
+ *
+ * On boards other than the H752 (which has its own key handler above)
+ * the boot / wakeup button is monitored for a 2-second hold.  Holding
+ * the button for 2 s clears every stored BLE keyboard bond and starts
+ * a fresh scan (same action as the "Forget KB" touch button on the
+ * BLE-prompt screen; lets users without touch pair a replacement
+ * keyboard after moving away from the old one).
+ *
+ * If the board defines a single BOOT/wake button (WAKEUP_GPIO_NUM) it
+ * is polled here.  Boards with no button at all (FNK0104A/B/S) skip
+ * this poller entirely.
+ */
+#if CONFIG_DRAFTLING_WAKEUP_GPIO >= 0 && \
+    !defined(CONFIG_DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO_H752) && \
+    !defined(CONFIG_DRAFTLING_MODEL_ELECROW_CROWPANEL_579) && \
+    !defined(CONFIG_DRAFTLING_MODEL_XTEINK_X4_CLASSIC)
+
+/* Poll period BTN_POLL_PERIOD_MS ms; BTN_LONG_PRESS_TICKS ticks = 2 s hold. */
+#define WAKEUP_BTN_LONG_PRESS_TICKS BTN_LONG_PRESS_TICKS
+
+static void wakeup_btn_poll_cb(void *arg)
+{
+    (void)arg;
+    gpio_num_t wake_gpio = (gpio_num_t)WAKEUP_GPIO_NUM;
+    static bool down             = false;
+    static int  stable           = 0;
+    static int  hold_ticks       = 0;
+    static bool long_press_fired = false;
+
+    bool raw_down = gpio_get_level(wake_gpio) == 0;
+    if (raw_down == down) {
+        stable = 0;
+        if (down && !long_press_fired) {
+            if (++hold_ticks >= BTN_LONG_PRESS_TICKS) {
+                long_press_fired = true;
+                ESP_LOGI(TAG, "Wakeup button held %d ms -- forgetting all BLE bonds",
+                         BTN_LONG_PRESS_MS);
+                ble_keyboard_forget_all();
+            }
+        }
+        return;
+    }
+
+    if (++stable < 2) return;
+
+    stable = 0;
+    down = raw_down;
+    if (!down) {
+#if defined(CONFIG_DRAFTLING_MODEL_XTEINK_X4_PRO) || \
+    defined(CONFIG_DRAFTLING_MODEL_SEEED_RETERMINAL_STICKY)
+        /* Unlike the shared BOOT-as-wake convention on every other
+         * board, this button is silkscreened "Power" (or, on the
+         * Seeed reTerminal Sticky, "Power/AI") -- and there is no
+         * hardware latch this firmware uses to physically cut power
+         * (see XTEINK_POWER_LATCH_PIN / PWR_HOLD_PIN+PWR_LOCK_PIN in
+         * app_config.h; they only gate peripheral rails or keep the
+         * board's own power switch closed, not something Draftling
+         * ever releases), so deep sleep IS this board's power-off. A
+         * short press (release before the 2 s hold below) triggers it
+         * instead of waiting for the inactivity timeout, matching what
+         * a button labeled Power should do -- through the editor, like
+         * Ctrl+P, so unsaved changes get the Save / Discard / Cancel
+         * prompt first (editor_ui_request_sleep()). The 2 s hold still
+         * forgets BLE keyboards; long_press_fired keeps the two
+         * mutually exclusive.
+         *
+         * On the reTerminal Sticky this deliberately does not match
+         * the vendor firmware's own convention for this button
+         * (FreeInk: "click confirms, hold sleeps") -- see
+         * main/boards/seeed_reterminal_sticky.h for why Draftling
+         * reuses the X4 Pro convention instead. */
+        if (!long_press_fired) {
+            ESP_LOGI(TAG, "Power button released -- requesting deep sleep");
+            editor_ui_request_sleep();
+        }
+#endif
+        hold_ticks       = 0;
+        long_press_fired = false;
+    }
+}
+
+static void wakeup_btn_init(void)
+{
+    gpio_config_t g = {};
+    g.intr_type    = GPIO_INTR_DISABLE;
+    g.mode         = GPIO_MODE_INPUT;
+    g.pin_bit_mask = 1ULL << WAKEUP_GPIO_NUM;
+    g.pull_up_en   = GPIO_PULLUP_ENABLE;
+    g.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    gpio_config(&g);
+
+    esp_timer_create_args_t targs = {};
+    targs.callback = wakeup_btn_poll_cb;
+    targs.name     = "wakeup_btn";
+    esp_timer_handle_t t = NULL;
+    if (esp_timer_create(&targs, &t) != ESP_OK ||
+        esp_timer_start_periodic(t, (uint64_t)BTN_POLL_PERIOD_MS * 1000) != ESP_OK) {
+        ESP_LOGW(TAG, "Wakeup button poller init failed (GPIO%d)",
+                 WAKEUP_GPIO_NUM);
+        return;
+    }
+    ESP_LOGI(TAG, "Wakeup button poller started (GPIO%d, level now %d; "
+                  "hold 2 s to forget all keyboards)",
+             WAKEUP_GPIO_NUM,
+             gpio_get_level((gpio_num_t)WAKEUP_GPIO_NUM));
+}
+#endif /* !CONFIG_DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO_H752 &&
+        * !CONFIG_DRAFTLING_MODEL_ELECROW_CROWPANEL_579 &&
+        * !CONFIG_DRAFTLING_MODEL_XTEINK_X4_CLASSIC */
+
+/* ---- Generic button long-press-to-sleep handler ----
+ *
+ * DRAFTLING_SLEEP_BUTTON_GPIO (Kconfig) names a GPIO that enters deep
+ * sleep on a BTN_LONG_PRESS_MS hold, for boards whose sleep trigger is
+ * a second physical control rather than the BOOT/wake button already
+ * covered by wakeup_btn_poll_cb() above. This poller only watches for
+ * the long hold and calls standby_enter_sleep() -- it does not inject
+ * any key, so it coexists with whatever short-press handling the same
+ * pin already gets from a board-specific poller (e.g.
+ * ws_epaper397_nav_poll_cb's KB_KEY_ENTER on the Waveshare ePaper-3.97
+ * Function button, physically the center press of that board's
+ * Up/Function/Down rocker). Disabled (compiled out) when the Kconfig
+ * value is -1, the default for every board that has not opted in. */
+#if CONFIG_DRAFTLING_SLEEP_BUTTON_GPIO >= 0
+
+#define SLEEP_BUTTON_LONG_PRESS_TICKS BTN_LONG_PRESS_TICKS
+
+static void sleep_button_poll_cb(void *arg)
+{
+    (void)arg;
+    static bool down             = false;
+    static int  stable           = 0;
+    static int  hold_ticks       = 0;
+    static bool long_press_fired = false;
+
+    bool raw_down = gpio_get_level((gpio_num_t)CONFIG_DRAFTLING_SLEEP_BUTTON_GPIO) == 0;
+
+    if (raw_down == down) {
+        if (down) {
+            hold_ticks++;
+            if (!long_press_fired && hold_ticks >= SLEEP_BUTTON_LONG_PRESS_TICKS) {
+                long_press_fired = true;
+                ESP_LOGI(TAG, "Sleep button: 2 s long press -- "
+                              "entering deep sleep (GPIO%d)",
+                         CONFIG_DRAFTLING_SLEEP_BUTTON_GPIO);
+                standby_enter_sleep();
+                /* Does not return (EPD/deep-sleep boards). */
+            }
+        }
+        stable = 0;
+        return;
+    }
+
+    if (++stable < 2) return;
+
+    stable = 0;
+    down = raw_down;
+    if (down) {
+        hold_ticks       = 0;
+        long_press_fired = false;
+    } else {
+        long_press_fired = false;
+    }
+}
+
+static void sleep_button_init(void)
+{
+    gpio_config_t g = {};
+    g.intr_type    = GPIO_INTR_DISABLE;
+    g.mode         = GPIO_MODE_INPUT;
+    g.pin_bit_mask = 1ULL << CONFIG_DRAFTLING_SLEEP_BUTTON_GPIO;
+    g.pull_up_en   = GPIO_PULLUP_ENABLE;
+    g.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    gpio_config(&g);
+
+    esp_timer_create_args_t targs = {};
+    targs.callback = sleep_button_poll_cb;
+    targs.name     = "sleep_btn";
+    esp_timer_handle_t t = NULL;
+    ESP_ERROR_CHECK(esp_timer_create(&targs, &t));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(t, (uint64_t)BTN_POLL_PERIOD_MS * 1000));
+    ESP_LOGI(TAG, "Sleep-button long-press poller started (GPIO%d, "
+                  "hold 2 s to enter deep sleep)",
+             CONFIG_DRAFTLING_SLEEP_BUTTON_GPIO);
+}
+#endif /* CONFIG_DRAFTLING_SLEEP_BUTTON_GPIO >= 0 */
+
+#if defined(CONFIG_DRAFTLING_MODEL_M5STACK_TAB5)
+/* M5Stack Tab5 (ESP32-P4): pre-sleep peripheral teardown.
+ *
+ * The Tab5 has no LP_IO-capable user input, so deep sleep can only
+ * exit via the hardware RESET button (the chip cold-boots; editor
+ * state is restored from autosave). With the BSP's default state
+ * left untouched the board still draws far more than it should in
+ * deep sleep because:
+ *
+ *   - the ESP32-C6 co-processor stays fully powered through P4 deep
+ *     sleep (WLAN_PWR_EN = PI4IOE5V6408 #2 P0 is latched HIGH at
+ *     boot and never released; the C6 LDO keeps its CPU, BLE
+ *     controller and SDIO link armed),
+ *   - the MIPI-DSI panel and its backlight stay on,
+ *   - the GT911 touch controller keeps polling at ~3 mA,
+ *   - the RTC peripherals domain is left powered.
+ *
+ * This hook drives each of those into the lowest state we can reach
+ * from software, in the order dictated by their dependencies (the
+ * I/O expander writes must happen while bsp_i2c is still up; the
+ * panel disable is safe at any time because the BSP owns it).
+ *
+ * Wake path is unchanged: the chip cold-boots on RESET and re-runs
+ * app_main(), which re-asserts WLAN_PWR_EN and CHG_EN through the
+ * same BSP / expander code used at first boot. */
+static void pre_sleep_tab5_deinit(void)
+{
+    ESP_LOGI(TAG, "Pre-sleep: M5Stack Tab5 peripheral teardown");
+
+    /* Editor autosave first while every bus is still up. */
+    pre_sleep_autosave();
+
+    /* GT911 -> sleep (uses the BSP-owned I2C bus, which is still up). */
+    touchscreen_sleep();
+
+    /* MIPI-DSI panel + backlight off via the BSP-managed handles. */
+    display_deep_sleep_prepare();
+
+    /* Drop the ESP32-C6 power rail. The PI4IOE5V6408 latches the
+     * pin state across P4 deep sleep, so the rail stays off until
+     * the next cold boot re-runs bsp_feature_enable(BSP_FEATURE_WIFI,
+     * true) in app_main(). Use the BSP API rather than poking the
+     * expander directly so the driver's shadow register stays in
+     * sync with the chip; otherwise a later RMW on any other pin
+     * on the same expander would un-clear our bit. */
+    {
+        esp_err_t err = bsp_feature_enable(BSP_FEATURE_WIFI, false);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "Tab5: WLAN_PWR_EN dropped (ESP32-C6 off)");
+        } else {
+            ESP_LOGW(TAG, "Tab5: bsp_feature_enable(WIFI, false) failed: %s",
+                     esp_err_to_name(err));
+        }
+    }
+
+    /* Power down the RTC peripherals domain. Draftling has no ULP
+     * and no RTC SLOW data to retain across wake, so dropping this
+     * domain shaves a few mA on ESP32-P4 over the default. */
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_OFF);
+}
+#endif /* CONFIG_DRAFTLING_MODEL_M5STACK_TAB5 */
+
+extern "C" void app_main(void)
+{
+    ESP_LOGI(TAG, "Draftling - %s", BOARD_NAME);
+
+    /* Boot diagnostics: reset reason + wake-up cause.
+     *
+     * Logged as the very first thing in app_main so a "screen comes
+     * back on right after sleep" symptom can be triaged from a
+     * single boot line:
+     *   ESP_RST_DEEPSLEEP + EXT0  -> wake source fired immediately on
+     *                                entry (e.g. BOOT held, or pull-
+     *                                up not yet settled when EXT0 was
+     *                                armed).
+     *   ESP_RST_PANIC             -> something in pre_sleep_t5_deinit
+     *                                aborted; the panic backtrace
+     *                                will be in the lines above.
+     *   ESP_RST_BROWNOUT          -> rail dipped below the BOD
+     *                                threshold during sleep entry
+     *                                (most likely candidate: EPD
+     *                                rail collapse during
+     *                                epd_poweroff on a tired cell).
+     *   ESP_RST_INT_WDT/TASK_WDT  -> a watchdog tripped while we
+     *                                were holding off in
+     *                                pre_sleep_t5_deinit.
+     *   ESP_RST_POWERON           -> genuine cold boot (USB plug,
+     *                                latch released, full battery
+     *                                disconnect). Wake cause will
+     *                                read UNDEFINED. */
+    {
+        esp_reset_reason_t        rst  = esp_reset_reason();
+        esp_sleep_wakeup_cause_t  wake = esp_sleep_get_wakeup_cause();
+        ESP_LOGI(TAG, "Boot: reset_reason=%d wakeup_cause=%d",
+                 (int)rst, (int)wake);
+    }
+
+    /* Initialize NVS - required for WiFi and BT */
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    /* Load the user-adjustable panel margins (Settings -> Screen
+     * margins; zero on a fresh install) before anything below derives
+     * DISPLAY_LOGICAL_WIDTH/HEIGHT from them -- the LVGL display
+     * resolution, the touchscreen's logical_width/height, and (on
+     * backends that need it) the display backend's own framebuffer
+     * write offset all read display_margin_*() exactly once, here at
+     * boot. */
+    display_margins_init();
+
+    /* Load the user-selected display orientation (Settings -> Display
+     * orientation; landscape on a fresh install) before anything below
+     * derives DISPLAY_ROTATE_EFFECTIVE from it. Portrait adds another
+     * 90 degrees on top of the board's build-time base rotation, so
+     * the LVGL rotation angle, the editor's SCR_W / SCR_H, and the
+     * split-screen axis all have to see the same value for the session. */
+    display_orientation_init();
+
+    /* Load the user-selected "Display upside down" flag (Settings ->
+     * Display upside down; off on a fresh install) before anything
+     * below derives DISPLAY_ROTATE_EFFECTIVE from it. It adds a
+     * further 180 degrees on top of whatever display_orientation_init()
+     * above just produced. */
+    display_flip_init();
+
+#if defined(BOARD_WS2812_PIN)
+    ws2812_off();
+#endif
+
+#if defined(CONFIG_DRAFTLING_HAS_POWER_LATCH)
+    /* Close the hardware power latch first thing after NVS so the
+     * battery rail stays alive when the user releases the boot-time
+     * PWR button press. power_init() also arms a polling timer that
+     * watches the PWR button for a long-press (= power off). The
+     * pre-off callback is wired up after the editor is created so
+     * the long-press save can flush dirty document state. */
+    ESP_LOGI(TAG, "Initializing power latch...");
+    {
+        power_config_t pcfg = {};
+        pcfg.pwr_button_gpio = PWR_BUTTON_GPIO;
+        pcfg.i2c_sda         = PWR_I2C_SDA_PIN;
+        pcfg.i2c_scl         = PWR_I2C_SCL_PIN;
+        pcfg.tca9554_addr    = PWR_TCA9554_ADDR;
+        pcfg.latch_bit       = PWR_TCA9554_LATCH_BIT;
+        power_init(&pcfg);
+    }
+#endif
+
+    /* Initialize display */
+    ESP_LOGI(TAG, "Initializing display...");
+#if defined(CONFIG_DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO)
+    /* If this boot is a wake from deep sleep, undo every IO latch
+     * pre_sleep_t5_deinit() applied before esp_deep_sleep_start().
+     * Front-light GPIO11 was held LOW (so it stayed dark in sleep)
+     * and the spare RTC-IO pads (GPIO1..GPIO4, including the GT911
+     * TOUCH_INT on GPIO3) were rtc_gpio_isolate()'d. Both states
+     * survive the wake reset on ESP32-S3 and would otherwise leave
+     * the front-light dark and the touchscreen unresponsive after
+     * wake. Called before display_init() / touchscreen_init() so
+     * those bring-up paths see fresh, un-latched pads. */
+    t5_release_held_gpios_after_wake();
+#endif
+#if defined(CONFIG_DRAFTLING_MODEL_XTEINK_X4)
+    /* pre_sleep_xteink_x4_*_deinit() calls gpio_deep_sleep_hold_en()
+     * before deep sleep, which on the ESP32-S3 keeps the digital GPIO
+     * output levels latched into the next startup -- and stays latched
+     * until gpio_deep_sleep_hold_dis() is called. Release it here, on
+     * every boot, so the display / touch / SD bring-up below can drive
+     * the peripheral-rail and power-enable pads freely (in particular
+     * the X4 Pro's GT911 power-cycle further down). A no-op if nothing
+     * was held. */
+    gpio_deep_sleep_hold_dis();
+
+    /* Master peripheral-rail latch (GPIO1). Must be driven HIGH before
+     * any SPI/display/SD bring-up -- without it, the e-paper panel rail
+     * and the SD slot both stay unpowered. No I2C expander involved
+     * (unlike the components/power TCA9554 latch on the Touch-LCD-3.49). */
+    {
+        gpio_config_t g = {};
+        g.intr_type    = GPIO_INTR_DISABLE;
+        g.mode         = GPIO_MODE_OUTPUT;
+        g.pin_bit_mask = (1ULL << XTEINK_POWER_LATCH_PIN);
+        gpio_config(&g);
+        gpio_set_level((gpio_num_t)XTEINK_POWER_LATCH_PIN, 1);
+    }
+#endif
+#if defined(CONFIG_DRAFTLING_MODEL_SEEED_RETERMINAL_STICKY)
+    /* Power-rail latch (PWR_HOLD=GPIO45, PWR_LOCK=GPIO46): must both
+     * be driven HIGH before any SPI/display/SD bring-up, or the
+     * board's own power switch drops the rail as soon as the case
+     * button is released -- see the board header comment. Release any
+     * hold left by pre_sleep_reterminal_sticky_deinit() from before
+     * this wake first.
+     *
+     * gpio_deep_sleep_hold_dis() releases the chip-wide digital-pad
+     * autohold that pre_sleep_reterminal_sticky_deinit() armed. On the
+     * ESP32-S3 that autohold survives the wake reset and keeps every
+     * digital pad (GPIO22-48) frozen until it is disabled. Without it
+     * the e-paper power-enable (GPIO47, on the VDD_SPI domain, which
+     * is powered down in deep sleep) stays stuck in its unpowered
+     * state, display_init() cannot drive it, and the panel never
+     * shows anything after the first wake. It only disarms the global
+     * latch, not each individual pin's hold, hence the gpio_hold_dis()
+     * calls below.
+     *
+     * Charger enable (CHARGE_EN=GPIO39, active-LOW): driven LOW here
+     * so the BQ25616 charges normally while awake, not just once
+     * asleep -- see the board header comment for why the JTAG-group
+     * reset-default pull-up would otherwise leave it effectively
+     * disabled. */
+    {
+        gpio_deep_sleep_hold_dis();
+        gpio_hold_dis((gpio_num_t)PWR_HOLD_PIN);
+        gpio_hold_dis((gpio_num_t)PWR_LOCK_PIN);
+        gpio_hold_dis((gpio_num_t)CHARGE_EN_PIN);
+
+        gpio_config_t g = {};
+        g.intr_type    = GPIO_INTR_DISABLE;
+        g.mode         = GPIO_MODE_OUTPUT;
+        g.pin_bit_mask = (1ULL << PWR_HOLD_PIN) | (1ULL << PWR_LOCK_PIN) |
+                         (1ULL << CHARGE_EN_PIN);
+        gpio_config(&g);
+        gpio_set_level((gpio_num_t)PWR_HOLD_PIN, 1);
+        gpio_set_level((gpio_num_t)PWR_LOCK_PIN, 1);
+        gpio_set_level((gpio_num_t)CHARGE_EN_PIN, 0);
+    }
+    /* The MicroSD card shares the e-paper SPI bus. Power it and park
+     * its CS high before display_init() sends anything: an unpowered
+     * card loads SCLK/MOSI through its protection diodes, and a
+     * floating CS lets it listen to panel traffic. */
+    {
+        gpio_hold_dis((gpio_num_t)SD_EN_PIN);
+        gpio_hold_dis((gpio_num_t)SD_SPI_CS_PIN);
+        gpio_config_t g = {};
+        g.intr_type    = GPIO_INTR_DISABLE;
+        g.mode         = GPIO_MODE_OUTPUT;
+        g.pin_bit_mask = (1ULL << SD_EN_PIN) | (1ULL << SD_SPI_CS_PIN);
+        gpio_config(&g);
+        gpio_set_level((gpio_num_t)SD_SPI_CS_PIN, 1);
+        gpio_set_level((gpio_num_t)SD_EN_PIN, 1);
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+#endif
+#if defined(CONFIG_DRAFTLING_MODEL_XTEINK_X4_PRO)
+    /* Full GT911 power-cycle + hardware reset with the datasheet
+     * address-select timing. Done HERE, before the shared I2C bus is
+     * created below, and `tcfg.rst` is passed as -1 so touchscreen_init()
+     * does not re-pulse RST and undo the address select.
+     *
+     * Why the full sequence and not just "enable the rail": on a cold
+     * boot the GT911 has never run, so even a sloppy reset works. But
+     * after a warm reboot -- esp_restart() from the Settings "restart to
+     * apply" prompt (display orientation / margins), a panic, a
+     * watchdog -- esp_restart() does not reset the GT911, and it comes
+     * back either wedged or (observed) answering at its fallback address
+     * 0x14 without ever scanning. The chip only latches a valid config
+     * and starts scanning if INT is held at the address-select level
+     * across the RST rising edge and for T3/T4 afterwards (GT911
+     * datasheet section 5). VDD is dropped first so the reset starts
+     * from a true power-off state regardless of what the chip was doing.
+     *
+     * TOUCH_POWER_EN_PIN is active-low (LOW = VDD on). INT held HIGH
+     * across RST-high selects the primary I2C address 0x5D. */
+    {
+        gpio_config_t g = {};
+        g.intr_type    = GPIO_INTR_DISABLE;
+        g.mode         = GPIO_MODE_OUTPUT;
+        g.pin_bit_mask = (1ULL << TOUCH_POWER_EN_PIN) |
+                         (1ULL << TOUCH_RST_PIN) |
+                         (1ULL << TOUCH_INT_PIN);
+        gpio_config(&g);
+
+        gpio_set_level((gpio_num_t)TOUCH_RST_PIN, 0);        /* assert reset */
+        gpio_set_level((gpio_num_t)TOUCH_INT_PIN, 0);
+        gpio_set_level((gpio_num_t)TOUCH_POWER_EN_PIN, 1);   /* VDD off */
+        vTaskDelay(pdMS_TO_TICKS(100));                      /* drain rail fully */
+
+        gpio_set_level((gpio_num_t)TOUCH_POWER_EN_PIN, 0);   /* VDD on */
+        vTaskDelay(pdMS_TO_TICKS(12));                       /* T1: >=10 ms held in reset */
+
+        gpio_set_level((gpio_num_t)TOUCH_INT_PIN, 1);        /* address select -> 0x5D */
+        vTaskDelay(pdMS_TO_TICKS(1));                        /* T2: >100 us */
+
+        gpio_set_level((gpio_num_t)TOUCH_RST_PIN, 1);        /* release reset */
+        vTaskDelay(pdMS_TO_TICKS(8));                        /* T3: hold INT >=5 ms */
+        gpio_set_level((gpio_num_t)TOUCH_INT_PIN, 0);
+        vTaskDelay(pdMS_TO_TICKS(55));                       /* T4: >=50 ms before INT is an input */
+
+        /* INT -> input + pull-up (its normal "data ready" role).
+         * touchscreen_init() also does this; doing it now keeps the
+         * line from floating during the shared-bus + display bring-up
+         * that runs before touchscreen_init(). */
+        gpio_config_t gi = {};
+        gi.intr_type    = GPIO_INTR_DISABLE;
+        gi.mode         = GPIO_MODE_INPUT;
+        gi.pin_bit_mask = (1ULL << TOUCH_INT_PIN);
+        gi.pull_up_en   = GPIO_PULLUP_ENABLE;
+        gpio_config(&gi);
+
+        ESP_LOGI(TAG, "GT911 power-cycled + reset (RST=%d INT=%d, selecting 0x5D)",
+                 TOUCH_RST_PIN, TOUCH_INT_PIN);
+    }
+#elif defined(CONFIG_DRAFTLING_MODEL_SEEED_RETERMINAL_STICKY)
+    /* GT911 power-enable (active-HIGH), then a hardware reset with INT
+     * held LOW across the RST rising edge and for 50 ms after it, as
+     * the sticky-micronotes firmware does on this board. That selects
+     * address 0x5D and performs the GT911's INT synchronisation; with
+     * INT left floating (touchscreen_init()'s own plain RST pulse) the
+     * chip came up at 0x14 and answered on I2C but never reported a
+     * touch. tcfg.rst is passed as -1 below so touchscreen_init() does
+     * not pulse RST again. */
+    {
+        gpio_config_t g = {};
+        g.intr_type    = GPIO_INTR_DISABLE;
+        g.mode         = GPIO_MODE_OUTPUT;
+        g.pin_bit_mask = (1ULL << TOUCH_POWER_EN_PIN) |
+                         (1ULL << TOUCH_RST_PIN) | (1ULL << TOUCH_INT_PIN);
+        gpio_config(&g);
+        gpio_set_level((gpio_num_t)TOUCH_POWER_EN_PIN, 1);
+        vTaskDelay(pdMS_TO_TICKS(10));
+        gpio_set_level((gpio_num_t)TOUCH_INT_PIN, 0);
+        gpio_set_level((gpio_num_t)TOUCH_RST_PIN, 0);
+        vTaskDelay(pdMS_TO_TICKS(10));
+        gpio_set_level((gpio_num_t)TOUCH_RST_PIN, 1);
+        vTaskDelay(pdMS_TO_TICKS(50));
+        /* Release INT; touchscreen_init() makes it an input. */
+        gpio_set_direction((gpio_num_t)TOUCH_INT_PIN, GPIO_MODE_INPUT);
+        ESP_LOGI(TAG, "GT911 power-enabled (GPIO%d) and reset", TOUCH_POWER_EN_PIN);
+    }
+#endif
+#if defined(CONFIG_DRAFTLING_DISPLAY_EPDIY) || defined(CONFIG_DRAFTLING_DISPLAY_H752_EPD) || \
+    defined(CONFIG_DRAFTLING_DISPLAY_XTEINK_EPD) || defined(CONFIG_DRAFTLING_HAS_CH422G) || \
+    defined(CONFIG_DRAFTLING_DISPLAY_WS_EPD397) || defined(CONFIG_DRAFTLING_DISPLAY_M5_PAPERMONO)
+    /* The LilyGO T5 E-Paper S3 Pro / Pro Lite shares its on-board
+     * I2C bus between epdiy (TPS65185 EPD power IC + PCA9535 IO
+     * expander), the GT911 capacitive touch controller and the
+     * BQ27220 battery fuel gauge (battery_init_bq27220 further
+     * below). The Waveshare ESP32-S3-Touch-LCD-7 similarly shares its
+     * I2C bus between the CH422G IO-expander and the GT911 touch
+     * controller. All consumers use driver-NG (driver/i2c_master.h),
+     * and ESP-IDF only allows one i2c_new_master_bus() per port. We
+     * therefore create the bus here, ahead of any consumer, and hand
+     * the handle to each: display_set_shared_i2c_bus() before
+     * display_init() (epdiy routes through epd_init_with_config() +
+     * EpdInitConfig.i2c.bus_handle; the Waveshare ESP32-S3-ePaper-3.97
+     * backend uses the same hook to enable its AXP2101 PMIC's ALDO3
+     * rail, which powers the e-paper panel itself, before any SPI
+     * traffic reaches it -- see display_ws_epd397.cpp), battery_init_bq27220()
+     * right after, ch422g_init() immediately below (CH422G boards), and
+     * touchscreen_config_t.i2c_bus before touchscreen_init() further
+     * below. This is the resolution for the legacy/driver-NG conflict
+     * that previously forced touch off on the epdiy boards; see
+     * components/display/idf_component.yml for why epdiy is pinned to
+     * a git commit. */
+    i2c_master_bus_handle_t shared_i2c_bus = NULL;
+    {
+        i2c_master_bus_config_t bus_cfg = {};
+        bus_cfg.i2c_port          = 0;
+        bus_cfg.sda_io_num        = (gpio_num_t)I2C_SDA_PIN;
+        bus_cfg.scl_io_num        = (gpio_num_t)I2C_SCL_PIN;
+        bus_cfg.clk_source        = I2C_CLK_SRC_DEFAULT;
+        bus_cfg.glitch_ignore_cnt = 7;
+        bus_cfg.flags.enable_internal_pullup = true;
+        esp_err_t bus_err = i2c_new_master_bus(&bus_cfg, &shared_i2c_bus);
+        if (bus_err != ESP_OK) {
+            ESP_LOGE(TAG, "Shared I2C bus init failed: %s -- "
+                          "falling back to per-component buses (touch "
+                          "will be disabled to avoid conflict)",
+                     esp_err_to_name(bus_err));
+            shared_i2c_bus = NULL;
+        } else {
+            ESP_LOGI(TAG, "Shared I2C bus created (port 0, SDA=%d SCL=%d)",
+                     I2C_SDA_PIN, I2C_SCL_PIN);
+        }
+    }
+    display_set_shared_i2c_bus(shared_i2c_bus);
+#if defined(CONFIG_DRAFTLING_MODEL_M5STACK_PAPERMONO)
+    /* M5Stack PaperMono: the M5PM1 power-management chip must be
+     * awake (I2C idle sleep and watchdog off, rails on) before
+     * anything else, then the M5IOE1 expander powers the e-paper
+     * panel, the touch controller and the MicroSD card and pulses the
+     * panel and touch reset lines -- the same order and timing as
+     * M5GFX's board_M5PaperMono bring-up. The display backend and the
+     * touchscreen component have no reset GPIO of their own here. */
+    if (battery_init_m5pm1((void *)shared_i2c_bus) != 0) {
+        ESP_LOGE(TAG, "M5PM1 init failed");
+    }
+    if (m5ioe1_init((void *)shared_i2c_bus) == ESP_OK) {
+        m5ioe1_set_pin(EPD_EN_IOE_PIN, true);
+        m5ioe1_set_pin(TOUCH_EN_IOE_PIN, true);
+        m5ioe1_set_pin(SD_EN_IOE_PIN, true);
+        m5ioe1_set_pin(EPD_RST_IOE_PIN, false);
+        m5ioe1_set_pin(TOUCH_RST_IOE_PIN, false);
+        vTaskDelay(pdMS_TO_TICKS(10));
+        m5ioe1_set_pin(EPD_RST_IOE_PIN, true);
+        m5ioe1_set_pin(TOUCH_RST_IOE_PIN, true);
+        /* FT6336 needs ~300 ms after reset before it answers on I2C
+         * (M5PaperMono-PowerDemo); touchscreen_init() runs much later
+         * in boot, so only the panel's short settle is waited here. */
+        vTaskDelay(pdMS_TO_TICKS(10));
+    } else {
+        ESP_LOGE(TAG, "M5IOE1 init failed -- display, touch and SD card "
+                      "stay unpowered");
+    }
+#endif
+#if defined(CONFIG_DRAFTLING_HAS_CH422G)
+    /* Bring up the CH422G before display_init() -- the RGB backend
+     * pulses the LCD reset line (EXIO3) and drives the backlight
+     * (EXIO2) through it as part of its own init (see
+     * components/display/display_rgb.cpp). Then pulse the GT911
+     * touch-reset line (EXIO1) with INT held low as a push-pull
+     * output so the controller latches its primary I2C address 0x5D
+     * (same address-select technique used on the M5Stack Tab5,
+     * without the TOUCH_EN power-cycle since this board's GT911 has
+     * its own dedicated reset line). touchscreen_init() further below
+     * reconfigures TOUCH_INT_PIN as an input before it starts polling. */
+    ch422g_init((void *)shared_i2c_bus);
+#if defined(CONFIG_DRAFTLING_TOUCHSCREEN) && (TOUCH_INT_PIN >= 0)
+    {
+        gpio_config_t int_cfg = {};
+        int_cfg.intr_type    = GPIO_INTR_DISABLE;
+        int_cfg.mode         = GPIO_MODE_OUTPUT;
+        int_cfg.pin_bit_mask = (1ULL << TOUCH_INT_PIN);
+        int_cfg.pull_up_en   = GPIO_PULLUP_DISABLE;
+        int_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+        gpio_config(&int_cfg);
+        gpio_set_level((gpio_num_t)TOUCH_INT_PIN, 0);
+        vTaskDelay(pdMS_TO_TICKS(10));
+        ch422g_set_pin(CH422G_TOUCH_RST_PIN, false);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        ch422g_set_pin(CH422G_TOUCH_RST_PIN, true);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        gpio_reset_pin((gpio_num_t)TOUCH_INT_PIN);
+    }
+#endif
+#endif
+#endif
+#if defined(CONFIG_DRAFTLING_DISPLAY_MIPI_DSI)
+    /* M5Stack Tab5 shares its on-board I2C bus (SDA=31, SCL=32)
+     * between the PI4IOE5V6408 I/O expander (LCD_EN, TOUCH_EN, ...),
+     * the GT911 / ST7123 touch controller, the BMI270 IMU and the
+     * audio codec. The espressif/m5stack_tab5 BSP creates and owns
+     * the driver-NG bus inside bsp_i2c_init(); the touchscreen
+     * component picks it up further below via bsp_i2c_get_handle()
+     * + touchscreen_config_t.i2c_bus. Call bsp_i2c_init() once
+     * here, before display_init(), so the panel auto-detect probe
+     * inside the BSP can issue the read on a ready bus. */
+    {
+        esp_err_t bus_err = bsp_i2c_init();
+        if (bus_err != ESP_OK) {
+            ESP_LOGE(TAG, "bsp_i2c_init failed: %s", esp_err_to_name(bus_err));
+        }
+    }
+
+    /* M5Stack Tab5 GT911 I2C address selection.
+     *
+     * The GT911 latches its 7-bit I2C address from the level on its
+     * INT pin at the *rising edge* of its internal power-on reset:
+     *   INT low  during reset -> backup  address 0x14
+     *   INT high during reset -> primary address 0x5D
+     *
+     * The Tab5 has a hardware pull-up to 3V3 on the GT911 INT
+     * (ESP32-P4 GPIO23). If we leave that pull-up to win, the
+     * GT911 latches 0x5D, but the BSP only ever probes the backup
+     * 0x14 (and our own TOUCH_I2C_ADDR is 0x14 to match) so touch
+     * is effectively dead.
+     *
+     * Crucially, on this board the GT911 has NO dedicated RST line
+     * exposed to the SoC -- the BSP sets `rst_gpio_num = GPIO_NUM_NC`
+     * and `BSP_LCD_RST = GPIO_NUM_NC`. The only way to force the
+     * GT911 to re-run its internal power-on reset (and re-latch
+     * its I2C address) is to power-cycle the TOUCH_EN rail driven
+     * by the first PI4IOE5V6408 I/O expander (I2C 0x43, pin P5 =
+     * BSP_TOUCH_EN). On a cold boot the PI4IOE5V6408 starts with
+     * every pin in high-impedance, so TOUCH_EN is effectively low
+     * and the GT911 is unpowered until `bsp_feature_enable(TOUCH)`
+     * brings it up inside `bsp_get_board_version()`. But on a warm
+     * reboot (esp_restart, panic, watchdog, wake-from-reset) the
+     * PI4IOE5V6408 retains its previous register state -- TOUCH_EN
+     * is already high, the GT911 already latched 0x5D against the
+     * INT pull-up before we ever got control, and any amount of
+     * INT-low driving afterwards has no effect.
+     *
+     * So do both, in this order:
+     *   (a) drive GPIO23 LOW as a push-pull output (override the
+     *       3V3 pull-up at the SoC pin),
+     *   (b) ask the BSP for the first PI4IOE5V6408 handle, switch
+     *       BSP_TOUCH_EN (P5) to push-pull output, then drive it
+     *       low for >=10 ms and high again, holding INT low across
+     *       the whole edge so the GT911 latches 0x14.
+     *
+     * `touchscreen_init()` further down reconfigures GPIO23 to
+     * INPUT + pull-up for the normal "data ready" signalling.
+     * By then the GT911 has already latched its address, so the
+     * 3V3 idle level on INT no longer matters.
+     *
+     * The subsequent `bsp_feature_enable(BSP_FEATURE_TOUCH, true)`
+     * call inside `bsp_get_board_version()` (which is inside
+     * `display_init()` below) is idempotent: it just rewrites P5
+     * to the same `high` we already set here. */
+#if defined(CONFIG_DRAFTLING_TOUCHSCREEN) && TOUCH_INT_PIN >= 0
+    {
+        /* (a) Hold INT low at the SoC pin. */
+        gpio_config_t int_cfg = {};
+        int_cfg.intr_type    = GPIO_INTR_DISABLE;
+        int_cfg.mode         = GPIO_MODE_OUTPUT;
+        int_cfg.pin_bit_mask = (1ULL << TOUCH_INT_PIN);
+        int_cfg.pull_up_en   = GPIO_PULLUP_DISABLE;
+        int_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+        gpio_config(&int_cfg);
+        gpio_set_level((gpio_num_t)TOUCH_INT_PIN, 0);
+
+        /* (b) Power-cycle TOUCH_EN through the first PI4IOE5V6408
+         * so the GT911 actually re-runs its internal POR and
+         * latches the INT=low we just established. */
+        esp_io_expander_handle_t pi4 = bsp_io_expander_init();
+        if (pi4 == NULL) {
+            ESP_LOGW(TAG, "Tab5 touch: bsp_io_expander_init returned NULL; "
+                          "skipping GT911 power-cycle (touch may stay at 0x5D)");
+        } else {
+            esp_err_t err = esp_io_expander_set_dir(
+                pi4, BSP_TOUCH_EN, IO_EXPANDER_OUTPUT);
+            if (err == ESP_OK) {
+                err = esp_io_expander_set_output_mode(
+                    pi4, BSP_TOUCH_EN, IO_EXPANDER_OUTPUT_MODE_PUSH_PULL);
+            }
+            if (err == ESP_OK) {
+                err = esp_io_expander_set_level(pi4, BSP_TOUCH_EN, 0);
+            }
+            if (err == ESP_OK) {
+                /* GT911 datasheet: hold reset (here: VDD removed) for
+                 * at least 10 ms to drain rail capacitance and ensure
+                 * the internal POR actually fires on the next rise. */
+                vTaskDelay(pdMS_TO_TICKS(20));
+                err = esp_io_expander_set_level(pi4, BSP_TOUCH_EN, 1);
+            }
+            if (err == ESP_OK) {
+                /* GT911 typical boot time is ~50 ms; the BSP itself
+                 * waits 500 ms before probing 0x14. We just need the
+                 * chip to have latched the address before we release
+                 * the INT line as input later in touchscreen_init(),
+                 * so a short delay here is enough -- the BSP's own
+                 * 500 ms inside bsp_get_board_version() covers the
+                 * rest. */
+                vTaskDelay(pdMS_TO_TICKS(60));
+                ESP_LOGI(TAG, "Tab5 touch: TOUCH_EN power-cycled with "
+                              "INT held low (selects GT911 0x14 on v1; "
+                              "v2 ST7123 at 0x55 ignores INT)");
+            } else {
+                ESP_LOGW(TAG, "Tab5 touch: TOUCH_EN power-cycle failed: %s",
+                         esp_err_to_name(err));
+            }
+        }
+    }
+#endif
+
+    /* M5Stack Tab5 battery charger enable (CHG_EN, P7 on the second
+     * PI4IOE5V6408) is asserted later, AFTER `bsp_feature_enable()`
+     * has had a chance to bring up the second I/O expander (its
+     * driver's reset() routine wipes the output register and forces
+     * every pin into high-impedance, which would clobber any CHG_EN
+     * setting we did here). See the dedicated block further down,
+     * immediately after the BSP_FEATURE_WIFI bring-up. */
+#endif
+
+#if defined(CONFIG_DRAFTLING_DISPLAY_RLCD)
+    display_init(RLCD_MOSI_PIN, RLCD_SCK_PIN, RLCD_DC_PIN,
+                 RLCD_CS_PIN, RLCD_RST_PIN, -1,
+                 DISPLAY_WIDTH, DISPLAY_HEIGHT);
+#elif defined(CONFIG_DRAFTLING_DISPLAY_EPDIY)
+    /* vroland/epdiy backend. Owns all panel GPIOs via its board
+     * definition (epdiy's built-in epd_board_v7 on the LilyGO T5
+     * E-Paper S3 Pro / Pro Lite, the in-tree epd_board_papers3 on
+     * the M5Stack PaperS3). Pin parameters are ignored. */
+    display_init(-1, -1, -1, -1, -1, -1, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+#elif defined(CONFIG_DRAFTLING_DISPLAY_H752_EPD)
+    /* Original LilyGO H752 EPD47 backend. Owns all panel GPIOs via
+     * the vendored LilyGO shift-register driver. Pin parameters are
+     * ignored. */
+    display_init(-1, -1, -1, -1, -1, -1, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+#elif defined(CONFIG_DRAFTLING_DISPLAY_XTEINK_EPD)
+    /* Xteink X4 Pro / X4 Classic SPI e-paper backend. Owns all panel
+     * GPIOs internally (the pin set is picked at build time on the
+     * model symbol -- see components/display/display_xteink_epd.cpp)
+     * and auto-detects which of three possible controllers (SSD1677,
+     * UC8179, UC8279) the panel is wired to. Pin parameters are
+     * ignored. */
+    display_init(-1, -1, -1, -1, -1, -1, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+#elif defined(CONFIG_DRAFTLING_DISPLAY_MIPI_DSI)
+    /* M5Stack Tab5 MIPI-DSI panel. All panel GPIOs, the MIPI-DSI
+     * PHY LDO, the I/O expander wiring and the LEDC backlight
+     * channel are owned by the espressif/m5stack_tab5 BSP, which
+     * also auto-detects board v1 (ILI9881C + GT911) vs board v2
+     * (ST7123 + ST7123). display_init's pin parameters are ignored
+     * by this backend. */
+    display_init(-1, -1, -1, -1, -1, -1, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+#elif defined(CONFIG_DRAFTLING_DISPLAY_RGB)
+    /* Parallel RGB565 color LCD (Sunton ESP32-8048S0xx, Waveshare
+     * Touch-LCD-7 / LCD-3.16). All panel data / control / backlight
+     * GPIOs are owned by the RGB backend
+     * (components/display/display_rgb.cpp); pin parameters are
+     * ignored, only width/height are used. On the LCD-3.16 this also
+     * sends the ST7701 init sequence and then releases the shared
+     * BOOT / SD pins, so it must stay ahead of the SD mount and the
+     * BOOT-button poller. */
+    display_init(-1, -1, -1, -1, -1, -1, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+#if defined(CONFIG_DRAFTLING_MODEL_WAVESHARE_LCD_316)
+    ws_lcd316_quiet_i2c_peripherals();
+#endif
+#elif defined(CONFIG_DRAFTLING_DISPLAY_ILI9341) || defined(CONFIG_DRAFTLING_DISPLAY_ST7796) || \
+      defined(CONFIG_DRAFTLING_DISPLAY_ST7365)
+    /* Shared 4-wire SPI TFT backend. Freenove and Viewe use its
+     * built-in pin maps; custom-pin variants pass their board tuple
+     * through display_init(). */
+#if defined(CONFIG_DRAFTLING_DISPLAY_SPI_TFT_CUSTOM_PINS)
+    display_init(LCD_MOSI_PIN, LCD_SCK_PIN, LCD_DC_PIN, LCD_CS_PIN,
+                 LCD_RST_PIN, LCD_MISO_PIN, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+#else
+    display_init(-1, -1, -1, -1, -1, -1, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+#endif
+#elif defined(CONFIG_DRAFTLING_DISPLAY_ST77922)
+    /* Freenove FNK0104N. ST77922 QSPI color LCD; all panel GPIOs are
+     * hard-coded in display_st77922.cpp. Works in the panel's native
+     * portrait frame; the LVGL port rotates it landscape. Pin
+     * parameters are ignored. */
+    display_init(-1, -1, -1, -1, -1, -1, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+#elif defined(CONFIG_DRAFTLING_DISPLAY_SSD1683)
+    /* Elecrow CrowPanel 5.79in E-Paper HMI. Dual-SSD1683 SPI panel;
+     * all panel GPIOs and the panel power-enable pin are hard-coded
+     * inside display_ssd1683.cpp since this backend is used by
+     * exactly one board. Pin parameters are ignored. */
+    display_init(-1, -1, -1, -1, -1, -1, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+#elif defined(CONFIG_DRAFTLING_DISPLAY_WS_EPD397)
+    /* Waveshare ESP32-S3-ePaper-3.97 SPI e-paper backend. Owns all
+     * panel GPIOs internally (see display_ws_epd397.cpp); a single
+     * SSD1677-family controller, no manufacturing-run detection
+     * needed. Pin parameters are ignored. The AXP2101 ALDO3 panel
+     * rail was already enabled above via display_set_shared_i2c_bus(). */
+    display_init(-1, -1, -1, -1, -1, -1, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+#elif defined(CONFIG_DRAFTLING_DISPLAY_M5_PAPERMONO)
+    /* M5Stack PaperMono SPI e-paper backend. Owns all panel GPIOs
+     * internally (see display_m5_papermono.cpp); the panel supply and
+     * reset were handled through the M5IOE1 above. Pin parameters
+     * are ignored. */
+    display_init(-1, -1, -1, -1, -1, -1, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+#elif defined(CONFIG_DRAFTLING_DISPLAY_SEEED_E1001)
+    /* Seeed Studio reTerminal E1001 (7.5" 800x480 UC8179 e-paper).
+     * Owns all panel GPIOs internally (see display_seeed_e1001.cpp). */
+    display_init(-1, -1, -1, -1, -1, -1, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+#elif defined(CONFIG_DRAFTLING_DISPLAY_RETERMINAL_STICKY)
+    /* Seeed reTerminal Sticky SPI e-paper backend. Owns all panel
+     * GPIOs internally (see display_reterminal_sticky.cpp), including
+     * its own plain-GPIO panel power-enable pin (no PMIC on this
+     * board, unlike the Waveshare ESP32-S3-ePaper-3.97 above). Pin
+     * parameters are ignored. This call also stands up the SPI2_HOST
+     * bus that the MicroSD card below shares with the panel. */
+    display_init(-1, -1, -1, -1, -1, -1, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+#elif defined(CONFIG_DRAFTLING_DISPLAY_AXS15231B)
+    /* AXS15231B QSPI color LCD. Needs 9 GPIOs (CS/SCK/D0..D3/RST/TE/BL),
+     * which do not fit in display_init()'s 6 pin slots, so the backend
+     * exposes a dedicated struct-based init. */
+    {
+        display_axs15231b_config_t cfg = {};
+        cfg.cs     = LCD_QSPI_CS_PIN;
+        cfg.sck    = LCD_QSPI_SCK_PIN;
+        cfg.d0     = LCD_QSPI_D0_PIN;
+        cfg.d1     = LCD_QSPI_D1_PIN;
+        cfg.d2     = LCD_QSPI_D2_PIN;
+        cfg.d3     = LCD_QSPI_D3_PIN;
+        cfg.rst    = LCD_RST_PIN;
+        cfg.te     = LCD_TE_PIN;
+        cfg.bl     = LCD_BL_PIN;
+        cfg.width  = DISPLAY_WIDTH;
+        cfg.height = DISPLAY_HEIGHT;
+        /* The Guition JC3248W535's AXS15231B silicon ignores the
+         * MADCTL MV (swap-XY) bit (same observation as Tactility's
+         * driver for this board), so the backend has to software-
+         * rotate at flush time to present the 320x480 portrait
+         * panel as 480x320 landscape. Waveshare's Touch-LCD-3.49
+         * is mounted with the same AXS15231B silicon but a 172x640
+         * portrait panel; its reference firmware also software-
+         * rotates to 640x172 landscape (USER_DISP_ROT_90), so we
+         * take the same path. */
+#if defined(CONFIG_DRAFTLING_MODEL_JC3248W535) || \
+    defined(CONFIG_DRAFTLING_MODEL_WAVESHARE_TOUCH_LCD_349)
+        cfg.swap_xy = true;
+#else
+        cfg.swap_xy = false;
+#endif
+        /* The hand-coded vendor-register block in display_axs15231b.cpp
+         * was adapted from the Guition JC3248W535 reference and is
+         * required to drive that 480x320 panel out of its weak factory
+         * defaults. The Waveshare Touch-LCD-3.49's 172x640 panel
+         * already ships with correct factory POR values -- the
+         * upstream Espressif esp_lcd_axs15231b driver lets users
+         * supply only {SLPOUT, DISPON} for that board, which is what
+         * Waveshare's reference firmware does. Sending the JC3248W535
+         * recipe to that panel clobbers its correct defaults and
+         * leaves the display black on cold boot until the user
+         * presses RESET. Skip the vendor block on Touch-LCD-3.49. */
+#if defined(CONFIG_DRAFTLING_MODEL_WAVESHARE_TOUCH_LCD_349)
+        cfg.skip_vendor_init = true;
+#else
+        cfg.skip_vendor_init = false;
+#endif
+        cfg.bl_deep_sleep_cut = LCD_BL_DEEP_SLEEP_CUT_PIN;
+        cfg.bl_active_low     = (LCD_BL_ACTIVE_LOW != 0);
+        display_axs15231b_init(&cfg);
+    }
+#endif
+
+    /* Initialize LVGL.
+     *
+     * LVGL renders 1:1 at the panel resolution; DISPLAY_LOGICAL_WIDTH /
+     * DISPLAY_LOGICAL_HEIGHT are aliases of the physical panel size
+     * (before rotation -- LVGL swaps them internally for a 90/270
+     * angle). (High-density boards no longer upscale the framebuffer;
+     * they use a larger font instead -- see
+     * CONFIG_DRAFTLING_DISPLAY_HIDPI.)
+     *
+     * DISPLAY_ROTATE_EFFECTIVE folds in the "Display orientation"
+     * setting: portrait = the board's base rotation + 90. */
+    ESP_LOGI(TAG, "Initializing LVGL...");
+    draftling_lvgl_port_init(DISPLAY_LOGICAL_WIDTH, DISPLAY_LOGICAL_HEIGHT,
+                             DISPLAY_ROTATE_EFFECTIVE);
+
+    /* Initialize battery voltage monitor before the UI so the editor
+     * status bar can show the battery level immediately. battery_init
+     * is a no-op when BATT_ADC_PIN is < 0 (HAT case). */
+    ESP_LOGI(TAG, "Initializing battery monitor...");
+#if defined(CONFIG_DRAFTLING_BATTERY_BQ27220) && \
+    defined(CONFIG_DRAFTLING_MODEL_SEEED_RETERMINAL_STICKY)
+    /* Seeed reTerminal Sticky: BQ27220 fuel gauge sits on its OWN
+     * dedicated I2C bus (I2C_NUM_1, SDA=GAUGE_I2C_SDA_PIN=1,
+     * SCL=GAUGE_I2C_SCL_PIN=0), physically separate from the GT911
+     * touch bus that touchscreen_init() creates on I2C_NUM_0 further
+     * below -- unlike the LilyGO T5 Pro branch below, there is no
+     * pre-existing "shared_i2c_bus" to reuse, since this board is not
+     * part of the epdiy/H752/xteink/CH422G display group. Create it
+     * here, right before the one component that needs it. */
+    {
+        i2c_master_bus_handle_t gauge_bus = NULL;
+        i2c_master_bus_config_t bus_cfg = {};
+        bus_cfg.i2c_port          = 1;
+        bus_cfg.sda_io_num        = (gpio_num_t)GAUGE_I2C_SDA_PIN;
+        bus_cfg.scl_io_num        = (gpio_num_t)GAUGE_I2C_SCL_PIN;
+        bus_cfg.clk_source        = I2C_CLK_SRC_DEFAULT;
+        bus_cfg.glitch_ignore_cnt = 7;
+        bus_cfg.flags.enable_internal_pullup = true;
+        esp_err_t bus_err = i2c_new_master_bus(&bus_cfg, &gauge_bus);
+        if (bus_err != ESP_OK) {
+            ESP_LOGW(TAG, "Gauge I2C bus init failed: %s; "
+                          "battery indicator disabled",
+                     esp_err_to_name(bus_err));
+        } else if (battery_init_bq27220(gauge_bus) != 0) {
+            ESP_LOGW(TAG, "BQ27220 fuel gauge init failed; "
+                          "battery indicator disabled");
+        }
+    }
+#elif defined(CONFIG_DRAFTLING_BATTERY_BQ27220)
+    /* LilyGO T5 E-Paper S3 Pro / Pro Lite: BQ27220YZFR fuel gauge
+     * lives on the same I2C bus we already created above for epdiy
+     * + GT911. The ADC backend has no pin (BATT_ADC_PIN == -1) on
+     * these boards; battery_init() would early-return, so we drive
+     * the BQ27220 backend directly. */
+    if (battery_init_bq27220(shared_i2c_bus) != 0) {
+        ESP_LOGW(TAG, "BQ27220 fuel gauge init failed; "
+                      "falling back to ADC backend");
+        battery_init(BATT_ADC_PIN, BATT_EN_PIN, BATT_DIVIDER);
+    }
+#elif defined(CONFIG_DRAFTLING_BATTERY_INA226)
+    /* M5Stack Tab5: TI INA226 current/voltage monitor at I2C 0x41 on
+     * the shared system bus owned by the espressif/m5stack_tab5 BSP
+     * (bsp_i2c_init() is run earlier by display_init() via the MIPI
+     * DSI backend). Battery pack is a 2S NP-F550 (~6.0-8.4 V); the
+     * INA226 backend divides bus voltage by cell count before
+     * looking up the per-cell SoC table. */
+    if (battery_init_ina226(bsp_i2c_get_handle(), 0x41, 2) != 0) {
+        ESP_LOGW(TAG, "INA226 init failed; battery indicator disabled");
+    }
+#elif defined(CONFIG_DRAFTLING_BATTERY_CW2017)
+    /* Xteink X4 Pro / X4 Classic: CW2017 fuel gauge on the shared I2C
+     * bus created above (which also carries the GT911 touch controller
+     * on the X4 Pro). No charger IC on this bus, so
+     * battery_read_charging() always reports "unknown" for this
+     * backend. */
+    if (battery_init_cw2017(shared_i2c_bus) != 0) {
+        ESP_LOGW(TAG, "CW2017 fuel gauge init failed; battery indicator disabled");
+    }
+#elif defined(CONFIG_DRAFTLING_BATTERY_AXP2101)
+    /* Waveshare ESP32-S3-ePaper-3.97: AXP2101 PMIC on the shared I2C
+     * bus created above. This is the same chip whose ALDO3 rail was
+     * already enabled (via battery_axp2101_enable_display_rail(),
+     * called from display_set_shared_i2c_bus()) before display_init()
+     * -- this call reuses that same cached I2C device handle and sets
+     * up battery-voltage/percent/charging reporting on top of it. */
+    if (battery_init_axp2101(shared_i2c_bus) != 0) {
+        ESP_LOGW(TAG, "AXP2101 init failed; battery indicator disabled");
+    }
+#elif defined(CONFIG_DRAFTLING_BATTERY_M5PM1)
+    /* M5Stack PaperMono: already brought up before display_init()
+     * (the chip also gates the board's power rails); a second call is
+     * a no-op that just reports whether it succeeded. */
+    if (battery_init_m5pm1(shared_i2c_bus) != 0) {
+        ESP_LOGW(TAG, "M5PM1 init failed; battery indicator disabled");
+    }
+#else
+    battery_init(BATT_ADC_PIN, BATT_EN_PIN, BATT_DIVIDER);
+#endif
+
+#if defined(CONFIG_DRAFTLING_CHARGER_BQ25896)
+    /* LilyGO T5 E-Paper S3 Pro / Pro Lite: the on-board BQ25896
+     * charger powers up with USB-SDP-class settings (500 mA IINLIM,
+     * AUTO_DPDM re-detecting on every plug-in, 40 s I2C watchdog
+     * that reverts host writes) and would otherwise charge the cell
+     * at ~500 mA regardless of the wall adapter rating. Lift the
+     * input current limit, raise the fast-charge current and
+     * disable the watchdog so the settings persist. Uses the same
+     * shared I2C bus as the BQ27220 fuel gauge (chip at 0x6B). */
+    if (battery_init_bq25896(shared_i2c_bus) != 0) {
+        ESP_LOGW(TAG, "BQ25896 charger init failed; "
+                      "device will charge at reduced rate");
+    }
+#endif
+
+#if defined(CONFIG_DRAFTLING_DEBUG_POWER)
+    /* Boot-time fuel-gauge dump + (if this boot was a wake from
+     * deep sleep) drain-rate estimate vs the SOC we persisted on
+     * the way into sleep. Cheap (two I2C reads + one NVS read);
+     * Kconfig-gated so production builds stay quiet. */
+    log_boot_power_telemetry();
+#endif
+#if defined(CONFIG_DRAFTLING_DEBUG_POWER) || \
+    defined(CONFIG_DRAFTLING_CHARGER_WATCHDOG_REASSERT)
+    /* Periodic BQ25896 maintenance task (30 s):
+     *   - re-asserts ICO_EN=0 + watchdog disabled (tamper-resistance)
+     *   - logs full charger status when VBUS is present (DEBUG_POWER)
+     * No-op when the chip is not present (the helper API early-exits). */
+    charger_maint_start();
+#endif
+
+    /* Create editor UI */
+    ESP_LOGI(TAG, "Creating editor UI...");
+    editor_ui_set_board_name(BOARD_NAME);
+    if (draftling_lvgl_port_lock(-1)) {
+        editor_ui_init();
+        draftling_lvgl_port_unlock();
+    }
+
+    /* Initialize SD card */
+    ESP_LOGI(TAG, "Initializing SD card...");
+    esp_err_t sd_ret = ESP_FAIL;
+#if defined(CONFIG_DRAFTLING_DISPLAY_EPDIY)
+    /* Hold the LVGL port lock across the whole SD mount sequence on
+     * epdiy e-paper boards (M5Stack PaperS3, LilyGO T5 E-Paper S3 Pro
+     * / Pro Lite).
+     *
+     * When NO card is inserted, sd_card_init_spi()'s retry ladder
+     * spends up to ~800 ms in its slowest attempt (1 MHz), keeping
+     * core 0 busy servicing the SPI3 ISR and the sdspi command
+     * timeouts. The epdiy LCD render path feeds pixel lines through
+     * the ESP32-S3 LCD peripheral on a tight ~25 us-per-line schedule
+     * driven by the LCD VSYNC and GDMA end-of-frame interrupts (also
+     * on core 0). If an EPD flush starts while that slow probing is
+     * hammering core 0, the frame timing is disrupted, the LCD state
+     * machine desyncs, and both epdiy "epd_prep" feeder tasks
+     * busy-spin forever at top priority -- starving IDLE0 and tripping
+     * the task watchdog. The symptom appears only with no card,
+     * because a present card mounts on the first 20 MHz attempt and an
+     * EPD flush never overlaps a slow attempt.
+     *
+     * EPD flushes run from the LVGL task inside lv_timer_handler(),
+     * which holds this same lock (see lvgl_port.cpp). Taking the lock
+     * here lets any in-progress flush finish, then blocks new flushes
+     * for the duration of the mount, making SD probing and EPD
+     * refreshes mutually exclusive. (NOTE: the SPI master allocates a
+     * dedicated, non-shared interrupt, so the earlier "SD mount frees
+     * epdiy's shared SPI IRQ" theory does not hold; this serialization
+     * is the actual fix.) */
+    bool sd_lvgl_held = draftling_lvgl_port_lock(-1);
+#endif
+#if defined(CONFIG_DRAFTLING_MODEL_XTEINK_X4)
+    /* SD slot power-enable, active-low. Drive it before mounting.
+     * X4 Pro: GPIO5, driven straight LOW. X4 Classic: GPIO6, which
+     * wants a power-cycle first (HIGH ~80 ms to drain the rail, then
+     * LOW and held LOW while the card is mounted -- FreeInk SDK
+     * SdmmcBlockDevice). */
+    {
+        gpio_config_t sd_pwr = {};
+        sd_pwr.intr_type    = GPIO_INTR_DISABLE;
+        sd_pwr.mode         = GPIO_MODE_OUTPUT;
+        sd_pwr.pin_bit_mask = (1ULL << SD_POWER_EN_PIN);
+        gpio_config(&sd_pwr);
+#if defined(CONFIG_DRAFTLING_MODEL_XTEINK_X4_CLASSIC)
+        gpio_set_level((gpio_num_t)SD_POWER_EN_PIN, 1);
+        vTaskDelay(pdMS_TO_TICKS(80));
+#endif
+        gpio_set_level((gpio_num_t)SD_POWER_EN_PIN, 0);
+    }
+#endif
+#if defined(CONFIG_DRAFTLING_SD_SDMMC)
+    /* Boards with the SD slot wired to the on-chip SDMMC peripheral
+     * (Waveshare RLCD-4.2). Uses 1-bit mode to keep the pin count
+     * down. */
+    sd_ret = sd_card_init(SD_CLK_PIN, SD_CMD_PIN, SD_D0_PIN, SD_MOUNT_POINT);
+#else
+#if defined(BOARD_LORA_CS_PIN) && (BOARD_LORA_CS_PIN >= 0)
+    /* LilyGO T5 E-Paper S3 Pro: the on-board MicroSD slot shares its
+     * SPI bus with the SX1262 LoRa radio. If the LoRa CS line is
+     * left floating, SD init can fail intermittently because the
+     * LoRa chip latches onto SPI traffic intended for the SD card
+     * (LilyGO T5S3-4.7-e-paper-PRO issue #3). Drive LoRa CS HIGH
+     * here -- on the Pro Lite variant the LoRa silicon is
+     * depopulated, so this is just a harmless drive on an
+     * unconnected output. */
+    {
+        gpio_config_t lora_cs = {};
+        lora_cs.intr_type    = GPIO_INTR_DISABLE;
+        lora_cs.mode         = GPIO_MODE_OUTPUT;
+        lora_cs.pin_bit_mask = (1ULL << BOARD_LORA_CS_PIN);
+        gpio_config(&lora_cs);
+        gpio_set_level((gpio_num_t)BOARD_LORA_CS_PIN, 1);
+    }
+#endif
+    /* Every other supported board carries the SD card on a generic
+     * SPI bus separate from the display:
+     *   - PaperS3:                on-board MicroSD on SPI3
+     *   - AXS15231B color LCDs:   SPI3 (display owns SPI2 QSPI)
+     *   - LilyGO T5 E-Paper S3 Pro: on-board MicroSD on SPI3 (shared
+     *     with the SX1262 LoRa radio CS; we drive LoRa CS HIGH above
+     *     so the radio does not snoop the SD traffic).
+     *   - Waveshare ESP32-S3-Touch-LCD-7: SD chip-select is CH422G
+     *     EXIO4, not a direct GPIO (SD_SPI_CS_PIN is -1). The SD card
+     *     is the only device on this SPI bus, so we assert CS once
+     *     here instead of letting sdspi_host toggle a GPIO per
+     *     transaction -- it cannot toggle a pin that lives behind an
+     *     I2C expander.
+     * sd_card_init_spi() returns gracefully if no card is present. */
+#if defined(CONFIG_DRAFTLING_HAS_CH422G) && defined(CH422G_SD_CS_PIN)
+    ch422g_set_pin(CH422G_SD_CS_PIN, false);
+#endif
+#if defined(CONFIG_DRAFTLING_MODEL_ELECROW_CROWPANEL_579)
+    /* SD slot power-enable, active HIGH (IO42_TF_3.3_CTL on the
+     * vendor schematic). Drive it before mounting -- see the vendor's
+     * 5.79_TF Arduino example (digitalWrite(42, HIGH)). Release any
+     * hold left by pre_sleep_crowpanel_579_deinit() first -- on
+     * ESP32-S3 a gpio_deep_sleep_hold_en() latch survives the wake
+     * reset and keeps the pad clamped low until software releases it
+     * (same pattern as the EPD panel power pin in
+     * display_ssd1683.cpp's display_init()). */
+    {
+        gpio_hold_dis((gpio_num_t)SD_POWER_EN_PIN);
+        gpio_config_t sd_pwr = {};
+        sd_pwr.intr_type    = GPIO_INTR_DISABLE;
+        sd_pwr.mode         = GPIO_MODE_OUTPUT;
+        sd_pwr.pin_bit_mask = (1ULL << SD_POWER_EN_PIN);
+        gpio_config(&sd_pwr);
+        gpio_set_level((gpio_num_t)SD_POWER_EN_PIN, 1);
+    }
+#endif
+    sd_ret = sd_card_init_spi(SD_SPI_HOST_NUM,
+                              SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, SD_SPI_SCK_PIN,
+                              SD_SPI_CS_PIN, SD_EN_PIN,
+                              SD_MOUNT_POINT);
+#endif
+    if (sd_ret != ESP_OK) {
+        ESP_LOGE(TAG, "SD card init failed: %s", esp_err_to_name(sd_ret));
+        if (draftling_lvgl_port_lock(-1)) {
+            editor_ui_set_status("ERROR: SD card not ready");
+            draftling_lvgl_port_unlock();
+        }
+    }
+#if defined(CONFIG_DRAFTLING_DISPLAY_EPDIY)
+    /* Release the LVGL port lock taken before the mount sequence. The
+     * pending "ERROR: SD card not ready" status (or the editor's
+     * normal first refresh) is flushed by the LVGL task only now that
+     * SD probing has finished, so the flush can never overlap it. */
+    if (sd_lvgl_held) {
+        draftling_lvgl_port_unlock();
+    }
+#endif
+
+#if defined(CONFIG_DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO) || \
+    defined(CONFIG_DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO_H752)
+    /* LilyGO T5 E-Paper S3 Pro / Pro Lite: this firmware does not use
+     * the SX1262 LoRa radio or the MIA-M10Q GPS receiver. Both come
+     * up live after POR (SX1262 in STBY_RC ~600 uA, MIA-M10Q in full
+     * acquisition mode ~25 mA), which would burn ~25 mA on the
+     * battery for the entire active session before standby kicks in.
+     * Park them in their lowest-power state right now -- SPI3 has
+     * just been initialised by sd_card_init_spi() above, which is
+     * the bus the LoRa sleep helper needs. pre_sleep_t5_deinit()
+     * re-issues the same commands before deep sleep so a peripheral
+     * that was somehow re-armed in between still gets parked. */
+    t5_disable_radios_at_boot();
+#endif
+
+    /* Bring up the ESP-Hosted SDIO link to the on-board ESP32-C6
+     * co-processor before Bluetooth or Wi-Fi. The C6 provides the
+     * BLE controller (attached to Bluedroid via VHCI in
+     * ble_keyboard.cpp) and the 2.4 GHz Wi-Fi radio (used through
+     * esp_wifi_remote by wifi_manager.cpp).
+     *
+     * esp_hosted_init() / esp_hosted_connect_to_slave() return
+     * success even when the SDIO slave does not respond (the
+     * underlying transport_drv_reconfigure() failure is logged via
+     * ESP_ERROR_CHECK_WITHOUT_ABORT and swallowed). We therefore
+     * subscribe to the ESP_HOSTED_EVENT_TRANSPORT_UP event and
+     * require it to fire within a short timeout before continuing.
+     * If it doesn't, the most common cause is that the on-board
+     * ESP32-C6 is not flashed with the matching ESP-Hosted slave
+     * firmware (see docs/tab5-esp-hosted.md). In that case we show a
+     * persistent on-screen message and halt instead of letting later
+     * BLE/Wi-Fi initialisation abort the firmware. */
+#if defined(CONFIG_ESP_HOSTED_ENABLED)
+    {
+#if defined(CONFIG_DRAFTLING_DISPLAY_MIPI_DSI)
+        /* On the M5Stack Tab5 the ESP32-C6 co-processor's 3V3 rail is
+         * gated by WLAN_PWR_EN (PI4IOE5V6408 #2, address 0x44, P0).
+         * Until this pin is driven HIGH the C6 has no power, so the
+         * host's reset pulse on GPIO15 below targets a dead chip and
+         * the SDIO handshake never completes. Drive the rail high via
+         * the espressif/m5stack_tab5 BSP and wait briefly for the C6
+         * LDO to settle and the ROM bootloader to come up. bsp_i2c_init()
+         * has already been called above (display path), and
+         * bsp_feature_enable() is idempotent.
+         *
+         * A 50 ms post-enable delay was empirically insufficient on cold
+         * boot (SDIO CMD5 then times out with sdmmc_init_ocr: send_op_cond
+         * returned 0x107 even though the host pulses Slave_Reset on GPIO15
+         * afterwards). 200 ms gives the C6 LDO + CHIP_PU + ROM bootloader
+         * comfortable headroom before SDIO probing starts. */
+        esp_err_t pwr_err = bsp_feature_enable(BSP_FEATURE_WIFI, true);
+        if (pwr_err != ESP_OK) {
+            ESP_LOGE(TAG, "bsp_feature_enable(BSP_FEATURE_WIFI) failed: %s",
+                     esp_err_to_name(pwr_err));
+        } else {
+            ESP_LOGI(TAG, "ESP32-C6 power rail (WLAN_PWR_EN) enabled");
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+
+#if defined(CONFIG_DRAFTLING_MODEL_M5STACK_TAB5)
+        /* M5Stack Tab5: enable battery charging from the USB-C input.
+         *
+         * The Tab5 carries an IP2326 autonomous Li-ion charger gated
+         * by the CHG_EN signal, which is wired to P7 of the second
+         * PI4IOE5V6408 I/O expander (I2C address 0x44). The
+         * espressif/m5stack_tab5 BSP does not expose the charger pin
+         * in `bsp_feature_enable()`, and M5Stack's reference
+         * `bsp_io_expander_pi4ioe_init()` deliberately boots with
+         * CHG_EN = 0, which is why the battery never charges when
+         * USB is plugged in.
+         *
+         * This block must run AFTER `bsp_feature_enable(BSP_FEATURE_WIFI)`
+         * above. That call goes through `bsp_io_expander1_init()`,
+         * which constructs the espressif/esp_io_expander_pi4ioe5v6408
+         * driver; that driver's reset() routine issues a chip-reset
+         * and then re-writes the default register values
+         * (OUT_SET = 0x00, OUT_H_IM = 0xFF, IO_DIR = 0xFF), which
+         * would clobber any direct I2C write we did before the BSP
+         * initialised the expander.
+         *
+         * We deliberately use the BSP-managed `esp_io_expander_handle_t`
+         * (rather than raw I2C writes) so the driver's cached shadow
+         * registers stay in sync with the chip. Otherwise a later
+         * BSP `esp_io_expander_set_level()` call on any OTHER pin
+         * (the BSP performs read-modify-write on its own shadow,
+         * never reading back the chip) would overwrite CHG_EN
+         * because the shadow still believes P7 is 0.
+         *
+         * Switching the pin to PUSH_PULL is required: the
+         * PI4IOE5V6408 powers up with every pin in high-impedance
+         * (OUT_H_IM = 0xFF), and the driver's reset() restores that
+         * default. Even with IO_DIR = output and OUT_SET = 1 the
+         * pin would otherwise stay floating and the IP2326 would
+         * never see CHG_EN go high.
+         */
+        {
+            esp_io_expander_handle_t pi4 = bsp_io_expander1_init();
+            if (pi4 == NULL) {
+                ESP_LOGW(TAG, "Tab5 CHG_EN: bsp_io_expander1_init returned NULL");
+            } else {
+                esp_err_t err = esp_io_expander_set_dir(
+                    pi4, IO_EXPANDER_PIN_NUM_7, IO_EXPANDER_OUTPUT);
+                if (err == ESP_OK) {
+                    err = esp_io_expander_set_output_mode(
+                        pi4, IO_EXPANDER_PIN_NUM_7,
+                        IO_EXPANDER_OUTPUT_MODE_PUSH_PULL);
+                }
+                if (err == ESP_OK) {
+                    err = esp_io_expander_set_level(
+                        pi4, IO_EXPANDER_PIN_NUM_7, 1);
+                }
+                if (err == ESP_OK) {
+                    ESP_LOGI(TAG, "Tab5 CHG_EN asserted (PI4IOE5V6408 #2 P7 = 1)");
+                } else {
+                    ESP_LOGW(TAG, "Tab5 CHG_EN setup failed: %s",
+                             esp_err_to_name(err));
+                }
+            }
+        }
+#endif /* CONFIG_DRAFTLING_MODEL_M5STACK_TAB5 */
+#endif
+        ESP_LOGI(TAG, "Initializing ESP-Hosted link to ESP32-C6...");
+
+        /* esp_hosted_init() posts ESP_HOSTED_EVENT_TRANSPORT_UP via
+         * the default event loop, so it must exist before we call
+         * into ESP-Hosted. wifi_manager_init() creates it later; here
+         * we just ensure it's already up. ESP_ERR_INVALID_STATE means
+         * "already created", which is fine. */
+        esp_err_t loop_err = esp_event_loop_create_default();
+        if (loop_err != ESP_OK && loop_err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(TAG, "esp_event_loop_create_default failed: %s",
+                     esp_err_to_name(loop_err));
+        }
+
+        static EventGroupHandle_t s_hosted_evt = NULL;
+        s_hosted_evt = xEventGroupCreate();
+        constexpr EventBits_t HOSTED_UP_BIT = BIT0;
+
+        auto hosted_event_cb = [](void *arg, esp_event_base_t /*base*/,
+                                  int32_t id, void * /*data*/) {
+            if (id == ESP_HOSTED_EVENT_TRANSPORT_UP) {
+                xEventGroupSetBits(reinterpret_cast<EventGroupHandle_t>(arg),
+                                   HOSTED_UP_BIT);
+            }
+        };
+
+        esp_err_t reg_err = esp_event_handler_register(
+            ESP_HOSTED_EVENT, ESP_EVENT_ANY_ID,
+            hosted_event_cb, s_hosted_evt);
+        if (reg_err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_event_handler_register(ESP_HOSTED_EVENT) "
+                          "failed: %s", esp_err_to_name(reg_err));
+        }
+
+        int hosted_err = esp_hosted_init();
+        if (hosted_err == 0) {
+            hosted_err = esp_hosted_connect_to_slave();
+        }
+
+        /* Wait up to 5 seconds for the SDIO transport to come up. The
+         * normal handshake completes in well under a second on a
+         * healthy Tab5; 5 s leaves generous margin for slower retries
+         * without keeping the user staring at an empty screen for
+         * long. */
+        const TickType_t timeout = pdMS_TO_TICKS(5000);
+        EventBits_t bits = xEventGroupWaitBits(
+            s_hosted_evt, HOSTED_UP_BIT,
+            pdFALSE /* clear */, pdTRUE /* wait all */, timeout);
+
+        esp_event_handler_unregister(ESP_HOSTED_EVENT, ESP_EVENT_ANY_ID,
+                                     hosted_event_cb);
+
+        if ((bits & HOSTED_UP_BIT) == 0) {
+            ESP_LOGE(TAG, "ESP-Hosted link did not come up "
+                          "(hosted_err=%d). The on-board ESP32-C6 is "
+                          "probably not flashed with the matching "
+                          "ESP-Hosted slave firmware. Halting.",
+                     hosted_err);
+            const char *fatal_msg =
+                "ESP32-C6 not responding.\n\n"
+                "The on-board ESP32-C6 co-processor is not "
+                "responding over the ESP-Hosted SDIO link. "
+                "This usually means it has not been flashed "
+                "with the matching ESP-Hosted slave firmware.\n\n"
+                "Please flash the ESP32-C6 with the ESP-Hosted "
+                "slave firmware, then power-cycle the device.\n\n"
+                "See docs/tab5-esp-hosted.md for instructions.";
+            if (draftling_lvgl_port_lock(-1)) {
+                editor_ui_show_fatal(fatal_msg);
+                draftling_lvgl_port_unlock();
+            }
+            /* Stop here. Do not proceed to ble_keyboard_init() /
+             * wifi_manager / etc.: those abort the firmware when the
+             * hosted link is down, which would wipe the message we
+             * just put on screen. */
+            while (true) {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
+        }
+        ESP_LOGI(TAG, "ESP-Hosted link up");
+    }
+#endif
+
+    /* Bring up the M5Stack Tab5 attachable keyboard (I2C + GPIO INT).
+     * Probed once here: if the keyboard is attached it is initialised
+     * in HID interrupt mode and feeds the editor alongside any USB
+     * keyboard; if it is absent the driver goes idle and issues no
+     * further I2C traffic this boot. Runs before the USB probe so the
+     * combined "is any wired keyboard present?" decision below can
+     * suppress the automatic BLE scan when local input already
+     * exists. */
+    bool tab5_kbd_present = false;
+#if defined(CONFIG_DRAFTLING_HAS_TAB5_KBD)
+    ESP_LOGI(TAG, "Probing for Tab5 keyboard...");
+    /* The Tab5 keyboard sits on its own I2C bus (SDA/SCL configured
+     * via CONFIG_DRAFTLING_TAB5_KBD_I2C_SDA_GPIO / _SCL_GPIO), not on
+     * the shared system bus (touch / IMU / codec). Create a dedicated
+     * master bus for it here. The system bus owned by bsp_i2c_init()
+     * already holds one controller, so let ESP-IDF auto-pick a free
+     * port (i2c_port = -1) instead of hard-coding one and colliding. */
+    i2c_master_bus_handle_t tab5_kbd_bus = NULL;
+    {
+        i2c_master_bus_config_t kbd_bus_cfg = {};
+        kbd_bus_cfg.i2c_port          = -1;
+        kbd_bus_cfg.sda_io_num        = (gpio_num_t)CONFIG_DRAFTLING_TAB5_KBD_I2C_SDA_GPIO;
+        kbd_bus_cfg.scl_io_num        = (gpio_num_t)CONFIG_DRAFTLING_TAB5_KBD_I2C_SCL_GPIO;
+        kbd_bus_cfg.clk_source        = I2C_CLK_SRC_DEFAULT;
+        kbd_bus_cfg.glitch_ignore_cnt = 7;
+        kbd_bus_cfg.flags.enable_internal_pullup = true;
+        esp_err_t kbd_bus_err = i2c_new_master_bus(&kbd_bus_cfg, &tab5_kbd_bus);
+        if (kbd_bus_err != ESP_OK) {
+            ESP_LOGE(TAG, "Tab5 keyboard I2C bus init failed: %s",
+                     esp_err_to_name(kbd_bus_err));
+            tab5_kbd_bus = NULL;
+        }
+    }
+    if (tab5_kbd_bus &&
+        tab5_kbd_init(tab5_kbd_bus,
+                      CONFIG_DRAFTLING_TAB5_KBD_INT_GPIO) == 0) {
+        tab5_kbd_present = true;
+    }
+#endif
+
+    /* Bring up USB Host + HID keyboard driver (Tab5 USB-A /
+     * MicroJournal native USB port).
+     * If a USB keyboard is enumerated within the probe window we
+     * disable BLE so the wired keyboard is the sole input source;
+     * if the user later unplugs the USB keyboard, the disconnect
+     * handler in usb_kbd.cpp calls ble_keyboard_enable() and BLE
+     * resumes scanning. BLE is brought up unconditionally below
+     * so this hand-off works in both directions.
+     */
+    bool usb_kbd_present = false;
+#if defined(CONFIG_DRAFTLING_HAS_USB_HOST)
+    ESP_LOGI(TAG, "Starting USB host...");
+#if defined(CONFIG_DRAFTLING_USB_HOST_BSP_MANAGED)
+    esp_err_t usb_err = bsp_usb_host_start(BSP_USB_HOST_POWER_MODE_USB_DEV,
+                                            true /* limit to 500 mA */);
+#else
+    esp_err_t usb_err = ESP_OK;
+#endif
+    if (usb_err != ESP_OK) {
+        ESP_LOGW(TAG, "bsp_usb_host_start failed: %s",
+                 esp_err_to_name(usb_err));
+    } else if (usb_kbd_init() == 0) {
+        const int probe_ms = CONFIG_DRAFTLING_USB_KBD_PROBE_MS;
+        ESP_LOGI(TAG, "Probing for USB keyboard (%d ms)...", probe_ms);
+        /* Poll every 50 ms so we exit as soon as enumeration
+         * completes rather than always waiting the full window. */
+        for (int waited = 0; waited < probe_ms; waited += 50) {
+            if (usb_kbd_is_connected()) break;
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        usb_kbd_present = usb_kbd_is_connected();
+    }
+#endif
+
+    /* Initialize Bluetooth keyboard.
+     *
+     * We always bring BLE up so it can take over as soon as the
+     * user unplugs the USB keyboard (the USB disconnect handler in
+     * usb_kbd.cpp calls ble_keyboard_enable() which restarts
+     * scanning) or chooses "BLE: Start scan" from the menu. When a
+     * wired keyboard (USB or the Tab5 attachable keyboard) is
+     * already present at boot we initialise BLE and immediately
+     * disable it; the BT controller stays up but the host stops
+     * scanning and stops dispatching key events / status text until
+     * it is re-enabled. */
+    bool wired_kbd_present = usb_kbd_present || tab5_kbd_present;
+    if (wired_kbd_present) {
+        if (usb_kbd_present) {
+            ESP_LOGI(TAG, "USB keyboard detected; BLE will stay idle "
+                          "until the USB keyboard is unplugged");
+        } else {
+            ESP_LOGI(TAG, "Tab5 keyboard detected; BLE stays idle "
+                          "(connect on demand via the menu)");
+        }
+        /* editor_ui_init() left the "Searching for BLE keyboard..."
+         * prompt screen active because at that point we did not yet
+         * know whether a local keyboard would be present. Jump
+         * straight to the file browser; the BLE connect callback will
+         * not fire while BLE is disabled. */
+        if (draftling_lvgl_port_lock(-1)) {
+            editor_ui_show_file_browser();
+            draftling_lvgl_port_unlock();
+        }
+    #if defined(CONFIG_BT_ENABLED)
+        ble_keyboard_init();
+        ble_keyboard_disable();
+    #endif
+    } else {
+    #if defined(CONFIG_BT_ENABLED)
+        ESP_LOGI(TAG, "Initializing Bluetooth keyboard...");
+        /* Now that we know we are going down the BLE path, replace
+         * the neutral "Initializing..." caption editor_ui_init()
+         * put on the boot screen with the actual "Searching for BLE
+         * keyboard..." prompt. Doing it here (rather than in
+         * editor_ui_init) keeps that message off the screen on the
+         * USB-keyboard path. */
+        if (draftling_lvgl_port_lock(-1)) {
+            editor_ui_set_ble_prompt_text(
+                "Searching for BLE keyboard...\nPlease turn on your keyboard");
+            draftling_lvgl_port_unlock();
+        }
+        ble_keyboard_init();
+#else
+        ESP_LOGI(TAG, "Bluetooth disabled; waiting for USB keyboard");
+        if (draftling_lvgl_port_lock(-1)) {
+            editor_ui_set_ble_prompt_text("Connect a USB keyboard...");
+            draftling_lvgl_port_unlock();
+        }
+#endif
+    }
+
+#if defined(CONFIG_DRAFTLING_TOUCHSCREEN)
+    /* Initialize the touchscreen and register the LVGL pointer
+     * indev. Must run after the display (LVGL needs the default
+     * display) and before standby_init (standby queries the touch
+     * INT GPIO when CONFIG_DRAFTLING_STANDBY_WAKE_ON_TOUCH is set).
+     *
+     * Touch native orientation and mirror flags come from
+     * app_config.h's per-board block (TOUCH_NATIVE_W / _H /
+     * TOUCH_SWAP_XY / TOUCH_MIRROR_X / TOUCH_MIRROR_Y), so this
+     * code stays board-agnostic. logical_width / logical_height
+     * are the panel pixel counts that LVGL itself uses (rendering is
+     * 1:1, so these equal the physical panel dimensions).
+     *
+     * On the LilyGO T5 E-Paper S3 Pro / Pro Lite the GT911 sits on
+     * the same physical I2C bus as epdiy's PCA9535 + TPS65185, and
+     * ESP-IDF allows only one driver-NG i2c_new_master_bus() per
+     * port. We therefore reuse the `shared_i2c_bus` handle created
+     * above and hand it to the touchscreen component via
+     * tcfg.i2c_bus; on every other board tcfg.i2c_bus stays NULL
+     * and the component creates its own bus from sda/scl as before. */
+    ESP_LOGI(TAG, "Initializing touchscreen...");
+    /* Note: on the Xteink X4 Pro the GT911 was fully power-cycled and
+     * hardware-reset (with the datasheet address-select timing) far
+     * above, before the shared I2C bus was created -- see the comment
+     * there. TOUCH_POWER_EN_PIN stays LOW (VDD on) from that point;
+     * tcfg.rst is passed as -1 below so touchscreen_init() does not
+     * re-pulse RST and undo the address select. */
+    {
+        touchscreen_config_t tcfg = {};
+        tcfg.sda      = I2C_SDA_PIN;
+        tcfg.scl      = I2C_SCL_PIN;
+#if defined(CONFIG_DRAFTLING_MODEL_XTEINK_X4_PRO) || \
+    defined(CONFIG_DRAFTLING_MODEL_SEEED_RETERMINAL_STICKY)
+        tcfg.rst      = -1;               /* reset already done in the block above */
+#else
+        tcfg.rst      = TOUCH_RST_PIN;
+#endif
+        tcfg.intr     = TOUCH_INT_PIN;
+        tcfg.i2c_addr = TOUCH_I2C_ADDR;
+        tcfg.i2c_port = 0;
+        tcfg.i2c_hz   = 400000;
+        tcfg.native_width   = TOUCH_NATIVE_W;
+        tcfg.native_height  = TOUCH_NATIVE_H;
+        /* All boards (including the Tab5 BSP-delegated path) feed
+         * LVGL indev coordinates in the *pre-rotation* logical pixel
+         * frame -- i.e. (DISPLAY_LOGICAL_WIDTH, DISPLAY_LOGICAL_HEIGHT),
+         * the same dimensions handed to lv_display_create() in
+         * draftling_lvgl_port_init().
+         *
+         * LVGL v9.2 itself applies the display rotation to indev
+         * points inside indev_pointer_proc() (using disp->hor_res /
+         * disp->ver_res, which stay at their unrotated values even
+         * after lv_display_set_rotation()). If we also rotated the
+         * touch coords in native_to_logical(), the two transforms
+         * would stack and the cursor would land at the wrong spot
+         * (a middle tap on Tab5 -- DISPLAY_ROTATE=270 -- would map
+         * to roughly 1/4 down from the top instead of the centre).
+         * Pass user_rotate_deg=0 so the rotation happens exactly
+         * once, inside LVGL. */
+        tcfg.logical_width  = DISPLAY_LOGICAL_WIDTH;
+        tcfg.logical_height = DISPLAY_LOGICAL_HEIGHT;
+        tcfg.swap_xy  = TOUCH_SWAP_XY  ? true : false;
+        tcfg.mirror_x = TOUCH_MIRROR_X ? true : false;
+        tcfg.mirror_y = TOUCH_MIRROR_Y ? true : false;
+        tcfg.user_rotate_deg = 0;
+#if defined(CONFIG_DRAFTLING_DISPLAY_EPDIY) || defined(CONFIG_DRAFTLING_DISPLAY_H752_EPD) || \
+    defined(CONFIG_DRAFTLING_DISPLAY_XTEINK_EPD) || defined(CONFIG_DRAFTLING_HAS_CH422G) || \
+    defined(CONFIG_DRAFTLING_DISPLAY_M5_PAPERMONO)
+        tcfg.i2c_bus = (void *)shared_i2c_bus;
+#elif defined(CONFIG_DRAFTLING_DISPLAY_MIPI_DSI)
+        /* The m5stack_tab5 BSP owns the I2C master bus (created
+         * by bsp_i2c_init() before display_init() above); hand
+         * its handle to the touchscreen component so we do not
+         * collide on i2c_new_master_bus() for the same port. */
+        tcfg.i2c_bus = (void *)bsp_i2c_get_handle();
+#endif
+        touchscreen_init(&tcfg);
+#if defined(CONFIG_DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO_H752)
+        /* Front touch key below the panel = Back (Esc). */
+        touchscreen_set_button_callback(h752_touch_button_cb);
+#endif
+    }
+#endif
+
+    /* WiFi is lazy-initialized on first wifi_manager_connect() call.
+     * On boards with a tight internal heap (e.g. M5Stack PaperS3,
+     * ~138 KB free) eagerly calling esp_wifi_init() here fails with
+     * ESP_ERR_NO_MEM because the WiFi static RX/TX buffers (DMA-
+     * capable, must live in internal RAM) cannot fit alongside the
+     * Bluedroid stack that ble_keyboard_init() just brought up. */
+
+    /* Initialize Git sync */
+    ESP_LOGI(TAG, "Initializing Git sync...");
+    git_sync_init();
+
+    /* Initialize standby manager (deep sleep on inactivity) */
+    ESP_LOGI(TAG, "Initializing standby manager...");
+    standby_init();
+#if defined(CONFIG_DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO)
+    standby_set_pre_sleep_cb(pre_sleep_t5_deinit);
+#elif defined(CONFIG_DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO_H752)
+    standby_set_pre_sleep_cb(pre_sleep_h752_deinit);
+#elif defined(CONFIG_DRAFTLING_MODEL_M5STACK_TAB5)
+    standby_set_pre_sleep_cb(pre_sleep_tab5_deinit);
+#elif defined(CONFIG_DRAFTLING_MODEL_XTEINK_X4_PRO)
+    standby_set_pre_sleep_cb(pre_sleep_xteink_x4_pro_deinit);
+#elif defined(CONFIG_DRAFTLING_MODEL_XTEINK_X4_CLASSIC)
+    standby_set_pre_sleep_cb(pre_sleep_xteink_x4_classic_deinit);
+#elif defined(CONFIG_DRAFTLING_MODEL_ELECROW_CROWPANEL_579)
+    standby_set_pre_sleep_cb(pre_sleep_crowpanel_579_deinit);
+#elif defined(CONFIG_DRAFTLING_MODEL_WAVESHARE_EPAPER_397)
+    standby_set_pre_sleep_cb(pre_sleep_ws_epaper397_deinit);
+#elif defined(CONFIG_DRAFTLING_MODEL_SEEED_RETERMINAL_E1001)
+    standby_set_pre_sleep_cb(pre_sleep_seeed_reterminal_e1001_deinit);
+#elif defined(CONFIG_DRAFTLING_MODEL_SEEED_RETERMINAL_STICKY)
+    standby_set_pre_sleep_cb(pre_sleep_reterminal_sticky_deinit);
+#elif defined(CONFIG_DRAFTLING_MODEL_M5STACK_PAPERMONO)
+    standby_set_pre_sleep_cb(pre_sleep_papermono_deinit);
+#else
+    standby_set_pre_sleep_cb(pre_sleep_autosave);
+#endif
+
+    /* Wire up the physical buttons that can trigger standby_enter_sleep()
+     * (the Xteink X4 Pro's Power short-press below) only now that
+     * standby_init() and the board's pre_sleep_cb above are both in
+     * place -- earlier, a press landing in that window would have
+     * called standby_enter_sleep() with no pre_sleep_cb registered,
+     * silently skipping the autosave/EPD-wipe/peripheral teardown. */
+#if defined(CONFIG_DRAFTLING_MODEL_LILYGO_T5_EPD_S3_PRO_H752)
+    /* Side key (GPIO48) = Menu (F1) on short press,
+     * forget all keyboards on 2 s long press. */
+    h752_user_key_init();
+#elif defined(CONFIG_DRAFTLING_MODEL_ELECROW_CROWPANEL_579)
+    /* Menu button (GPIO2) = F1 on short press, forget all keyboards
+     * on 2 s long press (same convention as the H752 side key
+     * above). Back button + dial switch (Esc/Up/Down/Enter) handle
+     * the rest of menu navigation once it is open. */
+    crowpanel_menu_key_init();
+    crowpanel_nav_init();
+#elif defined(CONFIG_DRAFTLING_MODEL_XTEINK_X4_CLASSIC)
+    /* Power button (GPIO3) = F1 on short press, forget all keyboards
+     * on 2 s long press. Six nav keys (Up/Down/Left/Right/Enter/Esc)
+     * drive the rest -- same buttons-only model as the CrowPanel. */
+    xteink_x4_classic_btn_init();
+#else
+    /* Generic wakeup-button long-press monitor: hold 2 s to forget
+     * all stored BLE keyboard pairings and start a fresh scan (and,
+     * on the Xteink X4 Pro, a short press to power off -- see
+     * wakeup_btn_poll_cb()). */
+#if CONFIG_DRAFTLING_WAKEUP_GPIO >= 0
+    wakeup_btn_init();
+#endif
+#if defined(CONFIG_DRAFTLING_MODEL_XTEINK_X4_PRO)
+    /* Left/Right buttons scroll the editor (Page Up / Page Down),
+     * alongside (not instead of) the generic Power/wakeup handler
+     * above. */
+    xteink_x4_pro_btn_init();
+#elif defined(CONFIG_DRAFTLING_MODEL_WAVESHARE_EPAPER_397)
+    /* Up/Function/Down buttons drive editor navigation (arrow keys /
+     * Enter), alongside (not instead of) the generic BOOT/wakeup
+     * handler above. */
+    ws_epaper397_nav_init();
+#elif defined(CONFIG_DRAFTLING_MODEL_SEEED_RETERMINAL_STICKY)
+    /* Up/Down page-turn buttons scroll the editor (Page Up / Page
+     * Down), alongside (not instead of) the generic Power/wakeup
+     * handler above. */
+    reterminal_sticky_btn_init();
+#elif defined(CONFIG_DRAFTLING_MODEL_M5STACK_PAPERMONO)
+    /* Button A / B short presses = Page Up / Page Down, alongside the
+     * generic handler above (A held 2 s forgets BLE keyboards) and the
+     * sleep-button handler below (B held 2 s sleeps). */
+    papermono_btn_init();
+#endif
+#endif
+
+#if CONFIG_DRAFTLING_SLEEP_BUTTON_GPIO >= 0
+    /* Second sleep trigger alongside whatever short-press handling
+     * the pin already got above (e.g. ws_epaper397_nav_init() on the
+     * Waveshare ePaper-3.97): hold DRAFTLING_SLEEP_BUTTON_GPIO for 2 s
+     * to enter deep sleep. */
+    sleep_button_init();
+#endif
+
+#if defined(CONFIG_DRAFTLING_HAS_POWER_LATCH)
+    /* On PWR long-press, run the full shutdown sequence via the
+     * standby manager: auto-save (pre_sleep_cb above), backlight
+     * cut, power-latch cut (battery: rail drops here; USB: no-op),
+     * then esp_deep_sleep_start. This is the same sequence used on
+     * inactivity timeout, so the behaviour is identical regardless
+     * of which path triggers the shutdown. */
+    power_set_long_press_cb(standby_enter_sleep);
+#endif
+
+    ESP_LOGI(TAG, "Draftling ready. Waiting for Bluetooth keyboard...");
+}

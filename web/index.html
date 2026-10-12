@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Draftling -- an open-source writerdeck</title>
+  <meta name="description" content="Draftling is open-source firmware that turns small e-paper and LCD devices into a distraction-free writerdeck with a Bluetooth keyboard and Git synchronization.">
+  <meta name="color-scheme" content="light dark">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+  <nav class="topnav">
+    <div class="wrap topnav-inner">
+      <a class="brand" href="#top">Draftling</a>
+      <ul>
+        <li><a href="#about">About</a></li>
+        <li><a href="#setup">Setup</a></li>
+        <li><a href="#settings">Settings</a></li>
+        <li><a href="#writing">Writing</a></li>
+        <li><a href="#license">License</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <header class="hero" id="top">
+    <div class="wrap">
+      <p class="eyebrow">Open-source writerdeck firmware</p>
+      <h1>Draftling</h1>
+      <p class="lead">
+        A small device dedicated to writing on the go. Flash the
+        firmware, pair a Bluetooth keyboard, and start writing.
+      </p>
+      <div class="actions">
+        <a class="btn btn-primary" href="https://clackups.github.io/draftling/">Open the web flasher</a>
+        <a class="btn" href="https://github.com/clackups/draftling">View on GitHub</a>
+      </div>
+      <figure class="hero-figure">
+        <img src="draftling_example.jpg" width="480" height="361"
+             alt="Xteink X4 Pro running Draftling, with a Jomaa KB231 keyboard">
+        <figcaption>Xteink X4 Pro with a Jomaa KB231 keyboard</figcaption>
+      </figure>
+    </div>
+  </header>
+
+  <main class="wrap content">
+
+    <section id="about">
+      <h2>What is Draftling?</h2>
+      <p>
+        Draftling is an
+        <a href="https://github.com/clackups/draftling">open-source
+        software project</a> that implements a writerdeck, also known as
+        a word processor: a small device dedicated to writing texts on
+        the go. You take one of the supported devices, flash the
+        firmware, connect a Bluetooth Low Energy keyboard, and you are
+        ready to write. You can also configure Wi-Fi access and a Git
+        repository, so that your text files are uploaded and kept in
+        sync if you edit them from multiple places.
+      </p>
+
+      <ul class="features">
+        <li>
+          <h3>Markdown</h3>
+          <p>Write with <a href="https://www.markdownguide.org/basic-syntax/">Markdown</a> formatting, rendered as you type.</p>
+        </li>
+        <li>
+          <h3>Fountain</h3>
+          <p>Draft screenplays in the <a href="https://fountain.io/syntax/">Fountain</a> format.</p>
+        </li>
+        <li>
+          <h3>Plain text</h3>
+          <p>Or just write plain text, exactly as you type it.</p>
+        </li>
+      </ul>
+    </section>
+
+    <section id="setup">
+      <h2>Setting up a device</h2>
+
+      <ol class="steps">
+        <li>
+          <h3>Get a supported device</h3>
+          <p>
+            The following devices are ready to use out of the box. See
+            also the <a href="https://github.com/clackups/draftling">project
+            page</a> for a variety of supported DIY boards.
+          </p>
+          <ul class="devices">
+            <li><a href="https://www.xteink.com/products/xteink-x4-pro-pocket-ereader">Xteink X4 Pro</a> <span class="note">unlocked devices only</span></li>
+            <li><a href="https://www.xteink.com/products/xteink-x4-classic-pocket-ereader">Xteink X4 Classic</a> <span class="note">unlocked devices only</span></li>
+            <li><a href="https://www.seeedstudio.com/sticky/">Seeed reTerminal Sticky</a></li>
+            <li><a href="https://shop.m5stack.com/products/papermono-lite-dev-kit-800x480-3-97-e-ink-display">M5Stack PaperMono / PaperMono-Lite</a></li>
+            <li><a href="https://lilygo.cc/products/t5-e-paper-s3-pro-lite">LilyGO T5 E-Paper S3 Pro / Pro Lite</a></li>
+            <li><a href="https://www.waveshare.com/esp32-s3-touch-lcd-3.49.htm">Waveshare ESP32-S3-Touch-LCD-3.49</a></li>
+            <li><a href="https://www.seeedstudio.com/reTerminal-E1001-p-6534.html">Seeed Studio reTerminal E1001</a>  <span class="note">7.5" e-paper, metal body</span></li>
+            <li><a href="https://docs.m5stack.com/en/core/PaperS3">M5Stack PaperS3</a> <span class="note">discontinued</span></li>
+          </ul>
+        </li>
+
+        <li>
+          <h3>Flash the firmware</h3>
+          <p>
+            Connect the device to your computer with a USB cable and open
+            <a href="https://clackups.github.io/draftling/">the web
+            flasher</a> in your browser. Allow the USB serial connection,
+            select your hardware type, and flash the firmware.
+          </p>
+        </li>
+
+        <li>
+          <h3>Pair a keyboard</h3>
+          <p>
+            You will need a Bluetooth Low Energy (BLE) keyboard to work
+            with the editor. There are hundreds of models on the market,
+            so choose the one that suits you best. If BLE pairing takes
+            too long, hold the Boot button on your Draftling device for
+            2 seconds: it will forget all previous pairings and search
+            for a new keyboard.
+          </p>
+        </li>
+
+        <li>
+          <h3>Insert a MicroSD card</h3>
+          <p>
+            Insert a formatted MicroSD card into the device. It does not
+            need to be large, since Draftling only works with text.
+          </p>
+        </li>
+      </ol>
+    </section>
+
+    <section id="settings">
+      <h2>Preferences and settings</h2>
+      <p>
+        Press <kbd>F1</kbd> to access a number of settings, such as the
+        font size, the screen orientation, and your preferred keyboard
+        layout(s). Append-only mode, if enabled, prevents you from
+        accidentally erasing your text. The Wi-Fi connection dialog lets
+        you set up the Internet connection used for file uploads.
+      </p>
+      <p>
+        You can also enable USB access to your SD card in the
+        <kbd>F1</kbd> menu. This way, you do not need to take the card
+        out of the device and look for an SD card reader. A few
+        devices like Seeed reTerminal E1001, reTerminal Sticky
+	and Elecrow CrowPanel do not support this on their USB port.
+      </p>
+
+      <h3>File synchronization with Git</h3>
+      <p>
+        Draftling uses Git for file synchronization. If you have an
+        account on GitHub, Codeberg, or another public Git hosting
+        service, create a read-write access token for your repository
+        and put it in <code>git.cfg</code> on the SD card.
+      </p>
+
+      <aside class="callout">
+        <h3>Draftbox</h3>
+        <p>
+          As an alternative to GitHub and others, I built
+          <a href="https://draftbox.art/">Draftbox</a>, an easy-to-use
+          Git hosting service tailored for writers. You create a
+          repository and an access token, and Draftbox generates a
+          one-time password. Enter it in the Draftling <kbd>F1</kbd>
+          menu, and the repository is attached to your device
+          automatically. You can start writing and uploading your
+          files right away. The service is not open for registration
+          yet, but you can drop me an email and I'll send you an
+          invite link.
+        </p>
+      </aside>
+    </section>
+
+    <section id="writing">
+      <h2>Writing</h2>
+      <p>
+        You press <kbd>Ctrl</kbd>+<kbd>N</kbd> to create a new file,
+        <kbd>Ctrl</kbd>+<kbd>S</kbd> to save it (Draftling will prompt
+        for a file name), and the rest is pretty easy and standard.
+        <kbd>F10</kbd> shows a help window with all the shortcuts.
+      </p>
+      <p>
+        Once you have a piece of text ready, press <kbd>Ctrl</kbd>+<kbd>W</kbd>
+        to connect Draftling to the Internet, then
+        <kbd>Ctrl</kbd>+<kbd>G</kbd> to synchronize your files with the
+        Git server.
+      </p>
+      <p>
+        You can review your writing on your computer, either by browsing
+        the Git repository in a web browser or by downloading the files
+        with a Git client. Commit and push your edits to Git, and
+        Draftling will pick them up during the next synchronization.
+      </p>
+    </section>
+
+    <section id="license">
+      <h2>Licenses and the use of LLM</h2>
+      <p>
+        <a href="https://github.com/clackups/draftling">Draftling</a> is
+        licensed under the MIT License.
+        <a href="https://github.com/clackups/draftbox">Draftbox</a> is
+        licensed under the Apache License 2.0.
+      </p>
+      <p>
+        Most of the coding was done by Claude Code. Without it, I would
+        not have found the time to implement this project. All of the
+        engineering and design was done by a human brain.
+      </p>
+    </section>
+
+  </main>
+
+  <footer class="footer">
+    <div class="wrap">
+      <p>
+        Copyright (c) 2026
+        <a href="mailto:clackups@gmail.com">clackups@gmail.com</a>
+        <span class="sep">&middot;</span>
+        Fediverse:
+        <a href="https://social.noleron.com/@clackups">@clackups@social.noleron.com</a>
+      </p>
+    </div>
+  </footer>
+
+</body>
+</html>

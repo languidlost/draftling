@@ -1,0 +1,174 @@
+# ESP32-P4-specific defaults
+# Applied automatically when: idf.py set-target esp32p4
+#
+# Currently the only ESP32-P4 board supported is the M5Stack Tab5,
+# which uses the upstream espressif/m5stack_tab5 BSP for all panel,
+# touch, MIPI-DSI PHY, I/O expander and audio-codec bring-up.
+
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# ---------------------------------------------------------------
+# Chip revision -- target pre-production ESP32-P4 (ECO2, v1.x)
+#
+# ESP-IDF's default minimum supported P4 revision is v3.1 (mass
+# production silicon). Engineering samples / pre-production boards
+# report revision v1.x (ROM banner "esp32p4-eco2-20240710") and
+# are refused by the bootloader's chip-revision check:
+#   "bootloader.bin requires chip revision in range [v3.1 - v3.99]
+#    (this chip is revision v1.3). Use --force to flash anyway."
+# Even with --force the firmware crashes immediately (Illegal
+# instruction in the bootloader) because v3.x-only ROM workarounds
+# and instructions are taken on a v1.x die.
+#
+# Selecting REV_LESS_V3 + REV_MIN_100 builds a binary that targets
+# v1.0..v1.99 silicon (covering v1.3). Note: ESP-IDF makes <3.0 and
+# >=3.0 mutually exclusive, so a binary built this way will NOT run
+# on production v3.x Tab5 boards. Drop these two lines once all
+# supported hardware is on ECO3/v3.x silicon.
+# ---------------------------------------------------------------
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_100=y
+
+# PSRAM -- Tab5 carries 32 MB HEX-mode PSRAM (200 MHz). The MIPI-DSI
+# DPI panel framebuffer (1280 * 720 * 2 = ~1.8 MB) and our LVGL
+# rendering buffers must all live in PSRAM; internal SRAM on the
+# ESP32-P4 is reserved for DMA descriptors and time-critical code.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_HEX=y
+CONFIG_SPIRAM_SPEED_200M=y
+CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
+
+# MIPI-DSI / DPI panel framebuffer
+#
+# The m5stack_tab5 BSP's bsp_display_new_with_handles() creates one
+# CONFIG_BSP_LCD_DPI_BUFFER_NUMS framebuffer(s) internally. Draftling
+# pushes pixels via esp_lcd_panel_draw_bitmap() into that framebuffer,
+# so a single buffer is enough and saves ~1.8 MB of PSRAM.
+CONFIG_BSP_LCD_DPI_BUFFER_NUMS=1
+
+# Wi-Fi / Bluetooth on the ESP32-P4 are unavailable natively (no
+# on-chip 2.4 GHz radio). Tab5 routes both through an on-board
+# ESP32-C6 co-processor via ESP-Hosted-MCU over SDIO. The host
+# component is `espressif/esp_hosted` (added in main/idf_component.yml
+# under `target == esp32p4`); Wi-Fi calls are redirected through
+# `espressif/esp_wifi_remote`; Bluedroid talks to the C6's BLE
+# controller through ESP-Hosted's VHCI driver. See
+# docs/tab5-esp-hosted.md for the C6 slave firmware version and
+# the one-time flashing procedure.
+
+# ---------------------------------------------------------------
+# ESP-Hosted-MCU transport (SDIO, 4-bit, 40 MHz)
+#
+# Tab5 SDIO pin map between P4 (host) and C6 (slave). These match
+# the M5Tab5-UserDemo sdkconfig and the Tab5 schematic.
+# RESET line to the C6 is GPIO15, active-low (verified against
+# M5Stack's reference firmware).
+#
+# NOTE: in espressif/esp_hosted >= 2.x, CONFIG_ESP_HOSTED_SDIO_PIN_*
+# are non-promptable derived ints (see upstream Kconfig: each is
+# `int` + `default ESP_HOSTED_PRIV_SDIO_PIN_*_SLOT_{0,1}`). Any
+# attempt to set CONFIG_ESP_HOSTED_SDIO_PIN_CLK=... here is silently
+# dropped by Kconfig and the value is recomputed from the per-slot
+# PRIV defaults (which on P4/SLOT_1 give CLK=18 CMD=19 D0=14 D1=15
+# D2=16 D3=17 -- not the Tab5 wiring, and D1=15 collides with the
+# C6 reset line). The promptable knobs are the
+# CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_*_SLOT_1 symbols below; those
+# DO override correctly. SLOT_1 is already the P4 default and is
+# the slot wired to the on-board C6.
+# ---------------------------------------------------------------
+CONFIG_ESP_HOSTED_ENABLED=y
+CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE=y
+CONFIG_ESP_HOSTED_IDF_SLAVE_TARGET="esp32c6"
+CONFIG_SLAVE_IDF_TARGET_ESP32C6=y
+CONFIG_ESP_HOSTED_SDIO_SLOT_1=y
+CONFIG_ESP_HOSTED_SDIO_4_BIT_BUS=y
+CONFIG_ESP_HOSTED_SDIO_BUS_WIDTH=4
+CONFIG_ESP_HOSTED_SDIO_CLOCK_FREQ_KHZ=40000
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_CLK_SLOT_1=12
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_CMD_SLOT_1=13
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D0_SLOT_1=11
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D1_4BIT_BUS_SLOT_1=10
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D2_4BIT_BUS_SLOT_1=9
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D3_4BIT_BUS_SLOT_1=8
+CONFIG_ESP_HOSTED_SDIO_GPIO_RESET_SLAVE=15
+# Reset polarity: use the umbrella CONFIG_ESP_HOSTED_RESET_GPIO_ACTIVE_LOW
+# symbol. The per-bus CONFIG_ESP_HOSTED_SDIO_RESET_ACTIVE_LOW sits inside a
+# `choice ESP_HOSTED_SDIO_RESET_GPIO_CONFIG` whose default is ACTIVE_HIGH;
+# the umbrella bool (default y if *_ACTIVE_LOW) is the symbol the host
+# driver actually reads (#ifdef CONFIG_ESP_HOSTED_RESET_GPIO_ACTIVE_LOW
+# in host/port/esp/freertos/include/port_esp_hosted_host_config.h). Set
+# it directly to avoid any confusion about which knob is in effect.
+CONFIG_ESP_HOSTED_RESET_GPIO_ACTIVE_LOW=y
+# Streaming RX mode pre-allocates a 15+ KB-per-block mempool that is
+# too large for the P4's tight internal DMA-capable SRAM at the point
+# hosted_mempool_create() runs; keep packet mode so the per-block size
+# stays at MAX_SDIO_BUFFER_SIZE (1536 B).
+# CONFIG_ESP_HOSTED_SDIO_OPTIMIZATION_RX_STREAMING_MODE is not set
+
+# On ESP32-P4 the GDMA engine can reach PSRAM through the cache, so
+# let ESP-Hosted allocate its SDIO transport mempool from the 32 MB
+# HEX PSRAM instead of the ~480 KB internal SRAM. Without this knob
+# hosted_malloc_align() falls back to MALLOC_CAP_INTERNAL|DMA|8BIT
+# and sdio_drv.c's `assert(buf_mp_g)` fires at boot.
+CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM=y
+
+# ---------------------------------------------------------------
+# Wi-Fi Remote -- redirect esp_wifi_* into ESP-Hosted RPCs so
+# wifi_manager.cpp does not need a P4-specific code path.
+# ---------------------------------------------------------------
+CONFIG_ESP_WIFI_REMOTE_LIBRARY_HOSTED=y
+
+# ---------------------------------------------------------------
+# Bluetooth on ESP32-P4 -- Bluedroid host + hosted-VHCI controller
+#
+# IMPORTANT: on ESP32-P4, CONFIG_BT_ENABLED=y does NOT enable an
+# on-chip Bluetooth radio (the P4 has none). ESP-IDF detects the
+# target and automatically forces CONFIG_BT_CONTROLLER_DISABLED=y,
+# so CONFIG_BT_ENABLED=y on this target only means "build the
+# Bluedroid HOST". The BLE controller actually lives on the
+# on-board ESP32-C6 and is reached over ESP-Hosted's SDIO
+# transport via a VHCI HCI driver attached to Bluedroid.
+#
+# components/ble_keyboard/ble_keyboard.cpp has a
+# CONFIG_BT_CONTROLLER_DISABLED branch that brings up
+# esp_hosted_bt_controller_* and attaches the hosted-VHCI HCI
+# driver before esp_bluedroid_init(). Without CONFIG_BT_ENABLED
+# (and CONFIG_BT_BLUEDROID_ENABLED, which it implies), the
+# ble_keyboard.cpp file collapses to its no-op stub at the top
+# (`#if !defined(CONFIG_BT_BLUEDROID_ENABLED)`) and you see
+# "Bluedroid host not enabled in sdkconfig" at boot.
+#
+# We therefore inherit CONFIG_BT_ENABLED=y / CONFIG_BT_BLUEDROID_ENABLED=y
+# from sdkconfig.defaults (do NOT override them to =n here, even
+# though "BT_ENABLED on a chip with no BT radio" looks wrong).
+#
+# The two CONFIG_ESP_HOSTED_* knobs below tell `espressif/esp_hosted`
+# to compile in its Bluedroid VHCI shim; without them the hosted_*
+# symbols ble_keyboard.cpp links against are not produced. Recipe
+# mirrors examples/host_bluedroid_ble_compatibility_test in
+# espressif/esp-hosted-mcu. The C6 slave only speaks BLE 4.2, so
+# pin BT_BLE_42 and turn off BLE 5.0 features.
+#
+# NOTE on stale sdkconfig: ESP-IDF only applies sdkconfig.defaults
+# when sdkconfig does not yet exist. If you previously built with
+# CONFIG_BT_ENABLED=n / CONFIG_BT_BLUEDROID_ENABLED=n, your local
+# sdkconfig has those values cached and `idf.py reconfigure` will
+# NOT overwrite them, producing
+#   "fatal error: esp_bt_main.h: No such file or directory"
+# in components/ble_keyboard/ble_keyboard.cpp because the `bt`
+# component does not export the Bluedroid host headers when
+# CONFIG_BT_BLUEDROID_ENABLED is unset. Fix: delete sdkconfig and
+# rerun `idf.py reconfigure` (or `idf.py fullclean`).
+# ---------------------------------------------------------------
+CONFIG_BT_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=y
+CONFIG_BT_CONTROLLER_DISABLED=y
+CONFIG_BT_BLE_50_FEATURES_SUPPORTED=n
+CONFIG_BT_LE_50_FEATURE_SUPPORT=n
+CONFIG_ESP_HOSTED_ENABLE_BT_BLUEDROID=y
+CONFIG_ESP_HOSTED_BLUEDROID_HCI_VHCI=y
+
+# The default ESP-IDF main task stack (3.5 KB) is too tight for the
+# editor's call chains; match the ESP32-S3 build.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192

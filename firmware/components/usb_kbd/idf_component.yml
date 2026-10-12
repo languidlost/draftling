@@ -1,0 +1,9 @@
+## Pulls in the USB HID Host driver (boot keyboard / mouse / generic
+## reports) for boards with native USB host support.
+dependencies:
+  idf:
+    version: ">=5.5"
+  espressif/usb_host_hid:
+    version: "^1.0.1"
+    rules:
+      - if: 'target in ["esp32p4", "esp32s3"]'
